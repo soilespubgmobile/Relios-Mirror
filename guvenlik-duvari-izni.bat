@@ -7,7 +7,9 @@ if errorlevel 1 (
   exit /b
 )
 netsh advfirewall firewall delete rule name="Relios Mirror" >nul 2>&1
-netsh advfirewall firewall add rule name="Relios Mirror" dir=in action=allow program="%~dp0relios-airplay-receiver.exe" enable=yes profile=private,domain
+netsh advfirewall firewall delete rule name=all program="%~dp0relios-airplay-receiver.exe" >nul 2>&1
+netsh advfirewall firewall add rule name="Relios Mirror" dir=in action=allow protocol=TCP localport=7000,7100
+netsh advfirewall firewall add rule name="Relios Mirror" dir=in action=allow protocol=UDP localport=5353,6000,6001,7011
 echo.
-echo Izin eklendi. Wi-Fi aginiz Windows'ta "Ozel ag" olarak ayarli olmali.
+echo Izin eklendi.
 pause

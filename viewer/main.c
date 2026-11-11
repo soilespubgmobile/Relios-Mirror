@@ -1567,6 +1567,46 @@ static int key_command(SDL_Keycode key)
 	}
 }
 
+#ifdef _WIN32
+/* Without a rule Windows Firewall drops what the iPad sends (the iPad then sees the name but cannot connect and no
+ * code is shown). Once, with the user's consent (UAC): rules for the receiver's fixed ports, and the "block" rules
+ * Windows made for the receiver if its own question was dismissed are removed. */
+static void ensure_firewall_rule(void)
+{
+	if (proc_run("netsh", "advfirewall firewall show rule name=\"Relios Mirror\"", 10000) == 0)
+		return;
+	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
+				 "iPad'in bağlanabilmesi için Windows Güvenlik Duvarı'nda izin gerekiyor.\n\n"
+				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin (bir kez sorulur).",
+				 A.win);
+	char cmd[6000];
+	snprintf(cmd, sizeof(cmd),
+		 "/c \"netsh advfirewall firewall delete rule name=all program=\"%s\""
+		 " & netsh advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow protocol=TCP localport=7000,7100"
+		 " & netsh advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow protocol=UDP localport=5353,6000,6001,7011\"",
+		 A.exe);
+	wchar_t *w = to_wide(cmd);
+	if (!w)
+		return;
+	SHELLEXECUTEINFOW info;
+	memset(&info, 0, sizeof(info));
+	info.cbSize = sizeof(info);
+	info.fMask = SEE_MASK_NOCLOSEPROCESS;
+	info.lpVerb = L"runas";
+	info.lpFile = L"cmd.exe";
+	info.lpParameters = w;
+	info.nShow = SW_HIDE;
+	if (ShellExecuteExW(&info) && info.hProcess) {
+		WaitForSingleObject(info.hProcess, 20000);
+		CloseHandle(info.hProcess);
+		app_log("firewall rules asked for");
+	} else {
+		app_log("firewall rules not added (error %lu)", (unsigned long)GetLastError());
+	}
+	free(w);
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 	(void)argc;
@@ -1609,6 +1649,9 @@ int main(int argc, char *argv[])
 	if (A.on_top)
 		SDL_SetWindowAlwaysOnTop(A.win, SDL_TRUE);
 
+#ifdef _WIN32
+	ensure_firewall_rule();
+#endif
 	session_start();
 	update_title();
 	draw();
