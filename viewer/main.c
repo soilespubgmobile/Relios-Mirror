@@ -59,13 +59,13 @@
 #endif
 
 enum app_state {
-	ST_STARTING,
-	ST_LISTENING,
-	ST_PIN,
-	ST_CONNECTED,
-	ST_PAIRING_OFF,
-	ST_ENDED,
-	ST_ERROR,
+	MIRROR_STARTING,
+	MIRROR_LISTENING,
+	MIRROR_PIN,
+	MIRROR_CONNECTED,
+	MIRROR_PAIRING_OFF,
+	MIRROR_ENDED,
+	MIRROR_ERROR,
 };
 
 enum { EV_FRAME = 1, EV_STATE = 2, EV_ENDED = 3 };
@@ -911,7 +911,7 @@ static void handle_status(const char *text)
 		app_log("receiver %s", text);
 	} else if (!strncmp(text, "listening", 9)) {
 		app_log("receiver listening (%s)", text + 9);
-		set_state(ST_LISTENING);
+		set_state(MIRROR_LISTENING);
 	} else if (!strncmp(text, "client", 6)) {
 		/* (the name may hold spaces: everything between "name=" and " model=") */
 		char name[96] = "?", model[48] = "?";
@@ -935,7 +935,7 @@ static void handle_status(const char *text)
 		A.pin[0] = '\0';
 		A.pair_requested = false;
 		SDL_UnlockMutex(A.mutex);
-		set_state(ST_CONNECTED);
+		set_state(MIRROR_CONNECTED);
 	} else if (!strncmp(text, "mirroring", 9)) {
 		bool on = strstr(text, " on") != NULL;
 		app_log("screen mirroring %s", on ? "started" : "stopped");
@@ -953,7 +953,7 @@ static void handle_status(const char *text)
 		A.pin[0] = '\0';
 		A.pair_requested = false;
 		SDL_UnlockMutex(A.mutex);
-		set_state(ST_PAIRING_OFF);
+		set_state(MIRROR_PAIRING_OFF);
 	} else if (!strncmp(text, "ended", 5)) {
 		app_log("the receiver ended (its ports are closed)");
 	} else if (!strncmp(text, "error", 5)) {
@@ -962,7 +962,7 @@ static void handle_status(const char *text)
 		snprintf(A.error, sizeof(A.error), "%s", t ? t + 5 : text);
 		SDL_UnlockMutex(A.mutex);
 		app_log("receiver error: %s", t ? t + 5 : text);
-		set_state(ST_ERROR);
+		set_state(MIRROR_ERROR);
 	}
 }
 
@@ -970,13 +970,13 @@ static void handle_pin(const char *pin)
 {
 	SDL_LockMutex(A.mutex);
 	snprintf(A.pin, sizeof(A.pin), "%s", pin);
-	bool was_pin = A.state == ST_PIN;
+	bool was_pin = A.state == MIRROR_PIN;
 	SDL_UnlockMutex(A.mutex);
 	if (pin[0]) {
 		app_log("the iPad asks for a pairing code: shown in the window"); /* (the code itself is not logged) */
-		set_state(ST_PIN);
+		set_state(MIRROR_PIN);
 	} else if (was_pin) {
-		set_state(ST_LISTENING);
+		set_state(MIRROR_LISTENING);
 	} else {
 		push_event(EV_STATE);
 	}
@@ -1079,8 +1079,8 @@ static int out_thread(void *generation)
 
 	clear_picture();
 	SDL_LockMutex(A.mutex);
-	if (A.state != ST_ERROR)
-		A.state = ST_ENDED;
+	if (A.state != MIRROR_ERROR)
+		A.state = MIRROR_ENDED;
 	A.pin[0] = '\0';
 	A.client[0] = A.format[0] = '\0';
 	SDL_UnlockMutex(A.mutex);
@@ -1139,7 +1139,7 @@ static void session_fail(const char *text)
 {
 	SDL_LockMutex(A.mutex);
 	snprintf(A.error, sizeof(A.error), "%s", text);
-	A.state = ST_ERROR;
+	A.state = MIRROR_ERROR;
 	SDL_UnlockMutex(A.mutex);
 	app_log("could not start: %s", text);
 	A.restart_at = SDL_GetTicks() + 5000;
@@ -1151,7 +1151,7 @@ static void session_start(void)
 	A.restart_at = 0;
 	SDL_LockMutex(A.mutex);
 	A.pin[0] = A.client[0] = A.format[0] = A.error[0] = '\0';
-	A.state = ST_STARTING;
+	A.state = MIRROR_STARTING;
 	bool pair = A.pair_requested;
 	SDL_UnlockMutex(A.mutex);
 
@@ -1229,25 +1229,25 @@ static void update_title(void)
 	enum app_state state = A.state;
 	bool pair = A.pair_requested;
 	switch (state) {
-	case ST_STARTING:
+	case MIRROR_STARTING:
 		snprintf(status, sizeof(status), "başlatılıyor…");
 		break;
-	case ST_LISTENING:
+	case MIRROR_LISTENING:
 		snprintf(status, sizeof(status), "hazır — iPad'de Ekran Yansıtma → " RECEIVER_NAME "%s",
 			 pair ? " (yeni cihaz eşleştirme açık)" : "");
 		break;
-	case ST_PIN:
+	case MIRROR_PIN:
 		snprintf(status, sizeof(status), "penceredeki kodu iPad'e girin");
 		break;
-	case ST_CONNECTED:
+	case MIRROR_CONNECTED:
 		snprintf(status, sizeof(status), "bağlı: %s", A.client[0] ? A.client : "iPad");
 		if (A.format[0])
 			snprintf(extra, sizeof(extra), " | %s, %.0f fps, %.1f Mbit/s", A.format, A.fps_now, A.mbit);
 		break;
-	case ST_PAIRING_OFF:
+	case MIRROR_PAIRING_OFF:
 		snprintf(status, sizeof(status), "üç yanlış kod: eşleştirme kapandı (P tuşu ile yeniden açın)");
 		break;
-	case ST_ENDED:
+	case MIRROR_ENDED:
 		snprintf(status, sizeof(status), "yeniden başlatılıyor…");
 		break;
 	default:
@@ -1421,8 +1421,8 @@ static bool run_command(int cmd)
 	case CMD_PAIR:
 		SDL_LockMutex(A.mutex);
 		A.pair_requested = true;
-		if (A.state == ST_PAIRING_OFF)
-			A.state = ST_LISTENING;
+		if (A.state == MIRROR_PAIRING_OFF)
+			A.state = MIRROR_LISTENING;
 		SDL_UnlockMutex(A.mutex);
 		if (A.proc)
 			proc_write(A.proc, "allow_pairing 1\n");
@@ -1633,7 +1633,7 @@ int main(int argc, char *argv[])
 						   (int)(intptr_t)e.user.data1 == A.generation && A.proc) {
 						/* the receiver ended (the iPad left, or an error): a new one after a moment */
 						SDL_LockMutex(A.mutex);
-						bool failed = A.state == ST_ERROR;
+						bool failed = A.state == MIRROR_ERROR;
 						SDL_UnlockMutex(A.mutex);
 						session_stop();
 						A.restart_at = SDL_GetTicks() + (failed ? 5000 : 700);
