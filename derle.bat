@@ -12,7 +12,7 @@ if not exist "%MSYS%\usr\bin\bash.exe" (
 set MSYSTEM=UCRT64
 set CHERE_INVOKING=1
 cd /d "%~dp0"
-"%MSYS%\usr\bin\bash.exe" -lc "pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-ffmpeg mingw-w64-ucrt-x86_64-SDL2 && bash paketle.sh"
+"%MSYS%\usr\bin\bash.exe" -lc "pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-openssl mingw-w64-ucrt-x86_64-ffmpeg mingw-w64-ucrt-x86_64-SDL2 mingw-w64-ucrt-x86_64-SDL2_ttf && bash paketle.sh"
 if errorlevel 1 (
   echo.
   echo Derleme basarisiz oldu. Yukaridaki hata satirlarini kopyalayip gonderin.

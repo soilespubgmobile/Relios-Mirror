@@ -13,17 +13,19 @@ KULLANIM
 iPad listede "Relios Mirror" görünmüyorsa: guvenlik-duvari-izni.bat dosyasını bir kez çalıştırın.
 
 
-MENÜ VE TUŞLAR (pencereye sağ tıklayın)
-  R            Kaydı başlat / durdur  (Videolar\ReliosMirror klasörüne .mkv)
-  Yukarı/Aşağı Sesi %10 artır / azalt (%0 - %200)
-  M            Sessiz
-  F, F11       Tam ekran (çift tıklama da olur; Esc çıkar)
-  T            Her zaman üstte
-  P            Yeni cihaz eşleştir (ikinci bir iPad / iPhone için)
-Menüde ayrıca: çözünürlük (720p - 4K), kare hızı (30 / 60), kodek (H.264 / H.265),
-eşleşmiş cihazları unut. Çözünürlük, kare hızı ya da kodek değişince iPad'den yeniden bağlanın.
+DÜĞMELER VE TUŞLAR
+Fareyi pencerenin üstünde oynatınca altta düğmeler çıkar (2,5 sn sonra gizlenir; yayında görünmez):
+kayıt başlat/durdur, kayıt işlemci / ekran kartı, ses - / + / sessiz, çözünürlük, fps, kodek,
+çözme işlemci / ekran kartı, tam ekran, üstte, yeni cihaz.
+Çözünürlük, fps, kodek değişince iPad'den yeniden bağlanın.
+Tuşlar: R kayıt, Yukarı/Aşağı ses, M sessiz, F tam ekran, T üstte, P yeni cihaz.
 
-Durum, çözünürlük, fps ve anlık bit hızı pencere başlığında yazar.
+
+KABLOLU BAĞLANTI
+AirPlay ağ üzerinden çalışır; kabloyla kullanmak için iPad ile bilgisayar arasında kablolu AĞ gerekir:
+- iPad'e USB-C Ethernet adaptörü takıp modeme bağlayın, ya da
+- hücresel iPad/iPhone'da Kişisel Erişim Noktası'nı açıp USB kabloyla bilgisayara bağlayın.
+Sonra yine Ekran Yansıtma > Relios Mirror.
 
 
 DISCORD

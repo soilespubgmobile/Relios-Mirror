@@ -31,14 +31,13 @@
 #include <time.h>
 
 #include <SDL.h>
-#ifdef _WIN32
-#include <SDL_syswm.h>
-#endif
+#include <SDL_ttf.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/dict.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
 #include <libswscale/swscale.h>
@@ -83,14 +82,11 @@ enum {
 	CMD_PAIR,
 	CMD_FORGET,
 	CMD_QUIT,
-	CMD_RES_720 = 100,
-	CMD_RES_1080,
-	CMD_RES_1440,
-	CMD_RES_2160,
-	CMD_FPS_30 = 200,
-	CMD_FPS_60,
-	CMD_H264 = 300,
-	CMD_H265,
+	CMD_RES_NEXT,
+	CMD_FPS_NEXT,
+	CMD_CODEC_NEXT,
+	CMD_REC_ENCODER,
+	CMD_HW_DECODE,
 };
 
 static struct {
@@ -115,16 +111,27 @@ static struct {
 	int width, height, fps;
 	bool h265;
 	bool on_top;
+	bool rec_gpu;   /* record with the graphics card's encoder */
+	bool hw_decode; /* decode with the graphics card */
 	SDL_atomic_t volume; /* percent, 0..200 */
 	SDL_atomic_t muted;
 
-	/* the picture: the reading thread fills back and swaps; the window thread uploads front */
+	/* the picture: from the reading thread to the window thread */
 	SDL_mutex *frame_mutex;
-	uint8_t *front, *back;
-	size_t frame_cap;
-	int fw, fh;
+	AVFrame *pending; /* the newest decoded picture, not yet in the texture */
+	bool pending_full, pending_709;
 	bool have_frame, frame_dirty;
 	SDL_atomic_t frame_event;
+	AVFrame *upload; /* (window thread) */
+	Uint32 tex_format;
+	int tex_mode;
+
+	/* the buttons */
+	TTF_Font *font;
+	int font_px;
+	Uint32 bar_until; /* shown until then (SDL ticks) after the mouse moved */
+	bool bar_drawn;
+	Uint32 apply_at; /* a changed size / rate / codec restarts the receiver then */
 
 	/* measured, for the title */
 	double mbit, fps_now;
@@ -159,6 +166,7 @@ static struct {
 	uint64_t t0;
 	int64_t last_vpts, next_apts;
 	bool audio_started, header_written;
+	char encoder[32];
 	char path[1400];
 } R;
 
@@ -334,6 +342,8 @@ static void load_settings(void)
 	A.fps = 60;
 	A.h265 = false;
 	A.on_top = false;
+	A.rec_gpu = false;
+	A.hw_decode = true;
 	SDL_AtomicSet(&A.volume, 100);
 	SDL_AtomicSet(&A.muted, 0);
 	FILE *f = fopen("ayarlar.txt", "r");
@@ -355,6 +365,10 @@ static void load_settings(void)
 			SDL_AtomicSet(&A.muted, a != 0);
 		} else if (sscanf(line, "ustte=%d", &a) == 1) {
 			A.on_top = a != 0;
+		} else if (sscanf(line, "kayit_gpu=%d", &a) == 1) {
+			A.rec_gpu = a != 0;
+		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
+			A.hw_decode = a != 0;
 		}
 	}
 	fclose(f);
@@ -365,8 +379,9 @@ static void save_settings(void)
 	FILE *f = fopen("ayarlar.txt", "w");
 	if (!f)
 		return;
-	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\n", A.width, A.height, A.fps,
-		A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0);
+	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\n", A.width,
+		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
+		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0);
 	fclose(f);
 }
 
@@ -465,37 +480,51 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 
 	R.w = f->width;
 	R.h = f->height;
-	const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
-	if (!codec)
-		codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-	if (!codec) {
-		app_log("recording: no H.264 encoder in this FFmpeg");
-		return false;
-	}
 	if (avformat_alloc_output_context2(&R.oc, NULL, "matroska", R.path) < 0 || !R.oc)
 		return false;
-	R.enc = avcodec_alloc_context3(codec);
 	R.frame = av_frame_alloc();
 	R.pkt = av_packet_alloc();
-	if (!R.enc || !R.frame || !R.pkt)
+	if (!R.frame || !R.pkt)
 		return false;
-	R.enc->width = f->width & ~1;
-	R.enc->height = f->height & ~1;
-	R.enc->pix_fmt = AV_PIX_FMT_YUV420P;
-	R.enc->time_base = (AVRational){1, 1000};
-	R.enc->framerate = (AVRational){A.fps, 1};
-	R.enc->gop_size = 120;
-	R.enc->color_range = full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-	R.enc->colorspace = bt709 ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
-	if (R.oc->oformat->flags & AVFMT_GLOBALHEADER)
-		R.enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-	AVDictionary *opts = NULL;
-	av_dict_set(&opts, "preset", "veryfast", 0);
-	av_dict_set(&opts, "crf", "20", 0);
-	int ret = avcodec_open2(R.enc, codec, &opts);
-	av_dict_free(&opts);
-	if (ret < 0) {
-		app_log("recording: the encoder %s did not open (%d)", codec->name, ret);
+	/* the graphics card's encoders first if asked (NVIDIA, AMD, Intel), then the processor's (x264) */
+	static const char *const names[] = {"h264_nvenc", "h264_amf", "h264_qsv", "libx264", NULL};
+	const AVCodec *codec = NULL;
+	for (int n = A.rec_gpu ? 0 : 3; names[n] && !R.enc; n++) {
+		bool gpu = n < 3;
+		codec = avcodec_find_encoder_by_name(names[n]);
+		if (!codec)
+			continue;
+		R.enc = avcodec_alloc_context3(codec);
+		if (!R.enc)
+			return false;
+		R.enc->width = f->width & ~1;
+		R.enc->height = f->height & ~1;
+		R.enc->pix_fmt = gpu ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
+		R.enc->time_base = (AVRational){1, 1000};
+		R.enc->framerate = (AVRational){A.fps, 1};
+		R.enc->gop_size = 120;
+		R.enc->color_range = full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+		R.enc->colorspace = bt709 ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+		if (R.oc->oformat->flags & AVFMT_GLOBALHEADER)
+			R.enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+		AVDictionary *opts = NULL;
+		if (gpu) {
+			R.enc->bit_rate = (int64_t)R.enc->width * R.enc->height * A.fps / 10; /* 1080p60: ~12 Mbit/s */
+		} else {
+			av_dict_set(&opts, "preset", "veryfast", 0);
+			av_dict_set(&opts, "crf", "20", 0);
+		}
+		int ret = avcodec_open2(R.enc, codec, &opts);
+		av_dict_free(&opts);
+		if (ret < 0) {
+			app_log("recording: the encoder %s did not open (%d)", names[n], ret);
+			avcodec_free_context(&R.enc);
+		} else {
+			snprintf(R.encoder, sizeof(R.encoder), "%s", gpu ? "GPU" : "CPU");
+		}
+	}
+	if (!R.enc) {
+		app_log("recording: no H.264 encoder could be used");
 		return false;
 	}
 
@@ -516,7 +545,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 	R.ast->codecpar->bit_rate = 44100 * 2 * 16;
 	R.ast->time_base = (AVRational){1, 44100};
 
-	R.frame->format = AV_PIX_FMT_YUV420P;
+	R.frame->format = R.enc->pix_fmt;
 	R.frame->width = R.enc->width;
 	R.frame->height = R.enc->height;
 	if (av_frame_get_buffer(R.frame, 0) < 0)
@@ -556,7 +585,8 @@ static void rec_video(const AVFrame *f, bool full, bool bt709)
 		}
 		if (R.oc && R.header_written && av_frame_make_writable(R.frame) >= 0) {
 			int w = R.enc->width, h = R.enc->height;
-			if (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P) {
+			if (R.enc->pix_fmt == AV_PIX_FMT_YUV420P &&
+			    (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P)) {
 				av_image_copy_plane(R.frame->data[0], R.frame->linesize[0], f->data[0], f->linesize[0], w, h);
 				av_image_copy_plane(R.frame->data[1], R.frame->linesize[1], f->data[1], f->linesize[1], w / 2,
 						    h / 2);
@@ -564,7 +594,7 @@ static void rec_video(const AVFrame *f, bool full, bool bt709)
 						    h / 2);
 			} else {
 				R.sws = sws_getCachedContext(R.sws, f->width, f->height, (enum AVPixelFormat)f->format, w, h,
-							     AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+							     R.enc->pix_fmt, SWS_BILINEAR, NULL, NULL, NULL);
 				if (R.sws)
 					sws_scale(R.sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height,
 						  R.frame->data, R.frame->linesize);
@@ -640,12 +670,23 @@ struct decoder {
 	int adec_ct;
 	AVPacket *pkt;
 	AVFrame *frame;
+	AVFrame *sw; /* a picture brought from the graphics card */
 	struct SwsContext *sws;
-	int sws_w, sws_h, sws_fmt, sws_full, sws_709;
 	float *mix;
 	size_t mix_cap;
 	bool warned_audio;
 };
+
+#ifdef _WIN32
+static enum AVPixelFormat pick_format(AVCodecContext *ctx, const enum AVPixelFormat *formats)
+{
+	for (const enum AVPixelFormat *p = formats; *p != AV_PIX_FMT_NONE; p++) {
+		if (*p == AV_PIX_FMT_D3D11)
+			return *p;
+	}
+	return avcodec_default_get_format(ctx, formats);
+}
+#endif
 
 static bool open_video_decoder(struct decoder *d, bool h265)
 {
@@ -661,12 +702,23 @@ static bool open_video_decoder(struct decoder *d, bool h265)
 	d->vdec->flags |= AV_CODEC_FLAG_LOW_DELAY;
 	d->vdec->thread_count = 0;
 	d->vdec->thread_type = FF_THREAD_SLICE; /* (frame threads would hold frames back) */
+	bool hw = false;
+#ifdef _WIN32
+	if (A.hw_decode) {
+		AVBufferRef *device = NULL;
+		if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) >= 0) {
+			d->vdec->hw_device_ctx = device;
+			d->vdec->get_format = pick_format;
+			hw = true;
+		}
+	}
+#endif
 	if (avcodec_open2(d->vdec, codec, NULL) < 0) {
 		avcodec_free_context(&d->vdec);
 		return false;
 	}
 	d->vdec_h265 = h265;
-	app_log("video decoder: %s", codec->name);
+	app_log("video decoder: %s (%s)", codec->name, hw ? "graphics card if it can" : "processor");
 	return true;
 }
 
@@ -680,58 +732,40 @@ static void frame_colors(const AVFrame *f, bool *full, bool *bt709)
 		*bt709 = false;
 }
 
-/* the decoded picture as BGRA into the back buffer, then swapped to the front */
+/* the decoded picture (YUV, as it is) to the window thread, which puts it into a texture on the graphics card */
 static void present_frame(struct decoder *d, const AVFrame *f, bool full, bool bt709)
 {
 	int w = f->width, h = f->height;
 	if (w <= 0 || h <= 0 || w > 8192 || h > 8192)
 		return;
-	size_t need = (size_t)w * (size_t)h * 4;
-	if (need > A.frame_cap) {
-		SDL_LockMutex(A.frame_mutex);
-		uint8_t *nf = realloc(A.front, need), *nb = realloc(A.back, need);
-		if (nf)
-			A.front = nf;
-		if (nb)
-			A.back = nb;
-		if (nf && nb) {
-			A.frame_cap = need;
-		} else {
-			A.frame_cap = 0;
+	AVFrame *converted = NULL;
+	if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P && f->format != AV_PIX_FMT_NV12) {
+		/* (10-bit and other rare ones) */
+		converted = av_frame_alloc();
+		if (!converted)
+			return;
+		converted->format = AV_PIX_FMT_YUV420P;
+		converted->width = w;
+		converted->height = h;
+		d->sws = sws_getCachedContext(d->sws, w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_YUV420P,
+					      SWS_BILINEAR, NULL, NULL, NULL);
+		if (!d->sws || av_frame_get_buffer(converted, 0) < 0) {
+			av_frame_free(&converted);
+			return;
 		}
-		A.have_frame = false;
-		SDL_UnlockMutex(A.frame_mutex);
-		if (!A.frame_cap)
-			return;
+		sws_scale(d->sws, (const uint8_t *const *)f->data, f->linesize, 0, h, converted->data, converted->linesize);
+		f = converted;
 	}
-	if (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format || d->sws_full != (int)full ||
-	    d->sws_709 != (int)bt709) {
-		sws_freeContext(d->sws);
-		d->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL,
-					NULL, NULL);
-		if (!d->sws)
-			return;
-		sws_setColorspaceDetails(d->sws, sws_getCoefficients(bt709 ? SWS_CS_ITU709 : SWS_CS_ITU601),
-					 full ? 1 : 0, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
-		d->sws_w = w;
-		d->sws_h = h;
-		d->sws_fmt = f->format;
-		d->sws_full = (int)full;
-		d->sws_709 = (int)bt709;
-	}
-	uint8_t *dst[4] = {A.back, NULL, NULL, NULL};
-	int dst_stride[4] = {w * 4, 0, 0, 0};
-	sws_scale(d->sws, (const uint8_t *const *)f->data, f->linesize, 0, h, dst, dst_stride);
-
 	SDL_LockMutex(A.frame_mutex);
-	uint8_t *t = A.front;
-	A.front = A.back;
-	A.back = t;
-	A.fw = w;
-	A.fh = h;
-	A.have_frame = true;
-	A.frame_dirty = true;
+	av_frame_unref(A.pending);
+	if (av_frame_ref(A.pending, f) >= 0) {
+		A.pending_full = full;
+		A.pending_709 = bt709;
+		A.have_frame = true;
+		A.frame_dirty = true;
+	}
 	SDL_UnlockMutex(A.frame_mutex);
+	av_frame_free(&converted);
 	if (SDL_AtomicCAS(&A.frame_event, 0, 1))
 		push_event(EV_FRAME);
 }
@@ -759,11 +793,24 @@ static void handle_video(struct decoder *d, const uint8_t *payload, size_t len)
 	if (avcodec_send_packet(d->vdec, d->pkt) < 0)
 		return;
 	while (avcodec_receive_frame(d->vdec, d->frame) == 0) {
+		AVFrame *f = d->frame;
+		if (f->format == AV_PIX_FMT_D3D11) {
+			/* decoded on the graphics card: brought to memory (NV12) */
+			av_frame_unref(d->sw);
+			if (av_hwframe_transfer_data(d->sw, f, 0) < 0) {
+				av_frame_unref(f);
+				continue;
+			}
+			d->sw->color_range = f->color_range;
+			d->sw->colorspace = f->colorspace;
+			f = d->sw;
+		}
 		bool full, bt709;
-		frame_colors(d->frame, &full, &bt709);
-		present_frame(d, d->frame, full, bt709);
-		rec_video(d->frame, full, bt709);
+		frame_colors(f, &full, &bt709);
+		present_frame(d, f, full, bt709);
+		rec_video(f, full, bt709);
 		av_frame_unref(d->frame);
+		av_frame_unref(d->sw);
 	}
 }
 
@@ -902,6 +949,7 @@ static void clear_picture(void)
 	SDL_LockMutex(A.frame_mutex);
 	A.have_frame = false;
 	A.frame_dirty = false;
+	av_frame_unref(A.pending);
 	SDL_UnlockMutex(A.frame_mutex);
 }
 
@@ -1004,8 +1052,9 @@ static int out_thread(void *generation)
 
 	d.pkt = av_packet_alloc();
 	d.frame = av_frame_alloc();
+	d.sw = av_frame_alloc();
 
-	while (d.pkt && d.frame && read_full(header, sizeof(header))) {
+	while (d.pkt && d.frame && d.sw && read_full(header, sizeof(header))) {
 		if (header[0] != RA_MAGIC0 || header[1] != RA_MAGIC1) {
 			app_log("unexpected data from the receiver; stopping it");
 			break;
@@ -1071,6 +1120,7 @@ static int out_thread(void *generation)
 	avcodec_free_context(&d.adec);
 	av_packet_free(&d.pkt);
 	av_frame_free(&d.frame);
+	av_frame_free(&d.sw);
 
 	/* the file ends with the session; recording stays switched on for the next one */
 	SDL_LockMutex(R.mutex);
@@ -1222,60 +1272,264 @@ static void session_start(void)
 
 /* ------------------------------------------------------------------ the window */
 
-static void update_title(void)
+static void status_text(char *status, size_t size)
 {
-	char title[900], status[420], extra[200] = "", rec[80] = "";
 	SDL_LockMutex(A.mutex);
-	enum app_state state = A.state;
-	bool pair = A.pair_requested;
-	switch (state) {
+	switch (A.state) {
 	case MIRROR_STARTING:
-		snprintf(status, sizeof(status), "başlatılıyor…");
+		snprintf(status, size, "başlatılıyor…");
 		break;
 	case MIRROR_LISTENING:
-		snprintf(status, sizeof(status), "hazır — iPad'de Ekran Yansıtma → " RECEIVER_NAME "%s",
-			 pair ? " (yeni cihaz eşleştirme açık)" : "");
+		snprintf(status, size, "hazır — iPad'de Ekran Yansıtma → " RECEIVER_NAME "%s",
+			 A.pair_requested ? " (yeni cihaz eşleştirme açık)" : "");
 		break;
 	case MIRROR_PIN:
-		snprintf(status, sizeof(status), "penceredeki kodu iPad'e girin");
+		snprintf(status, size, "penceredeki kodu iPad'e girin");
 		break;
 	case MIRROR_CONNECTED:
-		snprintf(status, sizeof(status), "bağlı: %s", A.client[0] ? A.client : "iPad");
 		if (A.format[0])
-			snprintf(extra, sizeof(extra), " | %s, %.0f fps, %.1f Mbit/s", A.format, A.fps_now, A.mbit);
+			snprintf(status, size, "bağlı: %s | %s, %.0f fps, %.1f Mbit/s", A.client[0] ? A.client : "iPad",
+				 A.format, A.fps_now, A.mbit);
+		else
+			snprintf(status, size, "bağlı: %s", A.client[0] ? A.client : "iPad");
 		break;
 	case MIRROR_PAIRING_OFF:
-		snprintf(status, sizeof(status), "üç yanlış kod: eşleştirme kapandı (P tuşu ile yeniden açın)");
+		snprintf(status, size, "üç yanlış kod: eşleştirme kapandı (\"Yeni cihaz\" ile yeniden açın)");
 		break;
 	case MIRROR_ENDED:
-		snprintf(status, sizeof(status), "yeniden başlatılıyor…");
+		snprintf(status, size, "yeniden başlatılıyor…");
 		break;
 	default:
 		if (strstr(A.error, "TCP 7000"))
-			snprintf(status, sizeof(status),
+			snprintf(status, size,
 				 "hata: 7000 portu kullanımda (OBS'teki iPad Yansıtma ya da başka bir AirPlay alıcısı açık olabilir)");
 		else
-			snprintf(status, sizeof(status), "hata: %s", A.error);
+			snprintf(status, size, "hata: %s", A.error);
 		break;
 	}
 	SDL_UnlockMutex(A.mutex);
 
+	char rec[80] = "";
 	SDL_LockMutex(R.mutex);
 	if (R.oc && R.header_written)
-		snprintf(rec, sizeof(rec), " | ● KAYIT");
+		snprintf(rec, sizeof(rec), " | KAYIT (%s)", R.encoder);
 	else if (R.failed)
 		snprintf(rec, sizeof(rec), " | kayıt başlatılamadı");
 	else if (R.want)
 		snprintf(rec, sizeof(rec), " | kayıt: görüntü bekleniyor");
 	SDL_UnlockMutex(R.mutex);
+	size_t used = strlen(status);
+	snprintf(status + used, size - used, "%s", rec);
+}
 
-	char vol[48];
-	if (SDL_AtomicGet(&A.muted))
-		snprintf(vol, sizeof(vol), "ses kapalı");
-	else
-		snprintf(vol, sizeof(vol), "ses %%%d", SDL_AtomicGet(&A.volume));
-	snprintf(title, sizeof(title), APP_NAME " — %s%s | %s%s | sağ tık: menü", status, extra, vol, rec);
+static void update_title(void)
+{
+	char title[900], status[600];
+	status_text(status, sizeof(status));
+	snprintf(title, sizeof(title), APP_NAME " — %s", status);
 	SDL_SetWindowTitle(A.win, title);
+}
+
+/* ---- text: a system font, each text drawn once into a texture */
+
+struct text_entry {
+	char text[160];
+	SDL_Texture *tex;
+	int w, h;
+};
+static struct text_entry texts[64];
+static int text_count;
+
+static void texts_clear(void)
+{
+	for (int i = 0; i < text_count; i++)
+		SDL_DestroyTexture(texts[i].tex);
+	text_count = 0;
+}
+
+static void font_open(int px)
+{
+	if (A.font && A.font_px == px)
+		return;
+	if (A.font)
+		TTF_CloseFont(A.font);
+	texts_clear();
+	A.font = NULL;
+	A.font_px = px;
+#ifdef _WIN32
+	static const char *const files[] = {"segoeui.ttf", "arial.ttf", "tahoma.ttf", NULL};
+	const char *windir = getenv("WINDIR");
+	for (int i = 0; files[i] && !A.font; i++) {
+		char path[600];
+		snprintf(path, sizeof(path), "%s\\Fonts\\%s", windir ? windir : "C:\\Windows", files[i]);
+		A.font = TTF_OpenFont(path, px);
+	}
+#else
+	A.font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", px);
+#endif
+}
+
+static struct text_entry *text_get(const char *text)
+{
+	if (!A.font || !text[0])
+		return NULL;
+	for (int i = 0; i < text_count; i++) {
+		if (!strcmp(texts[i].text, text))
+			return &texts[i];
+	}
+	if (text_count == (int)(sizeof(texts) / sizeof(texts[0])))
+		texts_clear();
+	SDL_Color white = {240, 240, 245, 255};
+	SDL_Surface *surface = TTF_RenderUTF8_Blended(A.font, text, white);
+	if (!surface)
+		return NULL;
+	struct text_entry *t = &texts[text_count];
+	t->tex = SDL_CreateTextureFromSurface(A.ren, surface);
+	t->w = surface->w;
+	t->h = surface->h;
+	SDL_FreeSurface(surface);
+	if (!t->tex)
+		return NULL;
+	snprintf(t->text, sizeof(t->text), "%s", text);
+	text_count++;
+	return t;
+}
+
+/* ---- the buttons: a bar at the bottom, shown while the mouse moves over the window (and while nothing is mirrored) */
+
+struct button {
+	int cmd;
+	bool on;
+	char text[64];
+	SDL_Rect r;
+};
+static struct button buttons[20];
+static int button_count;
+
+static void add_button(int cmd, bool on, const char *fmt, ...)
+{
+	if (button_count >= (int)(sizeof(buttons) / sizeof(buttons[0])))
+		return;
+	struct button *b = &buttons[button_count++];
+	b->cmd = cmd;
+	b->on = on;
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(b->text, sizeof(b->text), fmt, args);
+	va_end(args);
+}
+
+static void build_buttons(void)
+{
+	SDL_LockMutex(R.mutex);
+	bool recording = R.want;
+	SDL_UnlockMutex(R.mutex);
+	bool muted = SDL_AtomicGet(&A.muted) != 0;
+	button_count = 0;
+	add_button(CMD_RECORD, recording, recording ? "Kaydı durdur" : "Kayıt başlat");
+	add_button(CMD_REC_ENCODER, false, A.rec_gpu ? "Kayıt: ekran kartı" : "Kayıt: işlemci");
+	add_button(CMD_OPEN_FOLDER, false, "Kayıt klasörü");
+	add_button(CMD_VOL_DOWN, false, "Ses -");
+	add_button(CMD_VOL_100, false, "Ses %%%d", SDL_AtomicGet(&A.volume));
+	add_button(CMD_VOL_UP, false, "Ses +");
+	add_button(CMD_MUTE, muted, "Sessiz");
+	add_button(CMD_RES_NEXT, false, "%d×%d", A.width, A.height);
+	add_button(CMD_FPS_NEXT, false, "%d fps", A.fps);
+	add_button(CMD_CODEC_NEXT, false, A.h265 ? "H.265" : "H.264");
+	add_button(CMD_HW_DECODE, false, A.hw_decode ? "Çözme: ekran kartı" : "Çözme: işlemci");
+	add_button(CMD_FULLSCREEN, A.fullscreen, "Tam ekran");
+	add_button(CMD_ONTOP, A.on_top, "Üstte");
+	add_button(CMD_PAIR, false, "Yeni cihaz");
+}
+
+static bool bar_wanted(void)
+{
+	SDL_LockMutex(A.frame_mutex);
+	bool mirroring = A.have_frame;
+	SDL_UnlockMutex(A.frame_mutex);
+	return !mirroring || (A.bar_until && !SDL_TICKS_PASSED(SDL_GetTicks(), A.bar_until));
+}
+
+static void draw_bar(int ow, int oh)
+{
+	int ww = 0, wh = 0;
+	SDL_GetWindowSize(A.win, &ww, &wh);
+	int px = ww > 0 ? 15 * ow / ww : 15;
+	font_open(px < 10 ? 10 : px);
+	build_buttons();
+
+	int pad = A.font_px * 2 / 3, bh = A.font_px * 2, gap = A.font_px / 2;
+	/* the buttons from the left, in as many rows as they need */
+	int x = gap, rows = 1;
+	for (int i = 0; i < button_count; i++) {
+		struct text_entry *t = text_get(buttons[i].text);
+		int bw = (t ? t->w : A.font_px * 4) + pad * 2;
+		if (x + bw + gap > ow && x > gap) {
+			x = gap;
+			rows++;
+		}
+		buttons[i].r.x = x;
+		buttons[i].r.y = rows - 1; /* (the row, for now) */
+		buttons[i].r.w = bw;
+		buttons[i].r.h = bh;
+		x += bw + gap;
+	}
+	int status_h = A.font_px * 2;
+	int bar_h = status_h + rows * (bh + gap);
+	int y0 = oh - bar_h;
+	for (int i = 0; i < button_count; i++)
+		buttons[i].r.y = y0 + status_h + buttons[i].r.y * (bh + gap);
+
+	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_BLEND);
+	SDL_Rect bar = {0, y0, ow, bar_h};
+	SDL_SetRenderDrawColor(A.ren, 12, 14, 20, 215);
+	SDL_RenderFillRect(A.ren, &bar);
+
+	char status[600];
+	status_text(status, sizeof(status));
+	struct text_entry *st = text_get(status);
+	if (st) {
+		SDL_Rect dst = {gap, y0 + (status_h - st->h) / 2, st->w, st->h};
+		if (dst.w > ow - 2 * gap) {
+			SDL_Rect src = {0, 0, ow - 2 * gap, st->h};
+			dst.w = src.w;
+			SDL_RenderCopy(A.ren, st->tex, &src, &dst);
+		} else {
+			SDL_RenderCopy(A.ren, st->tex, NULL, &dst);
+		}
+	}
+	for (int i = 0; i < button_count; i++) {
+		struct button *b = &buttons[i];
+		if (b->on)
+			SDL_SetRenderDrawColor(A.ren, 200, 60, 60, 255);
+		else
+			SDL_SetRenderDrawColor(A.ren, 58, 64, 78, 255);
+		SDL_RenderFillRect(A.ren, &b->r);
+		struct text_entry *t = text_get(b->text);
+		if (t) {
+			SDL_Rect dst = {b->r.x + (b->r.w - t->w) / 2, b->r.y + (b->r.h - t->h) / 2, t->w, t->h};
+			SDL_RenderCopy(A.ren, t->tex, NULL, &dst);
+		}
+	}
+	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_NONE);
+}
+
+/* the button at this place of the window (window coordinates), or CMD_NONE */
+static int button_at(int mx, int my)
+{
+	int ow = 0, oh = 0, ww = 0, wh = 0;
+	if (!A.bar_drawn)
+		return CMD_NONE;
+	SDL_GetRendererOutputSize(A.ren, &ow, &oh);
+	SDL_GetWindowSize(A.win, &ww, &wh);
+	if (ww <= 0 || wh <= 0)
+		return CMD_NONE;
+	SDL_Point p = {mx * ow / ww, my * oh / wh};
+	for (int i = 0; i < button_count; i++) {
+		if (SDL_PointInRect(&p, &buttons[i].r))
+			return buttons[i].cmd;
+	}
+	return CMD_NONE;
 }
 
 /* the pairing code, as large seven-segment digits */
@@ -1319,36 +1573,52 @@ static void draw(void)
 {
 	int ow = 0, oh = 0;
 	SDL_GetRendererOutputSize(A.ren, &ow, &oh);
-	SDL_SetRenderDrawColor(A.ren, 0, 0, 0, 255);
-	SDL_RenderClear(A.ren);
 
 	char pin[8];
 	SDL_LockMutex(A.mutex);
 	snprintf(pin, sizeof(pin), "%s", A.pin);
 	SDL_UnlockMutex(A.mutex);
 
-	bool show = false;
+	/* the newest picture into the texture (YUV: the graphics card makes the colours and the size) */
+	bool got = false, full = false, bt709 = true, show;
 	SDL_LockMutex(A.frame_mutex);
-	if (A.have_frame && A.front && A.fw > 0 && A.fh > 0) {
-		if (!A.tex || A.tex_w != A.fw || A.tex_h != A.fh) {
+	if (A.have_frame && A.frame_dirty && A.pending->data[0]) {
+		av_frame_unref(A.upload);
+		av_frame_move_ref(A.upload, A.pending);
+		full = A.pending_full;
+		bt709 = A.pending_709;
+		A.frame_dirty = false;
+		got = true;
+	}
+	show = A.have_frame;
+	SDL_UnlockMutex(A.frame_mutex);
+	if (got) {
+		AVFrame *f = A.upload;
+		Uint32 format = f->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12 : SDL_PIXELFORMAT_IYUV;
+		int mode = full ? SDL_YUV_CONVERSION_JPEG : bt709 ? SDL_YUV_CONVERSION_BT709 : SDL_YUV_CONVERSION_BT601;
+		if (!A.tex || A.tex_w != f->width || A.tex_h != f->height || A.tex_format != format || A.tex_mode != mode) {
 			if (A.tex)
 				SDL_DestroyTexture(A.tex);
-			A.tex = SDL_CreateTexture(A.ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, A.fw, A.fh);
-			A.tex_w = A.fw;
-			A.tex_h = A.fh;
-			A.frame_dirty = true;
+			SDL_SetYUVConversionMode((SDL_YUV_CONVERSION_MODE)mode);
+			A.tex = SDL_CreateTexture(A.ren, format, SDL_TEXTUREACCESS_STREAMING, f->width, f->height);
+			A.tex_w = f->width;
+			A.tex_h = f->height;
+			A.tex_format = format;
+			A.tex_mode = mode;
 		}
-		if (A.tex && A.frame_dirty) {
-			SDL_UpdateTexture(A.tex, NULL, A.front, A.fw * 4);
-			A.frame_dirty = false;
-		}
-		show = A.tex != NULL;
+		if (A.tex && format == SDL_PIXELFORMAT_NV12)
+			SDL_UpdateNVTexture(A.tex, NULL, f->data[0], f->linesize[0], f->data[1], f->linesize[1]);
+		else if (A.tex)
+			SDL_UpdateYUVTexture(A.tex, NULL, f->data[0], f->linesize[0], f->data[1], f->linesize[1], f->data[2],
+					     f->linesize[2]);
+		av_frame_unref(f);
 	}
-	SDL_UnlockMutex(A.frame_mutex);
 
+	SDL_SetRenderDrawColor(A.ren, 0, 0, 0, 255);
+	SDL_RenderClear(A.ren);
 	if (pin[0]) {
 		draw_pin(pin, ow, oh);
-	} else if (show && ow > 0 && oh > 0) {
+	} else if (show && A.tex && ow > 0 && oh > 0) {
 		SDL_Rect dst;
 		if ((int64_t)ow * A.tex_h > (int64_t)oh * A.tex_w) {
 			dst.h = oh;
@@ -1361,6 +1631,9 @@ static void draw(void)
 		dst.y = (oh - dst.h) / 2;
 		SDL_RenderCopy(A.ren, A.tex, NULL, &dst);
 	}
+	A.bar_drawn = bar_wanted();
+	if (A.bar_drawn)
+		draw_bar(ow, oh);
 	SDL_RenderPresent(A.ren);
 }
 
@@ -1383,8 +1656,7 @@ static void open_video_folder(void)
 #endif
 }
 
-/* true: the program should end */
-static bool run_command(int cmd)
+static void run_command(int cmd)
 {
 	bool restart = false;
 	switch (cmd) {
@@ -1408,12 +1680,15 @@ static bool run_command(int cmd)
 		change_volume(-10);
 		break;
 	case CMD_VOL_100:
-		SDL_AtomicSet(&A.volume, 100);
-		SDL_AtomicSet(&A.muted, 0);
-		save_settings();
+		change_volume(100 - SDL_AtomicGet(&A.volume));
 		break;
 	case CMD_RECORD:
 		rec_toggle();
+		break;
+	case CMD_REC_ENCODER:
+		/* (for the next recording) */
+		A.rec_gpu = !A.rec_gpu;
+		save_settings();
 		break;
 	case CMD_OPEN_FOLDER:
 		open_video_folder();
@@ -1427,120 +1702,40 @@ static bool run_command(int cmd)
 		if (A.proc)
 			proc_write(A.proc, "allow_pairing 1\n");
 		break;
-	case CMD_FORGET:
-		remove("paired-devices.txt");
+	case CMD_RES_NEXT:
+		if (A.height < 1080)
+			A.width = 1920, A.height = 1080;
+		else if (A.height < 1440)
+			A.width = 2560, A.height = 1440;
+		else if (A.height < 2160)
+			A.width = 3840, A.height = 2160;
+		else
+			A.width = 1280, A.height = 720;
 		restart = true;
 		break;
-	case CMD_RES_720:
-		A.width = 1280, A.height = 720, restart = true;
+	case CMD_FPS_NEXT:
+		A.fps = A.fps >= 60 ? 30 : 60;
+		restart = true;
 		break;
-	case CMD_RES_1080:
-		A.width = 1920, A.height = 1080, restart = true;
+	case CMD_CODEC_NEXT:
+		A.h265 = !A.h265;
+		restart = true;
 		break;
-	case CMD_RES_1440:
-		A.width = 2560, A.height = 1440, restart = true;
+	case CMD_HW_DECODE:
+		A.hw_decode = !A.hw_decode;
+		restart = true;
 		break;
-	case CMD_RES_2160:
-		A.width = 3840, A.height = 2160, restart = true;
-		break;
-	case CMD_FPS_30:
-		A.fps = 30, restart = true;
-		break;
-	case CMD_FPS_60:
-		A.fps = 60, restart = true;
-		break;
-	case CMD_H264:
-		A.h265 = false, restart = true;
-		break;
-	case CMD_H265:
-		A.h265 = true, restart = true;
-		break;
-	case CMD_QUIT:
-		return true;
 	default:
 		break;
 	}
 	if (restart) {
-		/* the iPad learns the new size / rate / codec when it connects again */
+		/* the iPad learns the new size / rate / codec when it connects again: the receiver restarts a moment
+		 * after the last click */
 		save_settings();
-		session_start();
+		A.apply_at = SDL_GetTicks() + 1500;
 	}
 	update_title();
-	return false;
 }
-
-#ifdef _WIN32
-static int show_menu(void)
-{
-	SDL_SysWMinfo info;
-	SDL_VERSION(&info.version);
-	if (!SDL_GetWindowWMInfo(A.win, &info))
-		return CMD_NONE;
-	HWND hwnd = info.info.win.window;
-	HMENU menu = CreatePopupMenu(), res = CreatePopupMenu(), fps = CreatePopupMenu(), codec = CreatePopupMenu(),
-	      sound = CreatePopupMenu();
-	if (!menu || !res || !fps || !codec || !sound)
-		return CMD_NONE;
-
-	SDL_LockMutex(R.mutex);
-	bool recording = R.want;
-	SDL_UnlockMutex(R.mutex);
-	int vol = SDL_AtomicGet(&A.volume);
-	bool muted = SDL_AtomicGet(&A.muted) != 0;
-	wchar_t text[96];
-
-	AppendMenuW(res, MF_STRING | (A.height == 720 ? MF_CHECKED : 0), CMD_RES_720, L"1280 × 720");
-	AppendMenuW(res, MF_STRING | (A.height == 1080 ? MF_CHECKED : 0), CMD_RES_1080, L"1920 × 1080");
-	AppendMenuW(res, MF_STRING | (A.height == 1440 ? MF_CHECKED : 0), CMD_RES_1440, L"2560 × 1440");
-	AppendMenuW(res, MF_STRING | (A.height == 2160 ? MF_CHECKED : 0), CMD_RES_2160, L"3840 × 2160 (4K)");
-	AppendMenuW(fps, MF_STRING | (A.fps == 30 ? MF_CHECKED : 0), CMD_FPS_30, L"30 fps");
-	AppendMenuW(fps, MF_STRING | (A.fps == 60 ? MF_CHECKED : 0), CMD_FPS_60, L"60 fps");
-	AppendMenuW(codec, MF_STRING | (!A.h265 ? MF_CHECKED : 0), CMD_H264, L"H.264 (her iPad'de çalışır)");
-	AppendMenuW(codec, MF_STRING | (A.h265 ? MF_CHECKED : 0), CMD_H265,
-		    L"H.265 izinli (aynı bit hızında daha net)");
-	AppendMenuW(sound, MF_STRING, CMD_VOL_UP, L"Sesi artır (+%10)\tYukarı ok");
-	AppendMenuW(sound, MF_STRING, CMD_VOL_DOWN, L"Sesi azalt (−%10)\tAşağı ok");
-	AppendMenuW(sound, MF_STRING, CMD_VOL_100, L"%100'e getir");
-	AppendMenuW(sound, MF_STRING | (muted ? MF_CHECKED : 0), CMD_MUTE, L"Sessiz\tM");
-
-	AppendMenuW(menu, MF_STRING | (recording ? MF_CHECKED : 0), CMD_RECORD,
-		    recording ? L"Kaydı durdur\tR" : L"Kaydı başlat\tR");
-	AppendMenuW(menu, MF_STRING, CMD_OPEN_FOLDER, L"Kayıt klasörünü aç");
-	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-	_snwprintf(text, 95, L"Ses: %%%d%ls", vol, muted ? L" (sessiz)" : L"");
-	text[95] = 0;
-	AppendMenuW(menu, MF_POPUP, (UINT_PTR)sound, text);
-	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-	_snwprintf(text, 95, L"Çözünürlük: %d × %d", A.width, A.height);
-	text[95] = 0;
-	AppendMenuW(menu, MF_POPUP, (UINT_PTR)res, text);
-	_snwprintf(text, 95, L"Kare hızı: %d fps", A.fps);
-	text[95] = 0;
-	AppendMenuW(menu, MF_POPUP, (UINT_PTR)fps, text);
-	AppendMenuW(menu, MF_POPUP, (UINT_PTR)codec, A.h265 ? L"Kodek: H.265 izinli" : L"Kodek: H.264");
-	AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"(bu üçü değişince iPad'den yeniden bağlanın)");
-	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(menu, MF_STRING | (A.fullscreen ? MF_CHECKED : 0), CMD_FULLSCREEN, L"Tam ekran\tF");
-	AppendMenuW(menu, MF_STRING | (A.on_top ? MF_CHECKED : 0), CMD_ONTOP, L"Her zaman üstte\tT");
-	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(menu, MF_STRING, CMD_PAIR, L"Yeni cihaz eşleştir\tP");
-	AppendMenuW(menu, MF_STRING, CMD_FORGET, L"Eşleşmiş cihazları unut");
-	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(menu, MF_STRING, CMD_QUIT, L"Çıkış");
-
-	POINT pt;
-	GetCursorPos(&pt);
-	SetForegroundWindow(hwnd);
-	int cmd = (int)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-	DestroyMenu(menu); /* (with its submenus) */
-	return cmd;
-}
-#else
-static int show_menu(void)
-{
-	return CMD_NONE;
-}
-#endif
 
 static int key_command(SDL_Keycode key)
 {
@@ -1616,11 +1811,16 @@ int main(int argc, char *argv[])
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP_NAME, SDL_GetError(), NULL);
 		return 1;
 	}
+	TTF_Init();
 	A.mutex = SDL_CreateMutex();
 	A.frame_mutex = SDL_CreateMutex();
 	R.mutex = SDL_CreateMutex();
 	log_mutex = SDL_CreateMutex();
 	A.event_type = SDL_RegisterEvents(1);
+	A.pending = av_frame_alloc();
+	A.upload = av_frame_alloc();
+	if (!A.pending || !A.upload)
+		return 1;
 
 	char *base = SDL_GetBasePath();
 	snprintf(A.exe, sizeof(A.exe), "%s" RECEIVER_EXE, base ? base : "");
@@ -1683,27 +1883,36 @@ int main(int argc, char *argv[])
 						redraw = retitle = true;
 					}
 				} else if (e.type == SDL_WINDOWEVENT) {
+					if (e.window.event == SDL_WINDOWEVENT_LEAVE)
+						A.bar_until = 0;
 					redraw = true;
-				} else if (e.type == SDL_KEYDOWN && !e.key.repeat) {
-					cmd = key_command(e.key.keysym.sym);
+				} else if (e.type == SDL_MOUSEMOTION) {
+					A.bar_until = SDL_GetTicks() + 2500;
+					if (!A.bar_drawn)
+						redraw = true;
 				} else if (e.type == SDL_KEYDOWN &&
-					   (e.key.keysym.sym == SDLK_UP || e.key.keysym.sym == SDLK_DOWN)) {
+					   (!e.key.repeat || e.key.keysym.sym == SDLK_UP || e.key.keysym.sym == SDLK_DOWN)) {
 					cmd = key_command(e.key.keysym.sym);
-				} else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_RIGHT) {
-					cmd = show_menu();
-				} else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT &&
-					   e.button.clicks == 2) {
-					cmd = CMD_FULLSCREEN;
+				} else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+					A.bar_until = SDL_GetTicks() + 2500;
+					cmd = button_at(e.button.x, e.button.y);
+					if (cmd == CMD_NONE && e.button.clicks == 2)
+						cmd = CMD_FULLSCREEN;
+					redraw = true;
 				}
 				if (cmd != CMD_NONE) {
-					if (run_command(cmd))
-						quit = true;
+					run_command(cmd);
 					redraw = true;
 				}
 			} while (!quit && SDL_PollEvent(&e));
 		}
 
 		Uint32 now = SDL_GetTicks();
+		if (!quit && A.apply_at && SDL_TICKS_PASSED(now, A.apply_at)) {
+			A.apply_at = 0;
+			session_start();
+			redraw = retitle = true;
+		}
 		if (!quit && A.restart_at && SDL_TICKS_PASSED(now, A.restart_at) && !A.proc) {
 			session_start();
 			retitle = true;
@@ -1717,7 +1926,11 @@ int main(int argc, char *argv[])
 			SDL_UnlockMutex(A.mutex);
 			A.stats_at = now;
 			retitle = true;
+			if (A.bar_drawn)
+				redraw = true;
 		}
+		if (A.bar_drawn != bar_wanted())
+			redraw = true;
 		if (retitle)
 			update_title();
 		if (redraw)
@@ -1732,6 +1945,7 @@ int main(int argc, char *argv[])
 		SDL_CloseAudioDevice(A.adev);
 	save_settings();
 	app_log("ended");
+	texts_clear();
 	if (A.tex)
 		SDL_DestroyTexture(A.tex);
 	SDL_DestroyRenderer(A.ren);
