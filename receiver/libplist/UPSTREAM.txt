@@ -1,0 +1,4 @@
+libplist, from https://github.com/libimobiledevice/libplist at commit 3cfe224 (7 November 2026): the C
+library only (src/*.c and *.h, include/plist/plist.h, libcnary), LGPL-2.1 (COPYING.LESSER). Unchanged;
+config.h is ReliosOBS's (the receiver is built without autotools). Used by UxPlay's library for the
+AirPlay property lists.

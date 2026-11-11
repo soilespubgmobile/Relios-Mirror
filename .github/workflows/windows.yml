@@ -1,0 +1,32 @@
+name: Windows exe
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-ffmpeg
+            mingw-w64-ucrt-x86_64-SDL2
+      - name: Build and gather
+        run: bash paketle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReliosMirror-windows
+          path: dist/ReliosMirror

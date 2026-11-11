@@ -1,0 +1,58 @@
+RELIOS MIRROR
+iPad / iPhone ekranını Wi-Fi üzerinden (AirPlay) bilgisayarda kendi penceresinde gösterir. OBS gerekmez.
+Pencereyi Discord'da, OBS'te ya da başka bir programda "pencere" olarak seçip yayınlayabilirsiniz.
+
+
+KULLANIM
+1. ReliosMirror.exe'yi açın (klasördeki diğer dosyalar yanında kalmalı).
+   Windows Güvenlik Duvarı sorarsa "Özel ağlar" için izin verin.
+2. iPad ve bilgisayar aynı Wi-Fi ağında olsun.
+3. iPad'de Denetim Merkezi > Ekran Yansıtma > "Relios Mirror".
+4. İlk seferde pencerede 4 haneli kod çıkar; iPad'e girin. Sonraki bağlanmalarda kod sorulmaz.
+
+iPad listede "Relios Mirror" görünmüyorsa: guvenlik-duvari-izni.bat dosyasını bir kez çalıştırın.
+
+
+MENÜ VE TUŞLAR (pencereye sağ tıklayın)
+  R            Kaydı başlat / durdur  (Videolar\ReliosMirror klasörüne .mkv)
+  Yukarı/Aşağı Sesi %10 artır / azalt (%0 - %200)
+  M            Sessiz
+  F, F11       Tam ekran (çift tıklama da olur; Esc çıkar)
+  T            Her zaman üstte
+  P            Yeni cihaz eşleştir (ikinci bir iPad / iPhone için)
+Menüde ayrıca: çözünürlük (720p - 4K), kare hızı (30 / 60), kodek (H.264 / H.265),
+eşleşmiş cihazları unut. Çözünürlük, kare hızı ya da kodek değişince iPad'den yeniden bağlanın.
+
+Durum, çözünürlük, fps ve anlık bit hızı pencere başlığında yazar.
+
+
+DISCORD
+Ekran paylaş > Uygulamalar > "Relios Mirror" penceresi. Ses de paylaşılsın isterseniz paylaşım
+penceresinde sesi açık bırakın; ses seviyesini bu programdan ayarlayabilirsiniz.
+
+OBS
+Kaynak ekle > Pencere Yakalama > ReliosMirror.exe. Ses için: Uygulama Ses Yakalama > ReliosMirror.exe.
+Sanal kamera: OBS'te "Sanal Kamerayı Başlat" (bu programın kendi sanal kamerası yok).
+
+
+BİLMENİZ GEREKENLER
+- Bit hızını iPad kendisi seçer; AirPlay'de dışarıdan ayarlanamaz.
+- Şarj, kablosuz bağlantıda bilgisayardan açılıp kapatılamaz.
+- Ses beklemeden çalınır (en çok ~0,15 sn birikir, fazlası atılır). Discord'un kendi gecikmesi buna eklenir.
+- Kayıt, görüntüyü yeniden sıkıştırır (H.264, MKV); kayıt sırasında işlemci kullanımı artar.
+- OBS'teki "iPad Yansıtma" kaynağı aynı anda açıksa ikisi aynı portu (7000) ister; birini kapatın.
+- Ayarlar ve günlük: %APPDATA%\ReliosMirror (ayarlar.txt, log.txt). Sorun olursa log.txt'yi gönderin.
+
+
+EXE'Yİ DERLEMEK (kaynak koddan)
+A) GitHub ile (bilgisayara bir şey kurmadan):
+   1. github.com'da yeni bir depo açın, bu klasörün tamamını (.github klasörü dahil) yükleyin.
+   2. Depoda "Actions" sekmesi > "Windows exe" > en son çalışma bitince "ReliosMirror-windows"u indirin.
+B) Bilgisayarda:
+   1. https://www.msys2.org adresinden MSYS2'yi kurun (C:\msys64).
+   2. derle.bat'a çift tıklayın. Sonuç: dist\ReliosMirror klasörü.
+
+
+LİSANS
+GPL-3.0. Ağ tarafı ReliosOBS'un alıcısıdır (receiver klasörü, değiştirilmedi); o da UxPlay'in
+AirPlay kitaplığını kullanır (https://github.com/FDH2/UxPlay). Görüntü/ses çözme: FFmpeg. Pencere/ses: SDL2.

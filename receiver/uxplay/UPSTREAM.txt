@@ -1,0 +1,6 @@
+UxPlay's AirPlay server library (lib/), from https://github.com/FDH2/UxPlay at commit 05b0275
+("video_renderer: fix typo", 6 November 2026). Only lib/ is taken (without lib/dns_sd: the built-in
+mdnsd is used), with UxPlay's LICENSE (GPL-3.0; most lib/ files are LGPL-2.1, playfair GPL-3.0).
+
+The commit that adds this folder has the files exactly as upstream; ReliosOBS's changes come in later
+commits and are marked "RELIOS:" in the code (see ../README.md).
