@@ -28,6 +28,6 @@ if [ -f "$prefix/bin/SDL3.dll" ]; then
 	copy_dlls "$prefix/bin/SDL3.dll"
 fi
 
-cp BENIOKU.txt LICENSE guvenlik-duvari-izni.bat "$out/"
+cp BENIOKU.txt LICENSE guvenlik-duvari-izni.bat assets/logo.bmp "$out/"
 echo
 echo "Hazir: $out ($(ls "$out" | wc -l) dosya, $(du -sh "$out" | cut -f1))"

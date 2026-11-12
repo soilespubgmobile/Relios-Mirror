@@ -86,6 +86,8 @@ enum {
 	CMD_FPS_NEXT,
 	CMD_CODEC_NEXT,
 	CMD_REC_ENCODER,
+	CMD_REC_FORMAT,
+	CMD_REC_BITRATE,
 	CMD_HW_DECODE,
 };
 
@@ -112,6 +114,10 @@ static struct {
 	bool h265;
 	bool on_top;
 	bool rec_gpu;   /* record with the graphics card's encoder */
+	bool rec_mov;   /* record a QuickTime .mov (Apple's own format); otherwise .mkv */
+	int rec_kbit;   /* the recording's fixed bit rate; 0: by quality */
+	SDL_Texture *logo;
+	int logo_w, logo_h;
 	bool hw_decode; /* decode with the graphics card */
 	SDL_atomic_t volume; /* percent, 0..200 */
 	SDL_atomic_t muted;
@@ -167,6 +173,7 @@ static struct {
 	int64_t last_vpts, next_apts;
 	bool audio_started, header_written;
 	char encoder[32];
+	int fps;
 	char path[1400];
 } R;
 
@@ -343,6 +350,8 @@ static void load_settings(void)
 	A.h265 = false;
 	A.on_top = false;
 	A.rec_gpu = false;
+	A.rec_mov = true;
+	A.rec_kbit = 0;
 	A.hw_decode = true;
 	SDL_AtomicSet(&A.volume, 100);
 	SDL_AtomicSet(&A.muted, 0);
@@ -369,6 +378,10 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (sscanf(line, "kayit_mov=%d", &a) == 1) {
+			A.rec_mov = a != 0;
+		} else if (sscanf(line, "kayit_kbit=%d", &a) == 1 && a >= 0 && a <= 100000) {
+			A.rec_kbit = a;
 		}
 	}
 	fclose(f);
@@ -379,9 +392,9 @@ static void save_settings(void)
 	FILE *f = fopen("ayarlar.txt", "w");
 	if (!f)
 		return;
-	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\n", A.width,
+	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_mov=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
-		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0);
+		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_mov ? 1 : 0, A.rec_kbit);
 	fclose(f);
 }
 
@@ -476,11 +489,12 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 	struct tm *tm_now = localtime(&now);
 	if (tm_now)
 		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm_now);
-	snprintf(R.path, sizeof(R.path), "%s" PATH_SEP "ReliosMirror-%s.mkv", A.video_folder, stamp);
+	snprintf(R.path, sizeof(R.path), "%s" PATH_SEP "ReliosMirror-%s.%s", A.video_folder, stamp, A.rec_mov ? "mov" : "mkv");
 
 	R.w = f->width;
 	R.h = f->height;
-	if (avformat_alloc_output_context2(&R.oc, NULL, "matroska", R.path) < 0 || !R.oc)
+	R.fps = A.fps;
+	if (avformat_alloc_output_context2(&R.oc, NULL, A.rec_mov ? "mov" : "matroska", R.path) < 0 || !R.oc)
 		return false;
 	R.frame = av_frame_alloc();
 	R.pkt = av_packet_alloc();
@@ -500,18 +514,26 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 		R.enc->width = f->width & ~1;
 		R.enc->height = f->height & ~1;
 		R.enc->pix_fmt = gpu ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
-		R.enc->time_base = (AVRational){1, 1000};
-		R.enc->framerate = (AVRational){A.fps, 1};
+		R.enc->time_base = (AVRational){1, R.fps}; /* a constant frame rate: one tick per frame */
+		R.enc->framerate = (AVRational){R.fps, 1};
 		R.enc->gop_size = 120;
 		R.enc->color_range = full ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
 		R.enc->colorspace = bt709 ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
 		if (R.oc->oformat->flags & AVFMT_GLOBALHEADER)
 			R.enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 		AVDictionary *opts = NULL;
-		if (gpu) {
-			R.enc->bit_rate = (int64_t)R.enc->width * R.enc->height * A.fps / 10; /* 1080p60: ~12 Mbit/s */
-		} else {
+		if (!gpu)
 			av_dict_set(&opts, "preset", "veryfast", 0);
+		if (A.rec_kbit > 0) {
+			/* a fixed bit rate */
+			R.enc->bit_rate = (int64_t)A.rec_kbit * 1000;
+			R.enc->rc_max_rate = R.enc->bit_rate;
+			R.enc->rc_buffer_size = A.rec_kbit * 1000;
+			if (n == 0)
+				av_dict_set(&opts, "rc", "cbr", 0);
+		} else if (gpu) {
+			R.enc->bit_rate = (int64_t)R.enc->width * R.enc->height * R.fps / 10; /* 1080p60: ~12 Mbit/s */
+		} else {
 			av_dict_set(&opts, "crf", "20", 0);
 		}
 		int ret = avcodec_open2(R.enc, codec, &opts);
@@ -520,7 +542,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 			app_log("recording: the encoder %s did not open (%d)", names[n], ret);
 			avcodec_free_context(&R.enc);
 		} else {
-			snprintf(R.encoder, sizeof(R.encoder), "%s", gpu ? "GPU" : "CPU");
+			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "ekran kartı" : "işlemci", A.rec_mov ? "MOV" : "MKV");
 		}
 	}
 	if (!R.enc) {
@@ -599,13 +621,18 @@ static void rec_video(const AVFrame *f, bool full, bool bt709)
 					sws_scale(R.sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height,
 						  R.frame->data, R.frame->linesize);
 			}
-			int64_t pts = (int64_t)((now_ns() - R.t0) / 1000000ull);
-			if (pts <= R.last_vpts)
-				pts = R.last_vpts + 1;
-			R.last_vpts = pts;
-			R.frame->pts = pts;
-			if (avcodec_send_frame(R.enc, R.frame) >= 0)
-				rec_drain();
+			/* constant frame rate: this picture fills every frame time up to now (the iPad sends none while
+			 * its screen does not change), and is left out if its frame time is already filled */
+			int64_t index = (int64_t)((now_ns() - R.t0) / 1000ull * (uint64_t)R.fps / 1000000ull);
+			int64_t first = R.last_vpts + 1;
+			if (index - first > R.fps * 2)
+				first = index - R.fps * 2;
+			for (int64_t k = first; k <= index; k++) {
+				R.frame->pts = k;
+				if (avcodec_send_frame(R.enc, R.frame) >= 0)
+					rec_drain();
+				R.last_vpts = k;
+			}
 		}
 		if (opened || R.failed)
 			push_event(EV_STATE);
@@ -1312,7 +1339,7 @@ static void status_text(char *status, size_t size)
 	char rec[80] = "";
 	SDL_LockMutex(R.mutex);
 	if (R.oc && R.header_written)
-		snprintf(rec, sizeof(rec), " | KAYIT (%s)", R.encoder);
+		snprintf(rec, sizeof(rec), "  •  KAYIT (%s)", R.encoder);
 	else if (R.failed)
 		snprintf(rec, sizeof(rec), " | kayıt başlatılamadı");
 	else if (R.want)
@@ -1379,7 +1406,7 @@ static struct text_entry *text_get(const char *text)
 	}
 	if (text_count == (int)(sizeof(texts) / sizeof(texts[0])))
 		texts_clear();
-	SDL_Color white = {240, 240, 245, 255};
+	SDL_Color white = {255, 255, 255, 255}; /* (coloured when drawn) */
 	SDL_Surface *surface = TTF_RenderUTF8_Blended(A.font, text, white);
 	if (!surface)
 		return NULL;
@@ -1403,7 +1430,7 @@ struct button {
 	char text[64];
 	SDL_Rect r;
 };
-static struct button buttons[20];
+static struct button buttons[24];
 static int button_count;
 
 static void add_button(int cmd, bool on, const char *fmt, ...)
@@ -1428,6 +1455,11 @@ static void build_buttons(void)
 	button_count = 0;
 	add_button(CMD_RECORD, recording, recording ? "Kaydı durdur" : "Kayıt başlat");
 	add_button(CMD_REC_ENCODER, false, A.rec_gpu ? "Kayıt: ekran kartı" : "Kayıt: işlemci");
+	add_button(CMD_REC_FORMAT, false, A.rec_mov ? "Biçim: MOV" : "Biçim: MKV");
+	if (A.rec_kbit > 0)
+		add_button(CMD_REC_BITRATE, false, "Kayıt: %d kbit", A.rec_kbit);
+	else
+		add_button(CMD_REC_BITRATE, false, "Kayıt: otomatik bit");
 	add_button(CMD_OPEN_FOLDER, false, "Kayıt klasörü");
 	add_button(CMD_VOL_DOWN, false, "Ses -");
 	add_button(CMD_VOL_100, false, "Ses %%%d", SDL_AtomicGet(&A.volume));
@@ -1452,10 +1484,6 @@ static bool bar_wanted(void)
 
 static void draw_bar(int ow, int oh)
 {
-	int ww = 0, wh = 0;
-	SDL_GetWindowSize(A.win, &ww, &wh);
-	int px = ww > 0 ? 15 * ow / ww : 15;
-	font_open(px < 10 ? 10 : px);
 	build_buttons();
 
 	int pad = A.font_px * 2 / 3, bh = A.font_px * 2, gap = A.font_px / 2;
@@ -1482,13 +1510,17 @@ static void draw_bar(int ow, int oh)
 
 	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_BLEND);
 	SDL_Rect bar = {0, y0, ow, bar_h};
-	SDL_SetRenderDrawColor(A.ren, 12, 14, 20, 215);
+	SDL_SetRenderDrawColor(A.ren, 3, 13, 11, 228);
 	SDL_RenderFillRect(A.ren, &bar);
+	SDL_Rect line = {0, y0, ow, A.font_px / 8 > 1 ? A.font_px / 8 : 1};
+	SDL_SetRenderDrawColor(A.ren, 0, 166, 126, 255);
+	SDL_RenderFillRect(A.ren, &line);
 
 	char status[600];
 	status_text(status, sizeof(status));
 	struct text_entry *st = text_get(status);
 	if (st) {
+		SDL_SetTextureColorMod(st->tex, 150, 205, 190);
 		SDL_Rect dst = {gap, y0 + (status_h - st->h) / 2, st->w, st->h};
 		if (dst.w > ow - 2 * gap) {
 			SDL_Rect src = {0, 0, ow - 2 * gap, st->h};
@@ -1500,18 +1532,53 @@ static void draw_bar(int ow, int oh)
 	}
 	for (int i = 0; i < button_count; i++) {
 		struct button *b = &buttons[i];
+		/* soft corners: two overlapping rectangles */
+		int c = A.font_px / 4;
+		SDL_Rect wide = {b->r.x, b->r.y + c, b->r.w, b->r.h - 2 * c};
+		SDL_Rect tall = {b->r.x + c, b->r.y, b->r.w - 2 * c, b->r.h};
 		if (b->on)
-			SDL_SetRenderDrawColor(A.ren, 200, 60, 60, 255);
+			SDL_SetRenderDrawColor(A.ren, 0, 166, 126, 255);
 		else
-			SDL_SetRenderDrawColor(A.ren, 58, 64, 78, 255);
-		SDL_RenderFillRect(A.ren, &b->r);
+			SDL_SetRenderDrawColor(A.ren, 10, 44, 37, 255);
+		SDL_RenderFillRect(A.ren, &wide);
+		SDL_RenderFillRect(A.ren, &tall);
 		struct text_entry *t = text_get(b->text);
 		if (t) {
+			if (b->on)
+				SDL_SetTextureColorMod(t->tex, 2, 16, 13);
+			else
+				SDL_SetTextureColorMod(t->tex, 214, 240, 232);
 			SDL_Rect dst = {b->r.x + (b->r.w - t->w) / 2, b->r.y + (b->r.h - t->h) / 2, t->w, t->h};
 			SDL_RenderCopy(A.ren, t->tex, NULL, &dst);
 		}
 	}
 	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_NONE);
+}
+
+/* nothing is mirrored: the logo and what to do on the iPad */
+static void draw_idle(int ow, int oh)
+{
+	SDL_SetRenderDrawColor(A.ren, 3, 13, 11, 255);
+	SDL_RenderClear(A.ren);
+	int size = oh / 4, y = oh / 5;
+	if (A.logo && size > 0) {
+		SDL_Rect dst = {(ow - size) / 2, y, size, size};
+		SDL_RenderCopy(A.ren, A.logo, NULL, &dst);
+	}
+	y += size + A.font_px;
+	static const char *const lines[] = {APP_NAME, "iPad  →  Denetim Merkezi  →  Ekran Yansıtma  →  " RECEIVER_NAME};
+	for (int i = 0; i < 2; i++) {
+		struct text_entry *t = text_get(lines[i]);
+		if (!t)
+			continue;
+		if (i == 0)
+			SDL_SetTextureColorMod(t->tex, 0, 190, 145);
+		else
+			SDL_SetTextureColorMod(t->tex, 150, 205, 190);
+		SDL_Rect dst = {(ow - t->w) / 2, y, t->w, t->h};
+		SDL_RenderCopy(A.ren, t->tex, NULL, &dst);
+		y += t->h + A.font_px / 2;
+	}
 }
 
 /* the button at this place of the window (window coordinates), or CMD_NONE */
@@ -1545,9 +1612,9 @@ static void draw_pin(const char *pin, int ow, int oh)
 	int dw = dh / 2, gap = dh / 5, t = dh / 9 > 2 ? dh / 9 : 2;
 	int total = count * dw + (count - 1) * gap;
 	int x0 = (ow - total) / 2, y0 = (oh - dh) / 2;
-	SDL_SetRenderDrawColor(A.ren, 18, 22, 30, 255);
+	SDL_SetRenderDrawColor(A.ren, 3, 13, 11, 255);
 	SDL_RenderClear(A.ren);
-	SDL_SetRenderDrawColor(A.ren, 240, 240, 245, 255);
+	SDL_SetRenderDrawColor(A.ren, 0, 190, 145, 255);
 	for (int i = 0; i < count; i++) {
 		if (pin[i] < '0' || pin[i] > '9')
 			continue;
@@ -1614,11 +1681,18 @@ static void draw(void)
 		av_frame_unref(f);
 	}
 
+	int ww = 0, wh = 0;
+	SDL_GetWindowSize(A.win, &ww, &wh);
+	int px = ww > 0 ? 15 * ow / ww : 15;
+	font_open(px < 10 ? 10 : px);
+
 	SDL_SetRenderDrawColor(A.ren, 0, 0, 0, 255);
 	SDL_RenderClear(A.ren);
 	if (pin[0]) {
 		draw_pin(pin, ow, oh);
-	} else if (show && A.tex && ow > 0 && oh > 0) {
+	} else if (!show) {
+		draw_idle(ow, oh);
+	} else if (A.tex && ow > 0 && oh > 0) {
 		SDL_Rect dst;
 		if ((int64_t)ow * A.tex_h > (int64_t)oh * A.tex_w) {
 			dst.h = oh;
@@ -1690,6 +1764,21 @@ static void run_command(int cmd)
 		A.rec_gpu = !A.rec_gpu;
 		save_settings();
 		break;
+	case CMD_REC_FORMAT:
+		A.rec_mov = !A.rec_mov;
+		save_settings();
+		break;
+	case CMD_REC_BITRATE: {
+		static const int steps[] = {0, 10000, 15000, 20000, 30000, 50000};
+		int n = (int)(sizeof(steps) / sizeof(steps[0])), at = 0;
+		for (int i = 0; i < n; i++) {
+			if (steps[i] == A.rec_kbit)
+				at = i;
+		}
+		A.rec_kbit = steps[(at + 1) % n];
+		save_settings();
+		break;
+	}
 	case CMD_OPEN_FOLDER:
 		open_video_folder();
 		break;
@@ -1768,18 +1857,27 @@ static int key_command(SDL_Keycode key)
  * Windows made for the receiver if its own question was dismissed are removed. */
 static void ensure_firewall_rule(void)
 {
-	if (proc_run("netsh", "advfirewall firewall show rule name=\"Relios Mirror\"", 10000) == 0)
+	/* (the rule names the receiver program: made again if the folder moved) */
+	char *made_for = read_text("firewall.txt");
+	bool same = made_for && !strcmp(made_for, A.exe);
+	free(made_for);
+	if (same && proc_run("netsh", "advfirewall firewall show rule name=\"Relios Mirror\"", 10000) == 0)
 		return;
+	if (strpbrk(A.exe, "%^!\"&")) {
+		app_log("firewall rule not made by the program: unusual letters in its folder's name");
+		return;
+	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
 				 "iPad'in bağlanabilmesi için Windows Güvenlik Duvarı'nda izin gerekiyor.\n\n"
-				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin (bir kez sorulur).",
+				 "İzin yalnızca alıcı programa ve yalnızca yerel ağdan gelen bağlantılara verilir.\n"
+				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.",
 				 A.win);
-	char cmd[6000];
+	char cmd[8000];
 	snprintf(cmd, sizeof(cmd),
-		 "/c \"netsh advfirewall firewall delete rule name=all program=\"%s\""
-		 " & netsh advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow protocol=TCP localport=7000,7100"
-		 " & netsh advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow protocol=UDP localport=5353,6000,6001,7011\"",
-		 A.exe);
+		 "/c \"netsh advfirewall firewall delete rule name=\"Relios Mirror\""
+		 " & netsh advfirewall firewall delete rule name=all program=\"%s\""
+		 " & netsh advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet enable=yes\"",
+		 A.exe, A.exe);
 	wchar_t *w = to_wide(cmd);
 	if (!w)
 		return;
@@ -1794,9 +1892,14 @@ static void ensure_firewall_rule(void)
 	if (ShellExecuteExW(&info) && info.hProcess) {
 		WaitForSingleObject(info.hProcess, 20000);
 		CloseHandle(info.hProcess);
-		app_log("firewall rules asked for");
+		FILE *f = fopen("firewall.txt", "w");
+		if (f) {
+			fputs(A.exe, f);
+			fclose(f);
+		}
+		app_log("firewall rule asked for (the receiver program, local network only)");
 	} else {
-		app_log("firewall rules not added (error %lu)", (unsigned long)GetLastError());
+		app_log("firewall rule not added (error %lu)", (unsigned long)GetLastError());
 	}
 	free(w);
 }
@@ -1848,6 +1951,18 @@ int main(int argc, char *argv[])
 	}
 	if (A.on_top)
 		SDL_SetWindowAlwaysOnTop(A.win, SDL_TRUE);
+	{
+		char path[2100];
+		char *folder = SDL_GetBasePath();
+		snprintf(path, sizeof(path), "%slogo.bmp", folder ? folder : "");
+		SDL_free(folder);
+		SDL_Surface *logo = SDL_LoadBMP(path);
+		if (logo) {
+			SDL_SetWindowIcon(A.win, logo);
+			A.logo = SDL_CreateTextureFromSurface(A.ren, logo);
+			SDL_FreeSurface(logo);
+		}
+	}
 
 #ifdef _WIN32
 	ensure_firewall_rule();

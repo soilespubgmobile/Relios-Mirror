@@ -41,7 +41,10 @@ BİLMENİZ GEREKENLER
 - Bit hızını iPad kendisi seçer; AirPlay'de dışarıdan ayarlanamaz.
 - Şarj, kablosuz bağlantıda bilgisayardan açılıp kapatılamaz.
 - Ses beklemeden çalınır (en çok ~0,15 sn birikir, fazlası atılır). Discord'un kendi gecikmesi buna eklenir.
-- Kayıt, görüntüyü yeniden sıkıştırır (H.264, MKV); kayıt sırasında işlemci kullanımı artar.
+- Kayıt: H.264, sabit fps, QuickTime .mov (Apple biçimi) ya da .mkv; sabit bit hızı seçilebilir
+  (10000 - 50000 kbit) ya da otomatik. İşlemciyle ya da ekran kartıyla sıkıştırılır.
+- Güvenlik: alıcı düşük yetkiyle çalışır, yalnızca yerel ağdan bağlantı kabul eder, yeni cihaz kodla eşleşir;
+  güvenlik duvarı izni yalnızca alıcı programa ve yerel ağa verilir.
 - OBS'teki "iPad Yansıtma" kaynağı aynı anda açıksa ikisi aynı portu (7000) ister; birini kapatın.
 - Ayarlar ve günlük: %APPDATA%\ReliosMirror (ayarlar.txt, log.txt). Sorun olursa log.txt'yi gönderin.
 
