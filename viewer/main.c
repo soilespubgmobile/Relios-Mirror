@@ -387,8 +387,8 @@ static void load_settings(void)
 	A.fps = 60;
 	A.h265 = false;
 	A.on_top = false;
-	A.rec_gpu = false;
-	A.rec_format = 0;
+	A.rec_gpu = true;
+	A.rec_format = 1;
 	A.rec_mode = 0;
 	A.rec_kbit = 15000;
 	A.hw_decode = true;
@@ -397,7 +397,8 @@ static void load_settings(void)
 	FILE *f = fopen("ayarlar.txt", "r");
 	if (!f)
 		return;
-	char line[200];
+	char line[400];
+	int version = 1;
 	while (fgets(line, sizeof(line), f)) {
 		int a = 0, b = 0;
 		if (sscanf(line, "cozunurluk=%dx%d", &a, &b) == 2 && a >= 320 && b >= 240 && a <= 3840 && b <= 2160) {
@@ -417,6 +418,8 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (sscanf(line, "surum=%d", &a) == 1) {
+			version = a;
 		} else if (sscanf(line, "oran169=%d", &a) == 1) {
 			SDL_AtomicSet(&A.fit169, a != 0);
 		} else if (!strncmp(line, "ses_aygiti=", 11)) {
@@ -431,6 +434,11 @@ static void load_settings(void)
 		}
 	}
 	fclose(f);
+	if (version < 2) {
+		/* (settings saved before these became the defaults: the graphics card and .mov once) */
+		A.rec_gpu = true;
+		A.rec_format = 1;
+	}
 }
 
 static void save_settings(void)
@@ -441,7 +449,7 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
-	fprintf(f, "ses_aygiti=%s\noran169=%d\n", A.audio_device, SDL_AtomicGet(&A.fit169));
+	fprintf(f, "ses_aygiti=%s\noran169=%d\nsurum=2\n", A.audio_device, SDL_AtomicGet(&A.fit169));
 	fclose(f);
 }
 
@@ -1884,6 +1892,38 @@ static struct text_entry *text_get(const char *text)
 	return t;
 }
 
+/* the paired devices' names, for the settings ("Bayram iPad'i, ..."); read again every two seconds */
+static const char *paired_names(int *count)
+{
+	static char names[300];
+	static int n;
+	static Uint32 read_at;
+	Uint32 now = SDL_GetTicks();
+	if (!read_at || now - read_at > 2000) {
+		char *list = read_text("paired-devices.txt");
+		read_at = now ? now : 1;
+		names[0] = '\0';
+		n = 0;
+		for (char *line = list; line && *line;) {
+			char *end = strchr(line, '\n');
+			if (end)
+				*end = '\0';
+			/* <key> TAB <device id> TAB <name> TAB <date> */
+			char *tab1 = strchr(line, '\t'), *tab2 = tab1 ? strchr(tab1 + 1, '\t') : NULL;
+			if (tab1 && tab1 - line > 10) {
+				const char *name = tab2 ? tab2 + 1 : "?";
+				size_t len = strcspn(name, "\t\r"), used = strlen(names);
+				snprintf(names + used, sizeof(names) - used, "%s%.*s", n ? ", " : "", (int)len, name);
+				n++;
+			}
+			line = end ? end + 1 : NULL;
+		}
+		free(list);
+	}
+	*count = n;
+	return names;
+}
+
 /* ---- the interface: a bar at the bottom (shown while the mouse moves over the window, and while nothing is
  * mirrored) with the few things used all the time, and a settings panel for the rest */
 
@@ -2044,7 +2084,20 @@ static void draw_bar(int ow, int oh)
 						 "Ayarlar bir sonraki kayıtta geçerli olur.";
 		} else {
 			add_button(CMD_PAIR, pairing, "Yeni cihaz eşleştirme", pairing ? "Açık" : "Kapalı");
-			add_button(CMD_FORGET, false, "Eşleşmiş cihazlar", "Unut");
+			int paired = 0;
+			const char *names = paired_names(&paired);
+			char paired_label[64];
+			if (paired > 0) {
+				/* (shortened to fit, at a whole letter) */
+				size_t len = strlen(names), keep = len > 44 ? 44 : len;
+				while (keep > 0 && keep < len && ((unsigned char)names[keep] & 0xC0) == 0x80)
+					keep--;
+				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş: %.*s%s", (int)keep, names,
+					 keep < len ? "…" : "");
+			} else {
+				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş cihaz yok");
+			}
+			add_button(CMD_FORGET, false, paired_label, "Unut");
 			add_button(CMD_ONTOP, A.on_top, "Pencere her zaman üstte", A.on_top ? "Açık" : "Kapalı");
 			char device[64] = "Varsayılan";
 			if (A.audio_device[0]) {
