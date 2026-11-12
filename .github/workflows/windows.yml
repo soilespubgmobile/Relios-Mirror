@@ -4,7 +4,7 @@ on:
   push:
   workflow_dispatch:
 
-# (the build only reads the repository; only the "release" job below, for a version tag, may write to it)
+# (the build only reads the repository; only the "release" job at the end may write to it)
 permissions:
   contents: read
 
@@ -131,11 +131,15 @@ jobs:
           path: dist/ortam
           if-no-files-found: warn
 
-  # Only for a version tag (v1.2.3): the files of this build become a DRAFT release, which only the owner of the
-  # repository sees until it is published. The one job that may write to the repository; it builds nothing and
-  # runs nothing that was downloaded: it only passes the build's files on.
+  # The files of the build are kept as a DRAFT release (the repository's Releases page): only the owner of the
+  # repository sees a draft until it is published, and it does not expire as the build's artifacts do.
+  #  - a push to main: the draft of the version in viewer/version.h is made, or refreshed with this build
+  #    (a version that is already published is left alone);
+  #  - a version tag (v1.2.3): the files go to that tag's release.
+  # The one job that may write to the repository. It builds nothing and runs nothing that was downloaded or
+  # built: it only passes the build's files on.
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -144,28 +148,34 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: parts
-      - name: Make the draft release
+      - name: Keep the files as a draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version="${TAG#v}"
+          if [[ "$REF" == refs/tags/v* ]]; then
+            tag="$REF_NAME"
+          else
+            version=$(sed -n 's/^#define APP_VERSION "\([0-9][0-9.]*\)".*$/\1/p' parts/ReliosMirror-kaynak-kod/viewer/version.h | head -1)
+            test -n "$version"
+            tag="v$version"
+          fi
+          version="${tag#v}"
           mkdir -p out pack/ReliosMirror
           test -f parts/ReliosMirror-tek-exe/ReliosMirror.exe
           cp parts/ReliosMirror-tek-exe/ReliosMirror.exe out/ReliosMirror.exe
           cp -r parts/ReliosMirror-windows/. pack/ReliosMirror/
           (cd pack && zip -qr ../out/ReliosMirror-klasor.zip ReliosMirror)
-          if [ -d parts/ReliosMirror-kaynak-kod ]; then
-            mkdir -p pack/Relios-Mirror-kaynak-kod
-            cp -r parts/ReliosMirror-kaynak-kod/. pack/Relios-Mirror-kaynak-kod/
-            (cd pack && zip -qr ../out/Relios-Mirror-kaynak-kod.zip Relios-Mirror-kaynak-kod)
-          fi
+          mkdir -p pack/Relios-Mirror-kaynak-kod
+          cp -r parts/ReliosMirror-kaynak-kod/. pack/Relios-Mirror-kaynak-kod/
+          (cd pack && zip -qr ../out/Relios-Mirror-kaynak-kod.zip Relios-Mirror-kaynak-kod)
           if [ -d parts/ReliosMirror-sanal-kamera-kaynak ]; then cp parts/ReliosMirror-sanal-kamera-kaynak/*.zip out/; fi
           if [ -d parts/ReliosMirror-derleme-ortami ]; then cp parts/ReliosMirror-derleme-ortami/*.txt out/; fi
-          (cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          (cd out && sha256sum -- * > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt . && cat SHA256SUMS.txt)
           {
-            echo "Relios Mirror $version"
+            echo "Relios Mirror $version (commit ${GITHUB_SHA:0:7})"
             echo
             echo "- **ReliosMirror.exe**: program (tek dosya). Indirip calistirin."
             echo "- **ReliosMirror-klasor.zip**: ayni program, klasor halinde (butun DLL'leriyle)."
@@ -174,8 +184,18 @@ jobs:
             echo "- **derleme-ortami.txt**: bu surumun derlendigi arac ve kitaplik surumleri."
             echo "- **SHA256SUMS.txt**: dosyalarin SHA-256 ozetleri. Dogrulamak icin (PowerShell): \`Get-FileHash ReliosMirror.exe\`"
           } > notes.md
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          state=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          echo "release $tag: $state"
+          if [ "$state" = none ]; then
+            gh release create "$tag" out/* --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "Relios Mirror $version" --notes-file notes.md
+            echo "::notice::Draft release $tag made."
+          elif [ "$state" = true ]; then
+            gh release upload "$tag" out/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Relios Mirror $version" --notes-file notes.md
+            echo "::notice::Draft release $tag refreshed with this build."
+          elif [[ "$REF" == refs/tags/v* ]]; then
+            gh release upload "$tag" out/* --repo "$GITHUB_REPOSITORY" --clobber
+            echo "::notice::The files were added to the published release $tag."
           else
-            gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "Relios Mirror $version" --notes-file notes.md
+            echo "::notice::$tag is already published: its files are left as they are. For a new release raise the version in viewer/version.h."
           fi

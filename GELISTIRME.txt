@@ -24,6 +24,7 @@ A) GitHub ile (önerilen; bilgisayara bir şey kurulmaz)
    Depoya her gönderimde (push) Actions > "Windows exe" çalışır ve şunları üretir:
    ReliosMirror-tek-exe, ReliosMirror-windows, ReliosMirror-kaynak-kod, ReliosMirror-sanal-kamera-kaynak,
    ReliosMirror-derleme-ortami. Bu çıktılar 90 gün sonra silinir; kalıcı olan sürüm sayfasıdır (bkz. 3).
+   Elle başlatmak için: Actions > "Windows exe" > "Run workflow".
    Tarif: .github/workflows/windows.yml
 
 B) Windows'ta, kendi bilgisayarınızda
@@ -44,12 +45,18 @@ C) Linux / WSL'de yalnızca alıcı (sınama için)
    (gcc, cmake, pkg-config ve OpenSSL geliştirme paketi gerekir.)
 
 
-3. YENİ SÜRÜM ÇIKARMAK
+3. SÜRÜM SAYFASI VE YENİ SÜRÜM ÇIKARMAK
+   main dalına her gönderimde derleme, dosyalarını Releases sayfasında TASLAK (Draft) bir sürüm olarak da saklar:
+   viewer\version.h'deki sürümün taslağı yoksa oluşturulur, varsa o derlemenin dosyalarıyla yenilenir. Taslağı
+   yalnızca depo sahibi görür (GitHub'a giriş gerekir) ve süresi dolmaz. İçinde 1. maddedeki dosyalar vardır.
+   Yeni bir sürüm için:
    1. viewer\version.h içindeki iki satırı değiştirin (APP_VERSION ve APP_VERSION_NUMBERS).
-   2. Değişiklikleri depoya gönderin.
-   3. Sürüm etiketini gönderin:   git tag v1.0.1   ve   git push origin v1.0.1
-   4. Actions'taki derleme bitince Releases sayfasında TASLAK (Draft) bir sürüm oluşur; içinde 1. maddedeki
-      dosyalar vardır. Taslağı yalnızca depo sahibi görür. "Publish release" derseniz herkese açılır.
+   2. Değişiklikleri depoya gönderin; derleme bitince yeni sürümün taslağı oluşur.
+   3. Herkese açmak isterseniz taslağı açıp "Publish release" deyin; sürüm etiketi (örn. v1.0.1) o anda oluşur
+      ve dosyalar girişsiz indirilebilir olur. Yayınlanmış bir sürümün dosyaları sonraki derlemelerle
+      değişmez; geliştirmeyi sürdürmek için sürüm numarasını artırın.
+   (Etiketi kendiniz de gönderebilirsiniz: git tag v1.0.1, sonra git push origin v1.0.1; dosyalar o etiketin
+   sürümüne eklenir.)
    Sürüm numarası programda Ayarlar > Program'da, log.txt'nin ilk satırında ve exe'nin Özellikler > Ayrıntılar
    sekmesinde görünür.
 

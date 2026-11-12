@@ -3,8 +3,8 @@
  * and so does the version information of the exe files (app.rc). Only preprocessor lines here: the resource
  * compiler reads this file too.
  *
- * For a new version: change both lines, commit, then tag the commit "v<version>" and push the tag; the build on
- * GitHub then makes a draft release with the files (see GELISTIRME.txt).
+ * For a new version: change both lines and push. The build on GitHub keeps its files as a draft release of that
+ * version (see GELISTIRME.txt).
  */
 #define APP_VERSION "1.0.0"
 #define APP_VERSION_NUMBERS 1, 0, 0, 0

@@ -1,0 +1,6 @@
+# Line endings are the same on every computer (also in the source code the build on GitHub packs):
+# LF everywhere (the shell script needs it), CRLF for the Windows batch file.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ico binary
+*.bmp binary
