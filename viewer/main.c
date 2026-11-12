@@ -617,7 +617,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 			app_log("recording: the encoder %s did not open (%d)", names[n], ret);
 			avcodec_free_context(&R.enc);
 		} else {
-			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "ekran kartı" : "işlemci", rec_format_name[A.rec_format]);
+			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "Ekran kartı" : "İşlemci", rec_format_name[A.rec_format]);
 		}
 	}
 	if (!R.enc) {
@@ -933,7 +933,7 @@ done:
 	av_frame_free(&rgb);
 	avcodec_free_context(&enc);
 	app_log("screenshot %s: %s", ok ? "saved" : "failed", path);
-	set_notice(ok ? "Ekran görüntüsü kaydedildi (kayıt klasöründe)" : "Ekran görüntüsü kaydedilemedi");
+	set_notice(ok ? "Ekran görüntüsü kayıt klasörüne kaydedildi" : "Ekran görüntüsü kaydedilemedi");
 }
 
 /* ---- the virtual camera: the picture goes to "OBS Virtual Camera" (the camera OBS Studio installs), through the
@@ -1027,7 +1027,7 @@ static void vcam_write(const AVFrame *f)
 {
 	if (!V.h && !vcam_open()) {
 		SDL_AtomicSet(&A.vcam_on, 0);
-		set_notice("Sanal kamera açılamadı: OBS Studio kurulu olmalı ve OBS'in kendi sanal kamerası kapalı olmalı");
+		set_notice("Sanal kamera açılamadı. OBS Studio kurulu, OBS'in kendi sanal kamerası kapalı olmalı");
 		return;
 	}
 	int aw = f->width, ah = f->height;
@@ -1711,7 +1711,7 @@ static void session_start(void)
 	}
 	if (!A.proc) {
 		free(paired);
-		session_fail("alıcı program başlatılamadı");
+		session_fail("Alıcı program başlatılamadı");
 		return;
 	}
 	app_log("receiver started; paired devices: %d, pairing a new device: %s, asked %dx%d@%d %s", (int)paired_n,
@@ -1741,7 +1741,7 @@ static void session_start(void)
 	A.err_thread = SDL_CreateThread(err_thread, "receiver log", NULL);
 	if (!A.out_thread || !A.err_thread) {
 		session_stop();
-		session_fail("iş parçacığı başlatılamadı");
+		session_fail("İş parçacığı başlatılamadı");
 	}
 }
 
@@ -1752,34 +1752,34 @@ static void status_text(char *status, size_t size)
 	SDL_LockMutex(A.mutex);
 	switch (A.state) {
 	case MIRROR_STARTING:
-		snprintf(status, size, "başlatılıyor…");
+		snprintf(status, size, "Başlatılıyor…");
 		break;
 	case MIRROR_LISTENING:
-		snprintf(status, size, "hazır — iPad'de Ekran Yansıtma → " RECEIVER_NAME "%s",
-			 A.pair_requested ? " (yeni cihaz eşleştirme açık)" : "");
+		snprintf(status, size, "Hazır  •  iPad'de Ekran Yansıtma → " RECEIVER_NAME "%s",
+			 A.pair_requested ? "  •  Yeni cihaz eşleştirme açık" : "");
 		break;
 	case MIRROR_PIN:
-		snprintf(status, size, "penceredeki kodu iPad'e girin");
+		snprintf(status, size, "Penceredeki kodu iPad'e girin");
 		break;
 	case MIRROR_CONNECTED:
 		if (A.format[0])
-			snprintf(status, size, "bağlı: %s | %s, %.0f fps, %.1f Mbit/s", A.client[0] ? A.client : "iPad",
+			snprintf(status, size, "Bağlı: %s  •  %s, %.0f fps, %.1f Mbit/s", A.client[0] ? A.client : "iPad",
 				 A.format, A.fps_now, A.mbit);
 		else
-			snprintf(status, size, "bağlı: %s", A.client[0] ? A.client : "iPad");
+			snprintf(status, size, "Bağlı: %s", A.client[0] ? A.client : "iPad");
 		break;
 	case MIRROR_PAIRING_OFF:
-		snprintf(status, size, "üç yanlış kod: eşleştirme kapandı (\"Yeni cihaz\" ile yeniden açın)");
+		snprintf(status, size, "Üç yanlış kod girildi, eşleştirme kapandı (Ayarlar > Cihaz'dan yeniden açın)");
 		break;
 	case MIRROR_ENDED:
-		snprintf(status, size, "yeniden başlatılıyor…");
+		snprintf(status, size, "Yeniden başlatılıyor…");
 		break;
 	default:
 		if (strstr(A.error, "TCP 7000"))
 			snprintf(status, size,
-				 "hata: 7000 portu kullanımda (OBS'teki iPad Yansıtma ya da başka bir AirPlay alıcısı açık olabilir)");
+				 "Hata: 7000 portu kullanımda (OBS'teki iPad Yansıtma ya da başka bir AirPlay alıcısı açık olabilir)");
 		else
-			snprintf(status, size, "hata: %s", A.error);
+			snprintf(status, size, "Hata: %s", A.error);
 		break;
 	}
 	SDL_UnlockMutex(A.mutex);
@@ -1790,16 +1790,16 @@ static void status_text(char *status, size_t size)
 		uint64_t now = now_ns();
 		int seconds = (int)((now > R.t0 ? now - R.t0 : 0) / 1000000000ull);
 		int64_t bytes = R.oc->pb ? avio_tell(R.oc->pb) : 0;
-		snprintf(rec, sizeof(rec), "  •  KAYIT %02d:%02d:%02d  %.1f MB (%s)", seconds / 3600, seconds / 60 % 60,
+		snprintf(rec, sizeof(rec), "  •  Kayıt %02d:%02d:%02d  %.1f MB (%s)", seconds / 3600, seconds / 60 % 60,
 			 seconds % 60, (double)bytes / 1048576.0, R.encoder);
 	}
 	else if (R.failed)
-		snprintf(rec, sizeof(rec), " | kayıt başlatılamadı");
+		snprintf(rec, sizeof(rec), "  •  Kayıt başlatılamadı");
 	else if (R.want)
-		snprintf(rec, sizeof(rec), " | kayıt: görüntü bekleniyor");
+		snprintf(rec, sizeof(rec), "  •  Kayıt görüntüyü bekliyor");
 	SDL_UnlockMutex(R.mutex);
 	size_t used = strlen(status);
-	snprintf(status + used, size - used, "%s%s", rec, SDL_AtomicGet(&A.vcam_on) ? "  •  sanal kamera açık" : "");
+	snprintf(status + used, size - used, "%s%s", rec, SDL_AtomicGet(&A.vcam_on) ? "  •  Sanal kamera açık" : "");
 	SDL_LockMutex(A.mutex);
 	if (A.notice[0] && !SDL_TICKS_PASSED(SDL_GetTicks(), A.notice_until))
 		snprintf(status, size, "%s", A.notice);
@@ -1967,7 +1967,7 @@ static void draw_bar(int ow, int oh)
 
 	button_count = 0;
 	add_button(CMD_RECORD, recording, "", recording ? "Kaydı durdur" : "Kayıt");
-	add_button(CMD_SCREENSHOT, false, "", "Görüntü al");
+	add_button(CMD_SCREENSHOT, false, "", "Ekran görüntüsü");
 	add_button(CMD_VOL_DOWN, false, "", "-");
 	add_button(CMD_VOL_100, false, "", "Ses %%%d", SDL_AtomicGet(&A.volume));
 	add_button(CMD_VOL_UP, false, "", "+");
@@ -2021,8 +2021,8 @@ static void draw_bar(int ow, int oh)
 			add_button(CMD_CODEC_NEXT, false, "Kodek", A.h265 ? "H.265" : "H.264");
 			add_button(CMD_HW_DECODE, false, "Görüntü çözme", A.hw_decode ? "Ekran kartı" : "İşlemci");
 			bool fit = SDL_AtomicGet(&A.fit169) != 0;
-			add_button(CMD_ASPECT, fit, "Görüntü oranı", fit ? "16:9 (yatayda yay)" : "Özgün");
-			note = "İlk dördü değişince iPad'den yeniden bağlanın. 16:9 dikey görüntüye dokunmaz.";
+			add_button(CMD_ASPECT, fit, "Görüntü oranı", fit ? "16:9 (yatayda)" : "Özgün");
+			note = "İlk dört ayar değişince iPad'den yeniden bağlanın. 16:9, dikey görüntüyü değiştirmez.";
 		} else if (settings_tab == 1) {
 			add_button(CMD_REC_FORMAT, false, "Biçim",
 				   A.rec_format == 0 ? "MP4" : A.rec_format == 1 ? "MOV (Apple)" : "MKV");
