@@ -94,6 +94,9 @@ enum {
 	CMD_TAB_VIDEO,
 	CMD_TAB_RECORD,
 	CMD_TAB_DEVICE,
+	CMD_SCREENSHOT,
+	CMD_AUDIO_DEVICE,
+	CMD_VCAM,
 };
 
 static struct {
@@ -135,6 +138,8 @@ static struct {
 	bool have_frame, frame_dirty;
 	SDL_atomic_t frame_event;
 	AVFrame *upload; /* (window thread) */
+	AVFrame *last;   /* the newest picture, kept for a screenshot */
+	bool last_full, last_709;
 	Uint32 tex_format;
 	int tex_mode;
 
@@ -162,6 +167,12 @@ static struct {
 	int arate, ach;
 
 	char video_folder[1024];
+
+	char audio_device[256]; /* "": the default one (under mutex) */
+	SDL_atomic_t audio_reopen;
+	SDL_atomic_t vcam_on;
+	char notice[200]; /* a short message in the bar (under mutex) */
+	Uint32 notice_until;
 } A;
 
 /* recording (under R.mutex) */
@@ -220,6 +231,17 @@ static uint64_t now_ns(void)
 {
 	Uint64 c = SDL_GetPerformanceCounter(), f = SDL_GetPerformanceFrequency();
 	return (uint64_t)(c / f) * 1000000000ull + (uint64_t)(c % f) * 1000000000ull / (uint64_t)f;
+}
+
+static void push_event(int code);
+
+static void set_notice(const char *text)
+{
+	SDL_LockMutex(A.mutex);
+	snprintf(A.notice, sizeof(A.notice), "%s", text);
+	A.notice_until = SDL_GetTicks() + 5000;
+	SDL_UnlockMutex(A.mutex);
+	push_event(EV_STATE);
 }
 
 static void push_event(int code)
@@ -389,6 +411,9 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (!strncmp(line, "ses_aygiti=", 11)) {
+			snprintf(A.audio_device, sizeof(A.audio_device), "%s", line + 11);
+			A.audio_device[strcspn(A.audio_device, "\r\n")] = '\0';
 		} else if (sscanf(line, "kayit_bicim=%d", &a) == 1 && a >= 0 && a <= 2) {
 			A.rec_format = a;
 		} else if (sscanf(line, "kayit_mod=%d", &a) == 1 && a >= 0 && a <= 2) {
@@ -408,6 +433,7 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
+	fprintf(f, "ses_aygiti=%s\n", A.audio_device);
 	fclose(f);
 }
 
@@ -768,7 +794,7 @@ static void rec_toggle(void)
 /* Recording has a thread of its own: compressing must never hold back the picture and the sound that are shown
  * and played. The reading thread only hands over what it decoded (if the encoder cannot keep up, pictures are
  * left out of the file, not out of the window). */
-enum { REC_VIDEO = 1, REC_AUDIO, REC_CLOSE };
+enum { REC_VIDEO = 1, REC_AUDIO, REC_CLOSE, REC_SHOT, REC_SYNC };
 struct rec_item {
 	int kind;
 	AVFrame *frame;
@@ -805,7 +831,7 @@ static bool rec_push(struct rec_item *item)
 
 static void rec_queue_video(const AVFrame *f, bool full, bool bt709)
 {
-	if (!SDL_AtomicGet(&rec_on))
+	if (!SDL_AtomicGet(&rec_on) && !SDL_AtomicGet(&A.vcam_on))
 		return;
 	struct rec_item item;
 	memset(&item, 0, sizeof(item));
@@ -847,6 +873,197 @@ static void rec_queue_close(void)
 	rec_push(&item);
 }
 
+/* ---- a screenshot: the newest picture as a PNG next to the recordings */
+static void save_png(const AVFrame *f, bool full, bool bt709)
+{
+	char path[1400], stamp[40] = "goruntu";
+	time_t now = time(NULL);
+	struct tm *tm_now = localtime(&now);
+	if (tm_now)
+		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm_now);
+	snprintf(path, sizeof(path), "%s" PATH_SEP "ReliosMirror-%s.png", A.video_folder, stamp);
+
+	const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+	AVCodecContext *enc = codec ? avcodec_alloc_context3(codec) : NULL;
+	AVFrame *rgb = av_frame_alloc();
+	AVPacket *pkt = av_packet_alloc();
+	struct SwsContext *sws = NULL;
+	AVIOContext *out = NULL;
+	bool ok = false;
+	if (!enc || !rgb || !pkt)
+		goto done;
+	enc->width = f->width;
+	enc->height = f->height;
+	enc->pix_fmt = AV_PIX_FMT_RGB24;
+	enc->time_base = (AVRational){1, 25};
+	if (avcodec_open2(enc, codec, NULL) < 0)
+		goto done;
+	rgb->format = AV_PIX_FMT_RGB24;
+	rgb->width = f->width;
+	rgb->height = f->height;
+	if (av_frame_get_buffer(rgb, 0) < 0)
+		goto done;
+	sws = sws_getContext(f->width, f->height, (enum AVPixelFormat)f->format, f->width, f->height, AV_PIX_FMT_RGB24,
+			     SWS_BILINEAR, NULL, NULL, NULL);
+	if (!sws)
+		goto done;
+	sws_setColorspaceDetails(sws, sws_getCoefficients(bt709 ? SWS_CS_ITU709 : SWS_CS_ITU601), full ? 1 : 0,
+				 sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
+	sws_scale(sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height, rgb->data, rgb->linesize);
+	rgb->pts = 0;
+	if (avcodec_send_frame(enc, rgb) < 0)
+		goto done;
+	avcodec_send_frame(enc, NULL);
+	if (avcodec_receive_packet(enc, pkt) < 0)
+		goto done;
+	if (avio_open(&out, path, AVIO_FLAG_WRITE) < 0)
+		goto done;
+	avio_write(out, pkt->data, pkt->size);
+	avio_closep(&out);
+	ok = true;
+done:
+	sws_freeContext(sws);
+	av_packet_free(&pkt);
+	av_frame_free(&rgb);
+	avcodec_free_context(&enc);
+	app_log("screenshot %s: %s", ok ? "saved" : "failed", path);
+	set_notice(ok ? "Ekran görüntüsü kaydedildi (kayıt klasöründe)" : "Ekran görüntüsü kaydedilemedi");
+}
+
+/* ---- the virtual camera: the picture goes to "OBS Virtual Camera" (the camera OBS Studio installs), through the
+ * shared memory that camera reads (OBS's shared-memory-queue: a header, then three NV12 frames, each after a
+ * 32-byte frame header that starts with a timestamp). OBS need not run; it must be installed, and its own virtual
+ * camera must not be started at the same time. */
+#ifdef _WIN32
+#define VCAM_W 1920
+#define VCAM_H 1080
+struct vcam_header {
+	volatile uint32_t write_idx;
+	volatile uint32_t read_idx;
+	volatile uint32_t state; /* 1: starting, 2: ready, 3: stopping */
+	uint32_t offsets[3];
+	uint32_t type;
+	uint32_t cx;
+	uint32_t cy;
+	uint64_t interval; /* of the frames, in 100 ns */
+	uint32_t reserved[8];
+};
+static struct {
+	HANDLE map;
+	struct vcam_header *h;
+	uint8_t *frame[3];
+	uint64_t *ts[3];
+	struct SwsContext *sws;
+	int src_w, src_h;
+} V;
+
+static void vcam_close(void)
+{
+	if (V.h) {
+		V.h->state = 3;
+		UnmapViewOfFile(V.h);
+	}
+	if (V.map)
+		CloseHandle(V.map);
+	sws_freeContext(V.sws);
+	memset(&V, 0, sizeof(V));
+}
+
+static void vcam_black(void)
+{
+	for (int i = 0; i < 3; i++) {
+		memset(V.frame[i], 16, VCAM_W * VCAM_H);
+		memset(V.frame[i] + VCAM_W * VCAM_H, 128, VCAM_W * VCAM_H / 2);
+	}
+}
+
+static bool vcam_open(void)
+{
+	uint32_t frame_size = VCAM_W * VCAM_H * 3 / 2, offsets[3];
+	uint32_t size = (uint32_t)sizeof(struct vcam_header);
+	for (int i = 0; i < 3; i++) {
+		size = (size + 31u) & ~31u;
+		offsets[i] = size;
+		size += frame_size + 32;
+	}
+	size = (size + 31u) & ~31u;
+	V.map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, size, L"OBSVirtualCamVideo");
+	if (!V.map)
+		return false;
+	if (GetLastError() == ERROR_ALREADY_EXISTS) {
+		/* OBS's own virtual camera (or another program) is feeding the camera */
+		CloseHandle(V.map);
+		V.map = NULL;
+		return false;
+	}
+	V.h = (struct vcam_header *)MapViewOfFile(V.map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+	if (!V.h) {
+		vcam_close();
+		return false;
+	}
+	memset(V.h, 0, sizeof(*V.h));
+	V.h->state = 1;
+	V.h->cx = VCAM_W;
+	V.h->cy = VCAM_H;
+	V.h->interval = 10000000ull / 30;
+	for (int i = 0; i < 3; i++) {
+		V.h->offsets[i] = offsets[i];
+		V.ts[i] = (uint64_t *)((uint8_t *)V.h + offsets[i]);
+		V.frame[i] = (uint8_t *)V.h + offsets[i] + 32;
+	}
+	vcam_black();
+	return true;
+}
+
+/* the picture, fitted into 1920x1080 with black beside it */
+static void vcam_write(const AVFrame *f)
+{
+	if (!V.h && !vcam_open()) {
+		SDL_AtomicSet(&A.vcam_on, 0);
+		set_notice("Sanal kamera açılamadı: OBS Studio kurulu olmalı ve OBS'in kendi sanal kamerası kapalı olmalı");
+		return;
+	}
+	int dw = VCAM_W, dh = (int)((int64_t)VCAM_W * f->height / f->width);
+	if (dh > VCAM_H) {
+		dh = VCAM_H;
+		dw = (int)((int64_t)VCAM_H * f->width / f->height);
+	}
+	dw &= ~1;
+	dh &= ~1;
+	if (dw < 2 || dh < 2)
+		return;
+	int dx = ((VCAM_W - dw) / 2) & ~1, dy = ((VCAM_H - dh) / 2) & ~1;
+	if (V.src_w != f->width || V.src_h != f->height) {
+		vcam_black();
+		V.src_w = f->width;
+		V.src_h = f->height;
+	}
+	V.sws = sws_getCachedContext(V.sws, f->width, f->height, (enum AVPixelFormat)f->format, dw, dh, AV_PIX_FMT_NV12,
+				     SWS_BILINEAR, NULL, NULL, NULL);
+	if (!V.sws)
+		return;
+	uint32_t inc = V.h->write_idx + 1;
+	V.h->write_idx = inc;
+	int at = (int)(inc % 3);
+	uint8_t *dst[4] = {V.frame[at] + dy * VCAM_W + dx, V.frame[at] + VCAM_W * VCAM_H + (dy / 2) * VCAM_W + dx, NULL,
+			   NULL};
+	int stride[4] = {VCAM_W, VCAM_W, 0, 0};
+	sws_scale(V.sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height, dst, stride);
+	*V.ts[at] = now_ns();
+	V.h->read_idx = inc;
+	V.h->state = 2;
+}
+#else
+static void vcam_close(void)
+{
+}
+static void vcam_write(const AVFrame *f)
+{
+	(void)f;
+	SDL_AtomicSet(&A.vcam_on, 0);
+}
+#endif
+
 static int rec_thread(void *unused)
 {
 	(void)unused;
@@ -866,9 +1083,18 @@ static int rec_thread(void *unused)
 			Q.videos--;
 		SDL_UnlockMutex(Q.mutex);
 
+		if (!SDL_AtomicGet(&A.vcam_on))
+			vcam_close();
 		if (item.kind == REC_VIDEO) {
+			if (SDL_AtomicGet(&A.vcam_on))
+				vcam_write(item.frame);
 			rec_video(item.frame, item.full, item.bt709, item.t);
 			av_frame_free(&item.frame);
+		} else if (item.kind == REC_SHOT) {
+			save_png(item.frame, item.full, item.bt709);
+			av_frame_free(&item.frame);
+		} else if (item.kind == REC_SYNC) {
+			/* (only to look at the switches above) */
 		} else if (item.kind == REC_AUDIO) {
 			rec_audio(item.audio, item.frames, item.rate, item.channels, item.t);
 			free(item.audio);
@@ -879,6 +1105,7 @@ static int rec_thread(void *unused)
 			push_event(EV_STATE);
 		}
 	}
+	vcam_close();
 	return 0;
 }
 
@@ -979,6 +1206,11 @@ static void present_frame(struct decoder *d, const AVFrame *f, bool full, bool b
 	}
 	SDL_LockMutex(A.frame_mutex);
 	av_frame_unref(A.pending);
+	av_frame_unref(A.last);
+	if (av_frame_ref(A.last, f) >= 0) {
+		A.last_full = full;
+		A.last_709 = bt709;
+	}
 	if (av_frame_ref(A.pending, f) >= 0) {
 		A.pending_full = full;
 		A.pending_709 = bt709;
@@ -1071,10 +1303,19 @@ static bool open_audio_decoder(struct decoder *d, int ct)
 
 static bool open_audio_output(int rate, int channels)
 {
+	if (SDL_AtomicCAS(&A.audio_reopen, 1, 0) && A.adev) {
+		/* another output was chosen */
+		SDL_CloseAudioDevice(A.adev);
+		A.adev = 0;
+	}
 	if (A.adev && A.arate == rate && A.ach == channels)
 		return true;
 	if (A.adev)
 		SDL_CloseAudioDevice(A.adev);
+	char device[256];
+	SDL_LockMutex(A.mutex);
+	snprintf(device, sizeof(device), "%s", A.audio_device);
+	SDL_UnlockMutex(A.mutex);
 	SDL_AudioSpec want, have;
 	SDL_zero(want);
 	SDL_zero(have);
@@ -1082,7 +1323,9 @@ static bool open_audio_output(int rate, int channels)
 	want.format = AUDIO_F32SYS;
 	want.channels = (Uint8)channels;
 	want.samples = 512; /* small: the sound must not lag behind the picture */
-	A.adev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+	A.adev = SDL_OpenAudioDevice(device[0] ? device : NULL, 0, &want, &have, 0);
+	if (!A.adev && device[0])
+		A.adev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0); /* (the chosen one is gone: the default) */
 	if (!A.adev) {
 		app_log("no sound output: %s", SDL_GetError());
 		A.arate = A.ach = 0;
@@ -1171,6 +1414,7 @@ static void clear_picture(void)
 	A.have_frame = false;
 	A.frame_dirty = false;
 	av_frame_unref(A.pending);
+	av_frame_unref(A.last);
 	SDL_UnlockMutex(A.frame_mutex);
 }
 
@@ -1528,17 +1772,26 @@ static void status_text(char *status, size_t size)
 	}
 	SDL_UnlockMutex(A.mutex);
 
-	char rec[80] = "";
+	char rec[160] = "";
 	SDL_LockMutex(R.mutex);
-	if (R.oc && R.header_written)
-		snprintf(rec, sizeof(rec), "  •  KAYIT (%s)", R.encoder);
+	if (R.oc && R.header_written) {
+		uint64_t now = now_ns();
+		int seconds = (int)((now > R.t0 ? now - R.t0 : 0) / 1000000000ull);
+		int64_t bytes = R.oc->pb ? avio_tell(R.oc->pb) : 0;
+		snprintf(rec, sizeof(rec), "  •  KAYIT %02d:%02d:%02d  %.1f MB (%s)", seconds / 3600, seconds / 60 % 60,
+			 seconds % 60, (double)bytes / 1048576.0, R.encoder);
+	}
 	else if (R.failed)
 		snprintf(rec, sizeof(rec), " | kayıt başlatılamadı");
 	else if (R.want)
 		snprintf(rec, sizeof(rec), " | kayıt: görüntü bekleniyor");
 	SDL_UnlockMutex(R.mutex);
 	size_t used = strlen(status);
-	snprintf(status + used, size - used, "%s", rec);
+	snprintf(status + used, size - used, "%s%s", rec, SDL_AtomicGet(&A.vcam_on) ? "  •  sanal kamera açık" : "");
+	SDL_LockMutex(A.mutex);
+	if (A.notice[0] && !SDL_TICKS_PASSED(SDL_GetTicks(), A.notice_until))
+		snprintf(status, size, "%s", A.notice);
+	SDL_UnlockMutex(A.mutex);
 }
 
 static void update_title(void)
@@ -1702,6 +1955,7 @@ static void draw_bar(int ow, int oh)
 
 	button_count = 0;
 	add_button(CMD_RECORD, recording, "", recording ? "Kaydı durdur" : "Kayıt");
+	add_button(CMD_SCREENSHOT, false, "", "Görüntü al");
 	add_button(CMD_VOL_DOWN, false, "", "-");
 	add_button(CMD_VOL_100, false, "", "Ses %%%d", SDL_AtomicGet(&A.volume));
 	add_button(CMD_VOL_UP, false, "", "+");
@@ -1773,11 +2027,22 @@ static void draw_bar(int ow, int oh)
 			add_button(CMD_PAIR, pairing, "Yeni cihaz eşleştirme", pairing ? "Açık" : "Kapalı");
 			add_button(CMD_FORGET, false, "Eşleşmiş cihazlar", "Unut");
 			add_button(CMD_ONTOP, A.on_top, "Pencere her zaman üstte", A.on_top ? "Açık" : "Kapalı");
-			note = "Eşleştirme açıkken yeni bir cihaz kodla bağlanabilir.";
+			char device[64] = "Varsayılan";
+			if (A.audio_device[0]) {
+				/* (shortened to fit, at a whole letter) */
+				size_t len = strlen(A.audio_device), keep = len > 22 ? 22 : len;
+				while (keep > 0 && keep < len && ((unsigned char)A.audio_device[keep] & 0xC0) == 0x80)
+					keep--;
+				snprintf(device, sizeof(device), "%.*s%s", (int)keep, A.audio_device, keep < len ? "…" : "");
+			}
+			add_button(CMD_AUDIO_DEVICE, false, "Ses çıkışı", "%s", device);
+			bool vcam = SDL_AtomicGet(&A.vcam_on) != 0;
+			add_button(CMD_VCAM, vcam, "Sanal kamera (OBS Virtual Camera)", vcam ? "Açık" : "Kapalı");
+			note = "Sanal kamera için OBS Studio kurulu olmalı (açık olması gerekmez).";
 		}
 		int rows = button_count - first;
-		int row_h = bh + gap, value_w = f * 11;
-		int pw = f * 26 < ow - 2 * gap ? f * 26 : ow - 2 * gap;
+		int row_h = bh + gap, value_w = f * 13;
+		int pw = f * 32 < ow - 2 * gap ? f * 26 : ow - 2 * gap;
 		int ph = f + row_h + f / 2 + 5 * row_h + f * 2;
 		int px = ow - pw - gap, py = y0 - ph - gap;
 		if (py < gap)
@@ -2052,6 +2317,47 @@ static void run_command(int cmd)
 			proc_write(A.proc, on ? "allow_pairing 1\n" : "allow_pairing 0\n");
 		break;
 	}
+	case CMD_SCREENSHOT: {
+		struct rec_item item;
+		memset(&item, 0, sizeof(item));
+		item.kind = REC_SHOT;
+		SDL_LockMutex(A.frame_mutex);
+		if (A.have_frame && A.last->data[0]) {
+			item.frame = av_frame_clone(A.last);
+			item.full = A.last_full;
+			item.bt709 = A.last_709;
+		}
+		SDL_UnlockMutex(A.frame_mutex);
+		if (!item.frame)
+			set_notice("Ekran görüntüsü için önce iPad'i yansıtın");
+		else if (!rec_push(&item))
+			av_frame_free(&item.frame);
+		break;
+	}
+	case CMD_AUDIO_DEVICE: {
+		/* the next output: default, then each one Windows lists */
+		int count = SDL_GetNumAudioDevices(0), at = -1;
+		for (int i = 0; i < count; i++) {
+			const char *name = SDL_GetAudioDeviceName(i, 0);
+			if (name && !strcmp(name, A.audio_device))
+				at = i;
+		}
+		const char *next = at + 1 < count ? SDL_GetAudioDeviceName(at + 1, 0) : NULL;
+		SDL_LockMutex(A.mutex);
+		snprintf(A.audio_device, sizeof(A.audio_device), "%s", next ? next : "");
+		SDL_UnlockMutex(A.mutex);
+		SDL_AtomicSet(&A.audio_reopen, 1);
+		save_settings();
+		break;
+	}
+	case CMD_VCAM: {
+		SDL_AtomicSet(&A.vcam_on, !SDL_AtomicGet(&A.vcam_on));
+		struct rec_item item;
+		memset(&item, 0, sizeof(item));
+		item.kind = REC_SYNC;
+		rec_push(&item);
+		break;
+	}
 	case CMD_TAB_VIDEO:
 		settings_tab = 0;
 		editing_kbit = false;
@@ -2142,6 +2448,8 @@ static int key_command(SDL_Keycode key)
 		return CMD_VOL_DOWN;
 	case SDLK_r:
 		return CMD_RECORD;
+	case SDLK_s:
+		return CMD_SCREENSHOT;
 	case SDLK_p:
 		return CMD_PAIR;
 	case SDLK_t:
@@ -2225,7 +2533,8 @@ int main(int argc, char *argv[])
 	A.event_type = SDL_RegisterEvents(1);
 	A.pending = av_frame_alloc();
 	A.upload = av_frame_alloc();
-	if (!A.pending || !A.upload)
+	A.last = av_frame_alloc();
+	if (!A.pending || !A.upload || !A.last)
 		return 1;
 
 	char *base = SDL_GetBasePath();

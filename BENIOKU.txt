@@ -20,7 +20,12 @@ Ayarlar: çözünürlük, kare hızı, kodek, görüntü çözme (ekran kartı /
 kayıt biçimi (MP4 / MOV / MKV), bit hızı modu (otomatik / CBR / VBR), bit hızı (tıklayıp yazın, Enter),
 kayıt klasörü, her zaman üstte, yeni cihaz, eşleşmiş cihazları unut.
 Çözünürlük, kare hızı, kodek değişince iPad'den yeniden bağlanın.
-Tuşlar: R kayıt, Yukarı/Aşağı ses, M sessiz, F tam ekran, T üstte, P yeni cihaz.
+Tuşlar: R kayıt, S ekran görüntüsü, Yukarı/Aşağı ses, M sessiz, F tam ekran, T üstte, P eşleştirme.
+
+Sanal kamera (Ayarlar > Cihaz): görüntüyü "OBS Virtual Camera" kamerasına verir; Discord, Zoom vb.
+programlarda kamera olarak onu seçin. OBS Studio kurulu olmalı (açık olması gerekmez); OBS'in kendi
+"Sanal Kamerayı Başlat" düğmesi aynı anda açık olmamalı.
+Ses çıkışı (Ayarlar > Cihaz): sesin çalınacağı aygıt (hoparlör, kulaklık, sanal ses kablosu).
 
 
 KABLOLU BAĞLANTI
