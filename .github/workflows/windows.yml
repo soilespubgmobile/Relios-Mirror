@@ -51,6 +51,11 @@ jobs:
           }
           if ($changed -lt 3) { throw 'softcam: the name was not found where it is expected' }
           if (-not (Select-String -Path softcam/src/softcam/softcam.cpp -Pattern '0xa50eb610' -Quiet)) { throw 'softcam: the class id was not replaced' }
+          # one C runtime, inside the DLL (the project also names the runtime DLL's library: taken out)
+          $proj = 'softcam/src/softcam/softcam.vcxproj'
+          $text = [IO.File]::ReadAllText($proj)
+          if (-not $text.Contains('msvcrt.lib;')) { throw 'softcam: the project file is not as expected' }
+          [IO.File]::WriteAllText($proj, $text.Replace('msvcrt.lib;', ''))
           Set-Content softcam/Directory.Build.targets '<Project><ItemDefinitionGroup Condition="''$(Configuration)''==''Release''"><ClCompile><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile></ItemDefinitionGroup></Project>'
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
           $root = (Resolve-Path softcam).Path + '\\'
