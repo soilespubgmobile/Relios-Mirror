@@ -46,7 +46,7 @@
 #include "proc.h"
 
 #define APP_NAME "Relios Mirror"
-#define RECEIVER_NAME "Relios Mirror" /* what the iPad shows in Screen Mirroring */
+#define RECEIVER_NAME "PC Mirror" /* what the iPad shows in Screen Mirroring */
 #define CONFIG_FOLDER "ReliosMirror"
 
 #ifdef _WIN32

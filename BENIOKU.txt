@@ -7,10 +7,10 @@ KULLANIM
 1. ReliosMirror.exe'yi açın (klasördeki diğer dosyalar yanında kalmalı).
    Windows Güvenlik Duvarı sorarsa "Özel ağlar" için izin verin.
 2. iPad ve bilgisayar aynı Wi-Fi ağında olsun.
-3. iPad'de Denetim Merkezi > Ekran Yansıtma > "Relios Mirror".
+3. iPad'de Denetim Merkezi > Ekran Yansıtma > "PC Mirror".
 4. İlk seferde pencerede 4 haneli kod çıkar; iPad'e girin. Sonraki bağlanmalarda kod sorulmaz.
 
-iPad listede "Relios Mirror" görünmüyorsa: guvenlik-duvari-izni.bat dosyasını bir kez çalıştırın.
+iPad listede "PC Mirror" görünmüyorsa: guvenlik-duvari-izni.bat dosyasını bir kez çalıştırın.
 
 
 DÜĞMELER VE TUŞLAR
@@ -32,7 +32,7 @@ KABLOLU BAĞLANTI
 AirPlay ağ üzerinden çalışır; kabloyla kullanmak için iPad ile bilgisayar arasında kablolu AĞ gerekir:
 - iPad'e USB-C Ethernet adaptörü takıp modeme bağlayın, ya da
 - hücresel iPad/iPhone'da Kişisel Erişim Noktası'nı açıp USB kabloyla bilgisayara bağlayın.
-Sonra yine Ekran Yansıtma > Relios Mirror.
+Sonra yine Ekran Yansıtma > PC Mirror.
 
 
 DISCORD
