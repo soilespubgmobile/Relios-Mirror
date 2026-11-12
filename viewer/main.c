@@ -3060,34 +3060,52 @@ static void ensure_firewall_rule(void)
 	char netsh[900], cmd_exe[900];
 	system_program("netsh.exe", netsh, sizeof(netsh));
 	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
-	/* (the rule names the receiver program: made again if the folder moved) */
+	/* (the rules name the programs: made again if the folder moved; "v2": with the rules that keep both
+	 * programs off the internet) */
+	char self[2100], marker[2200];
+	char *folder = SDL_GetBasePath();
+	snprintf(self, sizeof(self), "%sReliosMirror.exe", folder ? folder : "");
+	SDL_free(folder);
+	snprintf(marker, sizeof(marker), "v2|%s", A.exe);
 	char *made_for = read_text("firewall.txt");
-	bool same = made_for && !strcmp(made_for, A.exe);
+	bool same = made_for && !strcmp(made_for, marker);
 	free(made_for);
 	if (same && proc_run(netsh, "advfirewall firewall show rule name=\"Relios Mirror\"", 10000) == 0)
 		return;
-	if (strpbrk(A.exe, "%^!\"&") || strpbrk(netsh, "%^!\"&")) {
+	if (strpbrk(A.exe, "%^!\"&") || strpbrk(netsh, "%^!\"&") || strpbrk(self, "%^!\"&")) {
 		app_log("firewall rule not made by the program: unusual letters in a folder's name");
 		return;
 	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
 				 "Apple cihazının bağlanabilmesi için Windows Güvenlik Duvarı'nda izin gerekiyor.\n\n"
-				 "İzin yalnızca alıcı programa ve yalnızca yerel ağdan gelen bağlantılara verilir.\n"
+				 "İzin yalnızca alıcı programa ve yalnızca yerel ağdan gelen bağlantılara verilir;\n"
+				 "ayrıca programın internete çıkışı Windows Güvenlik Duvarı'nda kapatılır.\n"
 				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.",
 				 A.win);
-	char cmd[9000];
+	/* Out: nothing of the two programs leaves for the internet (every address that is not a private, link-local
+	 * or multicast one is blocked; a block rule wins over any allow rule). In: the receiver, from the local
+	 * network only. The rule that mirroring needs comes last: its result is the command's result. */
+	static const char internet4[] = "0.0.0.0-9.255.255.255,11.0.0.0-100.63.255.255,100.128.0.0-169.253.255.255,"
+					"169.255.0.0-172.15.255.255,172.32.0.0-192.167.255.255,192.169.0.0-223.255.255.255";
+	static const char internet6[] = "2000::/3";
+	char cmd[12000];
 	snprintf(cmd, sizeof(cmd),
 		 "/c \"\"%s\" advfirewall firewall delete rule name=\"Relios Mirror\""
 		 " & \"%s\" advfirewall firewall delete rule name=all program=\"%s\""
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
 		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet enable=yes\"",
-		 netsh, netsh, A.exe, netsh, A.exe);
+		 netsh, netsh, A.exe, netsh, A.exe, internet6, netsh, self, internet6, netsh, A.exe, internet4, netsh, self,
+		 internet4, netsh, A.exe);
 	if (run_elevated(cmd_exe, cmd) == 0) {
 		FILE *f = fopen("firewall.txt", "w");
 		if (f) {
-			fputs(A.exe, f);
+			fputs(marker, f);
 			fclose(f);
 		}
-		app_log("firewall rule made (the receiver program, local network only)");
+		app_log("firewall rules made (in: the receiver, local network only; out: no internet for both programs)");
 	} else {
 		app_log("firewall rule not made (refused, or an error)");
 	}
