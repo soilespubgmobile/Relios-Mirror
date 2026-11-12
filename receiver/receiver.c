@@ -52,9 +52,7 @@ static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char *registered[MAX_REGISTERED];
 static int registered_count = 0;
 static bool allow_pairing = false;
-static bool hide_when_connected = false; /* Relios Mirror: not in the iPad's list while a paired device is connected */
-static bool trusted_connected = false;
-static bool visible = true; /* Relios Mirror: announced on the network at all */
+static bool visible = true; /* Relios Mirror: announced on the network ("visible 0" before "start": not) */
 static int pairing_failures = 0;
 static int open_connections = 0;
 static bool had_trusted_client = false;
@@ -233,8 +231,6 @@ static void cb_conn_destroy(void *cls)
 	(void)cls;
 	pthread_mutex_lock(&state_mutex);
 	open_connections--;
-	if (open_connections <= 0)
-		trusted_connected = false;
 	bool idle = open_connections <= 0 && had_trusted_client;
 	if (idle)
 		idle_since = wall_ns();
@@ -334,7 +330,6 @@ static void cb_client_trusted(void *cls, bool new_pairing)
 	(void)cls;
 	pthread_mutex_lock(&state_mutex);
 	had_trusted_client = true;
-	trusted_connected = true;
 	if (new_pairing) {
 		allow_pairing = false; /* one new device per "Pair a new iPad" */
 		pairing_failures = 0;
@@ -430,13 +425,9 @@ static void handle_command(char *line)
 			registered[registered_count++] = strdup(line + 9);
 		pthread_mutex_unlock(&state_mutex);
 	} else if (!strncmp(line, "visible ", 8)) {
-		pthread_mutex_lock(&state_mutex);
+		/* (only looked at when the receiver starts: the announcement is never taken back while it runs,
+		 * because an Apple device ends its mirroring when the receiver's name leaves the network) */
 		visible = atoi(line + 8) != 0;
-		pthread_mutex_unlock(&state_mutex);
-	} else if (!strncmp(line, "hide_connected ", 15)) {
-		pthread_mutex_lock(&state_mutex);
-		hide_when_connected = atoi(line + 15) != 0;
-		pthread_mutex_unlock(&state_mutex);
 	} else if (!strncmp(line, "allow_pairing ", 14)) {
 		pthread_mutex_lock(&state_mutex);
 		allow_pairing = atoi(line + 14) != 0;
@@ -663,7 +654,9 @@ int main(int argc, char **argv)
 	}
 	set_features(dnssd);
 	raop_set_dnssd(raop, dnssd);
-	if (dnssd_register_raop(dnssd, port) || dnssd_register_airplay(dnssd, port)) {
+	if (!visible) {
+		log_line("[info] not announced on the network (hidden in the settings): no device finds the receiver");
+	} else if (dnssd_register_raop(dnssd, port) || dnssd_register_airplay(dnssd, port)) {
 		send_text(RA_MSG_STATUS, "error text=could not announce the receiver on the network");
 		return 1;
 	}
@@ -672,28 +665,12 @@ int main(int argc, char **argv)
 	pthread_t input;
 	pthread_create(&input, NULL, stdin_thread, NULL);
 
-	bool announced = true;
 	for (;;) {
 		if (quit_requested)
 			break;
 		pthread_mutex_lock(&state_mutex);
 		uint64_t since = idle_since;
-		bool announce = visible && !(hide_when_connected && trusted_connected && open_connections > 0);
 		pthread_mutex_unlock(&state_mutex);
-		if (announce != announced) {
-			/* (the connection that is open does not depend on the announcement) */
-			if (announce) {
-				if (dnssd_register_raop(dnssd, port) || dnssd_register_airplay(dnssd, port))
-					log_line("[warning] could not announce the receiver again");
-				else
-					log_line("[info] announced on the network again");
-			} else {
-				dnssd_unregister_raop(dnssd);
-				dnssd_unregister_airplay(dnssd);
-				log_line("[info] no longer announced on the network (hidden, or a paired device is connected)");
-			}
-			announced = announce;
-		}
 		if (since && wall_ns() - since > RECONNECT_GRACE_NS) {
 			log_line("[info] the iPad did not reconnect: ending");
 			break;

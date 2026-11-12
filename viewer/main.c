@@ -109,6 +109,8 @@ enum {
 	CMD_AUTOSTART,
 	CMD_TRAY,
 	CMD_VISIBLE,
+	CMD_RESET,
+	CMD_VCAM_REMOVE,
 };
 
 static struct {
@@ -494,6 +496,7 @@ static void load_settings(void)
 	A.to_tray = false;
 	A.hide_connected = true;
 	A.visible = true;
+	SDL_AtomicSet(&A.vcam_on, 0);
 	A.rec_gpu = true;
 	A.rec_format = 1;
 	A.rec_mode = 0;
@@ -1122,20 +1125,19 @@ done:
 	set_notice(ok ? "Ekran görüntüsü kaydedildi  •  Klasörü açmak için tıklayın" : "Ekran görüntüsü kaydedilemedi", ok);
 }
 
-/* ---- the virtual camera: the picture goes to "OBS Virtual Camera" (the camera OBS Studio installs), through the
- * shared memory that camera reads (OBS's shared-memory-queue: a header, then three NV12 frames, each after a
- * 32-byte frame header that starts with a timestamp). OBS need not run; it must be installed, and its own virtual
- * camera must not be started at the same time. */
+/* ---- the virtual camera: our own, "Relios Mirror Camera"
+ * softcam (github.com/tshino/softcam, MIT; this project's workflow builds a fixed revision of it, with this camera's
+ * own name and class id): a DirectShow camera in one DLL, which also has the small interface the picture is sent
+ * through (24-bit BGR, top row first). The DLL is installed once, with the user's consent, in "Program Files\Relios
+ * Mirror" (where only administrators can change files) and made known to Windows there (install_camera); this
+ * program loads that same file, and only while the camera is switched on. Nothing of OBS is used. */
 #ifdef _WIN32
 #define VCAM_W 1920
 #define VCAM_H 1080
+#define CAMERA_CLASS_KEY L"CLSID\\{A50EB610-EEB2-4C26-A2E9-B5D00E01EC2D}"
 
-/* Our own camera, "Relios Mirror Camera": softcam (github.com/tshino/softcam, MIT), a DirectShow camera in
- * softcam.dll next to the program. The DLL is registered once with the user's consent (see register_camera); the
- * picture is sent through its small C interface as 24-bit BGR, 1920x1080. */
 typedef void *sc_camera;
 static struct {
-	bool tried;
 	HMODULE dll;
 	sc_camera (*create)(int, int, float);
 	void (*destroy)(sc_camera);
@@ -1143,67 +1145,102 @@ static struct {
 	sc_camera cam;
 	uint8_t *bgr;
 	struct SwsContext *sws;
-	int src_w, src_h;
-	bool fit;
+	int src_w, src_h, src_format, dst_w, dst_h;
+	bool full, bt709;
+	bool failed; /* (until the camera is switched off and on again) */
 } S;
 
-static void own_camera_path(char *out, size_t size)
+/* where the camera's DLL is installed: "<Program Files>\Relios Mirror\ReliosMirrorCamera.dll" */
+static bool camera_installed_path(char *out, size_t size)
 {
-	char *base = SDL_GetBasePath();
-	snprintf(out, size, "%ssoftcam.dll", base ? base : "");
-	SDL_free(base);
+	wchar_t folder[MAX_PATH];
+	char folder8[800];
+	if (SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, SHGFP_TYPE_CURRENT, folder) != S_OK)
+		return false;
+	if (WideCharToMultiByte(CP_UTF8, 0, folder, -1, folder8, (int)sizeof(folder8), NULL, NULL) <= 1)
+		return false;
+	snprintf(out, size, "%s\\Relios Mirror\\ReliosMirrorCamera.dll", folder8);
+	return true;
 }
 
-static void own_camera_close(void)
+/* installed, and known to Windows as a camera */
+static bool camera_installed(void)
 {
-	if (S.cam && S.destroy)
+	char path[1200];
+	HKEY key;
+	if (!camera_installed_path(path, sizeof(path)) || !file_exists_utf8(path))
+		return false;
+	if (RegOpenKeyExW(HKEY_CLASSES_ROOT, CAMERA_CLASS_KEY, 0, KEY_READ, &key) != ERROR_SUCCESS)
+		return false;
+	RegCloseKey(key);
+	return true;
+}
+
+static void camera_stop(void)
+{
+	if (S.cam && S.destroy) {
 		S.destroy(S.cam);
+		app_log("virtual camera: stopped");
+	}
 	S.cam = NULL;
 	sws_freeContext(S.sws);
 	S.sws = NULL;
-	free(S.bgr);
-	S.bgr = NULL;
-	S.src_w = S.src_h = 0;
+	S.failed = false;
 }
 
-/* true: the picture went to our own camera */
-static bool own_camera_write(const AVFrame *f)
+/* the camera exists (programs can open it) and shows black until the first picture; false: it cannot be used */
+static bool camera_start(void)
 {
-	if (!S.tried) {
-		S.tried = true;
-		char path[2100];
-		own_camera_path(path, sizeof(path));
-		wchar_t *w = to_wide(path);
-		S.dll = w ? LoadLibraryW(w) : NULL;
+	if (S.cam)
+		return true;
+	if (S.failed)
+		return false;
+	if (!S.dll) {
+		char path[1200];
+		wchar_t *w = camera_installed() && camera_installed_path(path, sizeof(path)) ? to_wide(path) : NULL;
+		/* (the installed file, by its full path: the same file Windows gives to the programs that use the camera) */
+		S.dll = w ? LoadLibraryExW(w, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) : NULL;
 		free(w);
 		if (S.dll) {
-			S.create = (sc_camera(*)(int, int, float))(void *)GetProcAddress(S.dll, "scCreateCamera");
-			S.destroy = (void (*)(sc_camera))(void *)GetProcAddress(S.dll, "scDeleteCamera");
-			S.send = (void (*)(sc_camera, const void *))(void *)GetProcAddress(S.dll, "scSendFrame");
+			S.create = (sc_camera (*)(int, int, float))GetProcAddress(S.dll, "scCreateCamera");
+			S.destroy = (void (*)(sc_camera))GetProcAddress(S.dll, "scDeleteCamera");
+			S.send = (void (*)(sc_camera, const void *))GetProcAddress(S.dll, "scSendFrame");
 		}
-		app_log("own virtual camera: %s", S.dll && S.create && S.destroy && S.send ? "softcam.dll loaded" : "softcam.dll not usable");
-	}
-	if (!S.dll || !S.create || !S.destroy || !S.send)
-		return false;
-	if (!S.cam) {
-		/* (frame rate 0: each picture is passed on as it comes; if this softcam wants a rate, 60) */
-		S.cam = S.create(VCAM_W, VCAM_H, 0.0f);
-		if (!S.cam)
-			S.cam = S.create(VCAM_W, VCAM_H, 60.0f);
-		if (!S.cam) {
-			app_log("own virtual camera: could not be created (another program is using it?)");
-			S.create = NULL; /* (not tried again) */
-			return false;
-		}
-		S.bgr = calloc(1, VCAM_W * VCAM_H * 3);
-		app_log("own virtual camera: started");
+		app_log("virtual camera: %s", S.dll && S.create && S.destroy && S.send ? "loaded" : "not installed, or not usable");
 	}
 	if (!S.bgr)
+		S.bgr = calloc(1, (size_t)VCAM_W * VCAM_H * 3 + 64);
+	if (!S.dll || !S.create || !S.destroy || !S.send || !S.bgr) {
+		S.failed = true;
 		return false;
+	}
+	/* (frame rate 0: each picture is passed on as it comes) */
+	S.cam = S.create(VCAM_W, VCAM_H, 0.0f);
+	if (!S.cam) {
+		app_log("virtual camera: could not be started (in use by another program?)");
+		S.failed = true;
+		return false;
+	}
+	memset(S.bgr, 0, (size_t)VCAM_W * VCAM_H * 3);
+	S.send(S.cam, S.bgr);
+	app_log("virtual camera: started");
+	return true;
+}
+
+/* the picture to the camera, fitted into 1920x1080 with black beside it (no picture: only makes sure the camera is
+ * there) */
+static void camera_send(const AVFrame *f, bool full, bool bt709)
+{
+	if (!camera_start()) {
+		SDL_AtomicSet(&A.vcam_on, 0);
+		set_notice("Sanal kamera başlatılamadı (kurulu değil ya da başka bir program kullanıyor)", false);
+		return;
+	}
+	if (!f)
+		return;
 	int aw = f->width, ah = f->height;
-	bool fit = SDL_AtomicGet(&A.fit169) && aw > ah;
-	if (fit)
-		aw = 16, ah = 9;
+	if (SDL_AtomicGet(&A.fit169) && aw > ah)
+		aw = 16, ah = 9; /* landscape: spread to 16:9 */
 	int dw = VCAM_W, dh = (int)((int64_t)VCAM_W * ah / aw);
 	if (dh > VCAM_H) {
 		dh = VCAM_H;
@@ -1211,159 +1248,45 @@ static bool own_camera_write(const AVFrame *f)
 	}
 	dw &= ~1;
 	dh &= ~1;
-	if (dw < 2 || dh < 2)
-		return true;
-	int dx = (VCAM_W - dw) / 2, dy = (VCAM_H - dh) / 2;
-	if (S.src_w != f->width || S.src_h != f->height || S.fit != fit) {
-		memset(S.bgr, 0, VCAM_W * VCAM_H * 3);
+	if (dw < 2 || dh < 2 || dw > VCAM_W || dh > VCAM_H)
+		return;
+	if (!S.sws || S.src_w != f->width || S.src_h != f->height || S.src_format != f->format || S.dst_w != dw ||
+	    S.dst_h != dh || S.full != full || S.bt709 != bt709) {
+		sws_freeContext(S.sws);
+		S.sws = sws_getContext(f->width, f->height, (enum AVPixelFormat)f->format, dw, dh, AV_PIX_FMT_BGR24,
+				       SWS_BILINEAR, NULL, NULL, NULL);
+		if (!S.sws)
+			return;
+		sws_setColorspaceDetails(S.sws, sws_getCoefficients(bt709 ? SWS_CS_ITU709 : SWS_CS_ITU601), full ? 1 : 0,
+					 sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
 		S.src_w = f->width;
 		S.src_h = f->height;
-		S.fit = fit;
+		S.src_format = f->format;
+		S.dst_w = dw;
+		S.dst_h = dh;
+		S.full = full;
+		S.bt709 = bt709;
+		memset(S.bgr, 0, (size_t)VCAM_W * VCAM_H * 3); /* (black beside a picture of another shape) */
 	}
-	S.sws = sws_getCachedContext(S.sws, f->width, f->height, (enum AVPixelFormat)f->format, dw, dh, AV_PIX_FMT_BGR24,
-				     SWS_BILINEAR, NULL, NULL, NULL);
-	if (!S.sws)
-		return true;
-	uint8_t *dst[4] = {S.bgr + (dy * VCAM_W + dx) * 3, NULL, NULL, NULL};
+	int dx = (VCAM_W - dw) / 2, dy = (VCAM_H - dh) / 2;
+	uint8_t *dst[4] = {S.bgr + ((size_t)dy * VCAM_W + (size_t)dx) * 3, NULL, NULL, NULL};
 	int stride[4] = {VCAM_W * 3, 0, 0, 0};
 	sws_scale(S.sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height, dst, stride);
 	S.send(S.cam, S.bgr);
-	return true;
-}
-
-struct vcam_header {
-	volatile uint32_t write_idx;
-	volatile uint32_t read_idx;
-	volatile uint32_t state; /* 1: starting, 2: ready, 3: stopping */
-	uint32_t offsets[3];
-	uint32_t type;
-	uint32_t cx;
-	uint32_t cy;
-	uint64_t interval; /* of the frames, in 100 ns */
-	uint32_t reserved[8];
-};
-static struct {
-	HANDLE map;
-	struct vcam_header *h;
-	uint8_t *frame[3];
-	uint64_t *ts[3];
-	struct SwsContext *sws;
-	int src_w, src_h;
-	bool fit;
-} V;
-
-static void vcam_close(void)
-{
-	own_camera_close();
-	if (V.h) {
-		V.h->state = 3;
-		UnmapViewOfFile(V.h);
-	}
-	if (V.map)
-		CloseHandle(V.map);
-	sws_freeContext(V.sws);
-	memset(&V, 0, sizeof(V));
-}
-
-static void vcam_black(void)
-{
-	for (int i = 0; i < 3; i++) {
-		memset(V.frame[i], 16, VCAM_W * VCAM_H);
-		memset(V.frame[i] + VCAM_W * VCAM_H, 128, VCAM_W * VCAM_H / 2);
-	}
-}
-
-static bool vcam_open(void)
-{
-	uint32_t frame_size = VCAM_W * VCAM_H * 3 / 2, offsets[3];
-	uint32_t size = (uint32_t)sizeof(struct vcam_header);
-	for (int i = 0; i < 3; i++) {
-		size = (size + 31u) & ~31u;
-		offsets[i] = size;
-		size += frame_size + 32;
-	}
-	size = (size + 31u) & ~31u;
-	V.map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, size, L"OBSVirtualCamVideo");
-	if (!V.map)
-		return false;
-	if (GetLastError() == ERROR_ALREADY_EXISTS) {
-		/* OBS's own virtual camera (or another program) is feeding the camera */
-		CloseHandle(V.map);
-		V.map = NULL;
-		return false;
-	}
-	V.h = (struct vcam_header *)MapViewOfFile(V.map, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-	if (!V.h) {
-		vcam_close();
-		return false;
-	}
-	memset(V.h, 0, sizeof(*V.h));
-	V.h->state = 1;
-	V.h->cx = VCAM_W;
-	V.h->cy = VCAM_H;
-	V.h->interval = 10000000ull / 30;
-	for (int i = 0; i < 3; i++) {
-		V.h->offsets[i] = offsets[i];
-		V.ts[i] = (uint64_t *)((uint8_t *)V.h + offsets[i]);
-		V.frame[i] = (uint8_t *)V.h + offsets[i] + 32;
-	}
-	vcam_black();
-	return true;
-}
-
-/* the picture, fitted into 1920x1080 with black beside it */
-static void vcam_write(const AVFrame *f)
-{
-	if (own_camera_write(f))
-		return;
-	/* (our own camera is not there: OBS's, if OBS is installed) */
-	if (!V.h && !vcam_open()) {
-		SDL_AtomicSet(&A.vcam_on, 0);
-		set_notice("Sanal kamera açılamadı (kamera kaydı yapılamadı ya da başka bir program kullanıyor)", false);
-		return;
-	}
-	int aw = f->width, ah = f->height;
-	bool fit = SDL_AtomicGet(&A.fit169) && aw > ah;
-	if (fit)
-		aw = 16, ah = 9;
-	int dw = VCAM_W, dh = (int)((int64_t)VCAM_W * ah / aw);
-	if (dh > VCAM_H) {
-		dh = VCAM_H;
-		dw = (int)((int64_t)VCAM_H * aw / ah);
-	}
-	dw &= ~1;
-	dh &= ~1;
-	if (dw < 2 || dh < 2)
-		return;
-	int dx = ((VCAM_W - dw) / 2) & ~1, dy = ((VCAM_H - dh) / 2) & ~1;
-	if (V.src_w != f->width || V.src_h != f->height || V.fit != fit) {
-		vcam_black();
-		V.src_w = f->width;
-		V.src_h = f->height;
-		V.fit = fit;
-	}
-	V.sws = sws_getCachedContext(V.sws, f->width, f->height, (enum AVPixelFormat)f->format, dw, dh, AV_PIX_FMT_NV12,
-				     SWS_BILINEAR, NULL, NULL, NULL);
-	if (!V.sws)
-		return;
-	uint32_t inc = V.h->write_idx + 1;
-	V.h->write_idx = inc;
-	int at = (int)(inc % 3);
-	uint8_t *dst[4] = {V.frame[at] + dy * VCAM_W + dx, V.frame[at] + VCAM_W * VCAM_H + (dy / 2) * VCAM_W + dx, NULL,
-			   NULL};
-	int stride[4] = {VCAM_W, VCAM_W, 0, 0};
-	sws_scale(V.sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height, dst, stride);
-	*V.ts[at] = now_ns();
-	V.h->read_idx = inc;
-	V.h->state = 2;
 }
 #else
-static void vcam_close(void)
+static bool camera_installed(void)
+{
+	return false;
+}
+static void camera_stop(void)
 {
 }
-static void vcam_write(const AVFrame *f)
+static void camera_send(const AVFrame *f, bool full, bool bt709)
 {
 	(void)f;
+	(void)full;
+	(void)bt709;
 	SDL_AtomicSet(&A.vcam_on, 0);
 }
 #endif
@@ -1388,17 +1311,19 @@ static int rec_thread(void *unused)
 		SDL_UnlockMutex(Q.mutex);
 
 		if (!SDL_AtomicGet(&A.vcam_on))
-			vcam_close();
+			camera_stop();
 		if (item.kind == REC_VIDEO) {
 			if (SDL_AtomicGet(&A.vcam_on))
-				vcam_write(item.frame);
+				camera_send(item.frame, item.full, item.bt709);
 			rec_video(item.frame, item.full, item.bt709, item.t);
 			av_frame_free(&item.frame);
 		} else if (item.kind == REC_SHOT) {
 			save_png(item.frame, item.full, item.bt709);
 			av_frame_free(&item.frame);
 		} else if (item.kind == REC_SYNC) {
-			/* (only to look at the switches above) */
+			/* (a switch changed: the camera is there as soon as it is on, before the first picture) */
+			if (SDL_AtomicGet(&A.vcam_on))
+				camera_send(NULL, false, false);
 		} else if (item.kind == REC_AUDIO) {
 			rec_audio(item.audio, item.frames, item.rate, item.channels, item.t);
 			free(item.audio);
@@ -1409,7 +1334,7 @@ static int rec_thread(void *unused)
 			push_event(EV_STATE);
 		}
 	}
-	vcam_close();
+	camera_stop();
 	return 0;
 }
 
@@ -2018,9 +1943,9 @@ static void session_start(void)
 
 	char config[512];
 	snprintf(config, sizeof(config),
-		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nhide_connected %d\nvisible %d\n",
+		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nvisible %d\n",
 		 id, A.res_auto ? 3840 : A.width, A.res_auto ? 2160 : A.height, A.fps, A.h265 ? 1 : 0, allow ? 1 : 0,
-		 A.hide_connected ? 1 : 0, (A.visible || allow) ? 1 : 0);
+		 A.visible ? 1 : 0);
 	proc_write(A.proc, config);
 	for (const char *p = paired; p && *p;) {
 		const char *end = strchr(p, '\n');
@@ -2211,6 +2136,19 @@ static const char *paired_names(int *count)
 
 static bool autostart_get(void);
 
+/* (asked while the settings are drawn: looked up every two seconds) */
+static bool camera_installed_cached(void)
+{
+	static Uint32 at;
+	static bool value;
+	Uint32 now = SDL_GetTicks();
+	if (!at || now - at > 2000) {
+		value = camera_installed();
+		at = now ? now : 1;
+	}
+	return value;
+}
+
 /* ---- the interface: a bar at the bottom (shown while the mouse moves over the window, and while nothing is
  * mirrored) with the few things used all the time, and a settings panel for the rest */
 
@@ -2376,7 +2314,8 @@ static void draw_bar(int ow, int oh)
 			bool autostart = autostart_get();
 			add_button(CMD_AUTOSTART, autostart, "Windows İle Başlat", autostart ? "Açık" : "Kapalı");
 			add_button(CMD_ONTOP, A.on_top, "Pencere Her Zaman Üstte", A.on_top ? "Açık" : "Kapalı");
-			note = "Windows ile başlayınca pencere simge durumunda açılır.";
+			add_button(CMD_RESET, false, "Varsayılan Ayarlara Dön (İlk Açılış Gibi)", "Sıfırla");
+			note = "Sıfırlama ayarları ve eşleşmiş cihazları siler; önce onay ister.";
 		} else {
 			add_button(CMD_PAIR, pairing, "Yeni Cihaz Eşleştirme", pairing ? "Açık" : "Kapalı");
 			int paired = 0;
@@ -2394,7 +2333,6 @@ static void draw_bar(int ow, int oh)
 			}
 			add_button(CMD_FORGET, false, paired_label, "Unut");
 			add_button(CMD_VISIBLE, A.visible, "Ekran Yansıtma Listesinde Göster", A.visible ? "Açık" : "Kapalı");
-			add_button(CMD_HIDE, A.hide_connected, "Bağlıyken Listede Gizle", A.hide_connected ? "Açık" : "Kapalı");
 			char device[64] = "Varsayılan";
 			if (A.audio_device[0]) {
 				/* (shortened to fit, at a whole letter) */
@@ -2406,7 +2344,9 @@ static void draw_bar(int ow, int oh)
 			add_button(CMD_AUDIO_DEVICE, false, "Ses Çıkışı", "%s", device);
 			bool vcam = SDL_AtomicGet(&A.vcam_on) != 0;
 			add_button(CMD_VCAM, vcam, "Sanal Kamera", vcam ? "Açık" : "Kapalı");
-			note = "Sanal kameranın adı: Relios Mirror Camera (Discord vb. programlarda bunu seçin).";
+			if (camera_installed_cached())
+				add_button(CMD_VCAM_REMOVE, false, "Sanal Kamerayı Windows'tan Kaldır", "Kaldır");
+			note = "Sanal kamerayı önce burada açın, sonra programda \"Relios Mirror Camera\"yı seçin.";
 		}
 		int rows = button_count - first;
 		int row_h = bh + gap, value_w = f * 13;
@@ -2662,69 +2602,72 @@ static void choose_video_folder(void)
 }
 
 #ifdef _WIN32
-#define TRAY_MESSAGE (WM_APP + 1)
-
-static HWND window_handle(void)
+/* The camera's DLL (next to the program) is copied to "Program Files\Relios Mirror" and made known to Windows there,
+ * with the user's consent (Windows asks: UAC), once. false: not installed. */
+static bool install_camera(void)
 {
-	SDL_SysWMinfo info;
-	SDL_VERSION(&info.version);
-	return SDL_GetWindowWMInfo(A.win, &info) ? info.info.win.window : NULL;
-}
-
-/* Our camera's DLL is made known to Windows (regsvr32, with the user's consent: UAC), once for the folder the
- * program is in. false: not registered (the DLL is missing, or the user said no). */
-static bool register_camera(void)
-{
-	char path[2100];
-	own_camera_path(path, sizeof(path));
-	if (!file_exists_utf8(path))
-		return false;
-	char *made_for = read_text("kamera.txt");
-	bool same = made_for && !strcmp(made_for, path);
-	free(made_for);
-	if (same)
+	char src[2100], dst[1200], dir[1200], cmd_exe[900], regsvr[900], args[9000];
+	if (camera_installed())
 		return true;
-	if (strpbrk(path, "%^!\"&"))
+	char *base = SDL_GetBasePath();
+	snprintf(src, sizeof(src), "%ssoftcam.dll", base ? base : "");
+	SDL_free(base);
+	if (!file_exists_utf8(src) || !camera_installed_path(dst, sizeof(dst))) {
+		app_log("virtual camera: this build has no camera file");
 		return false;
+	}
+	snprintf(dir, sizeof(dir), "%s", dst);
+	char *slash = strrchr(dir, '\\');
+	if (slash)
+		*slash = '\0';
+	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
+	system_program("regsvr32.exe", regsvr, sizeof(regsvr));
+	if (strpbrk(src, "%^!\"&") || strpbrk(dst, "%^!\"&") || strpbrk(regsvr, "%^!\"&")) {
+		app_log("virtual camera: not installed (unusual letters in a folder's name)");
+		return false;
+	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
-				 "Sanal kamera (\"Relios Mirror Camera\") Windows'a bir kez tanıtılacak.\n\n"
+				 "Sanal kamera (\"Relios Mirror Camera\") Windows'a bir kez kurulacak.\n\n"
 				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.\n"
-				 "Kamera, açık olan programlarda (Discord vb.) onlar yeniden başlatılınca görünür.",
+				 "Kamerayı kullanacak program (Discord vb.) açıksa kapatıp yeniden açın.",
 				 A.win);
-	char args[2300];
-	snprintf(args, sizeof(args), "/s \"%s\"", path);
-	wchar_t *w = to_wide(args);
-	if (!w)
+	int n = snprintf(args, sizeof(args),
+			 "/c \"mkdir \"%s\" 2>nul & copy /y \"%s\" \"%s\" >nul 2>&1 & \"%s\" /s \"%s\"\"", dir, src, dst,
+			 regsvr, dst);
+	if (n < 0 || n >= (int)sizeof(args))
 		return false;
-	SHELLEXECUTEINFOW info;
-	memset(&info, 0, sizeof(info));
-	info.cbSize = sizeof(info);
-	info.fMask = SEE_MASK_NOCLOSEPROCESS;
-	info.lpVerb = L"runas";
-	info.lpFile = L"regsvr32.exe";
-	info.lpParameters = w;
-	info.nShow = SW_HIDE;
-	bool ok = false;
-	if (ShellExecuteExW(&info) && info.hProcess) {
-		DWORD code = 1;
-		WaitForSingleObject(info.hProcess, 30000);
-		GetExitCodeProcess(info.hProcess, &code);
-		CloseHandle(info.hProcess);
-		ok = code == 0;
-	}
-	free(w);
-	app_log("own virtual camera: registration %s", ok ? "done" : "failed or refused");
-	if (ok) {
-		FILE *f = fopen("kamera.txt", "w");
-		if (f) {
-			fputs(path, f);
-			fclose(f);
-		}
-	}
+	int code = run_elevated(cmd_exe, args);
+	bool ok = code == 0 && camera_installed();
+	app_log("virtual camera: installation %s (code %d)", ok ? "done" : "failed or refused", code);
 	return ok;
 }
 
-/* "Relios Mirror" under HKCU\...\Run: started with Windows, in the notification area */
+/* the camera is taken out of Windows again (the user is asked: UAC) */
+static void remove_camera(void)
+{
+	char dst[1200], dir[1200], cmd_exe[900], regsvr[900], args[9000];
+	if (!camera_installed_path(dst, sizeof(dst)))
+		return;
+	snprintf(dir, sizeof(dir), "%s", dst);
+	char *slash = strrchr(dir, '\\');
+	if (slash)
+		*slash = '\0';
+	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
+	system_program("regsvr32.exe", regsvr, sizeof(regsvr));
+	if (strpbrk(dst, "%^!\"&") || strpbrk(regsvr, "%^!\"&"))
+		return;
+	int n = snprintf(args, sizeof(args),
+			 "/c \"\"%s\" /u /s \"%s\" & del /f /q \"%s\" >nul 2>&1 & rmdir \"%s\" >nul 2>&1\"", regsvr, dst, dst,
+			 dir);
+	if (n < 0 || n >= (int)sizeof(args))
+		return;
+	run_elevated(cmd_exe, args);
+	bool gone = !camera_installed();
+	app_log("virtual camera: removal %s", gone ? "done" : "failed or refused");
+	set_notice(gone ? "Sanal kamera Windows'tan kaldırıldı" : "Sanal kamera kaldırılamadı", false);
+}
+
+/* "Relios Mirror" under HKCU\...\Run: started with Windows (its window minimized) */
 static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 static bool autostart_get(void)
@@ -2761,45 +2704,13 @@ static void autostart_set(bool on)
 	}
 	RegCloseKey(key);
 }
-
-static void tray_icon(DWORD action)
-{
-	NOTIFYICONDATAW icon;
-	memset(&icon, 0, sizeof(icon));
-	icon.cbSize = sizeof(icon);
-	icon.hWnd = window_handle();
-	icon.uID = 1;
-	icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-	icon.uCallbackMessage = TRAY_MESSAGE;
-	icon.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-	_snwprintf(icon.szTip, 63, L"Relios Mirror");
-	Shell_NotifyIconW(action, &icon);
-}
-
-/* the window to the notification area (mirroring goes on) and back */
-static void tray_hide(void)
-{
-	if (A.in_tray)
-		return;
-	tray_icon(NIM_ADD);
-	SDL_HideWindow(A.win);
-	A.in_tray = true;
-}
-
-static void tray_show(void)
-{
-	if (!A.in_tray)
-		return;
-	tray_icon(NIM_DELETE);
-	SDL_ShowWindow(A.win);
-	SDL_RestoreWindow(A.win);
-	SDL_RaiseWindow(A.win);
-	A.in_tray = false;
-}
 #else
-static bool register_camera(void)
+static bool install_camera(void)
 {
 	return false;
+}
+static void remove_camera(void)
+{
 }
 static bool autostart_get(void)
 {
@@ -2809,13 +2720,70 @@ static void autostart_set(bool on)
 {
 	(void)on;
 }
-static void tray_hide(void)
-{
-}
-static void tray_show(void)
-{
-}
 #endif
+
+/* a question with "Evet" and "Vazgeç" (Enter and Esc: Vazgeç); true: Evet */
+static bool confirm(const char *text)
+{
+	const SDL_MessageBoxButtonData buttons[] = {
+		{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Vazgeç"},
+		{0, 1, "Evet"},
+	};
+	SDL_MessageBoxData data;
+	int hit = 0;
+	SDL_zero(data);
+	data.flags = SDL_MESSAGEBOX_WARNING;
+	data.window = A.win;
+	data.title = APP_NAME;
+	data.message = text;
+	data.numbuttons = 2;
+	data.buttons = buttons;
+	return SDL_ShowMessageBox(&data, &hit) == 0 && hit == 1;
+}
+
+/* everything as at the first start: the settings, and no paired device (the firewall permission and an installed
+ * virtual camera stay as they are) */
+static void reset_everything(void)
+{
+	if (!confirm("Bütün ayarlar ilk açılıştaki haline dönecek ve eşleşmiş cihazlar unutulacak.\n"
+		     "(Güvenlik duvarı izni ve kurulu sanal kamera yerinde kalır.)\n\nDevam edilsin mi?"))
+		return;
+	session_stop();
+	A.restart_at = 0;
+	A.apply_at = 0;
+	SDL_LockMutex(R.mutex);
+	R.want = false;
+	R.failed = false;
+	rec_close_locked();
+	SDL_AtomicSet(&rec_on, 0);
+	SDL_UnlockMutex(R.mutex);
+	SDL_AtomicSet(&A.vcam_on, 0);
+	struct rec_item item;
+	memset(&item, 0, sizeof(item));
+	item.kind = REC_SYNC;
+	rec_push(&item);
+	remove("ayarlar.txt");
+	remove("paired-devices.txt");
+	remove("receiver-key.pem");
+	remove("device-id.txt");
+	autostart_set(false);
+	SDL_LockMutex(A.mutex);
+	A.audio_device[0] = '\0';
+	A.pair_requested = false;
+	A.pin[0] = '\0';
+	SDL_UnlockMutex(A.mutex);
+	A.custom_folder[0] = '\0';
+	SDL_AtomicSet(&A.fit169, 0);
+	SDL_AtomicSet(&A.audio_reopen, 1);
+	load_settings();
+	find_video_folder();
+	SDL_SetWindowAlwaysOnTop(A.win, SDL_FALSE);
+	editing_kbit = false;
+	settings_tab = 0;
+	save_settings();
+	session_start();
+	set_notice("Ayarlar ilk açılıştaki haline döndü", false);
+}
 
 static void run_command(int cmd)
 {
@@ -2885,12 +2853,11 @@ static void run_command(int cmd)
 		SDL_UnlockMutex(A.mutex);
 		SDL_AtomicSet(&A.register_ok, on ? 1 : 0);
 		if (on && !A.visible) {
-			/* (a device can only pair with a receiver it sees) */
+			/* (a device can only pair with a receiver it sees: the receiver starts again, announced) */
 			A.visible = true;
 			save_settings();
-		}
-		if (A.proc) {
-			proc_write(A.proc, A.visible ? "visible 1\n" : "visible 0\n");
+			A.apply_at = SDL_GetTicks() + 300;
+		} else if (A.proc) {
 			proc_write(A.proc, on ? "allow_pairing 1\n" : "allow_pairing 0\n");
 		}
 		break;
@@ -2929,13 +2896,19 @@ static void run_command(int cmd)
 		break;
 	}
 	case CMD_VCAM: {
-		if (!SDL_AtomicGet(&A.vcam_on))
-			register_camera(); /* (without it: OBS's camera, if OBS is installed) */
-		SDL_AtomicSet(&A.vcam_on, !SDL_AtomicGet(&A.vcam_on));
+		bool on = !SDL_AtomicGet(&A.vcam_on);
+		if (on && !install_camera()) {
+			set_notice("Sanal kamera kurulamadı (izin verilmedi ya da bu sürümde kamera dosyası yok)", false);
+			break;
+		}
+		SDL_AtomicSet(&A.vcam_on, on ? 1 : 0);
+		save_settings();
 		struct rec_item item;
 		memset(&item, 0, sizeof(item));
 		item.kind = REC_SYNC;
 		rec_push(&item);
+		if (on)
+			set_notice("Sanal kamera açık: programlarda \"Relios Mirror Camera\"yı seçin", false);
 		break;
 	}
 	case CMD_ASPECT:
@@ -2969,18 +2942,33 @@ static void run_command(int cmd)
 		settings_tab = 2;
 		editing_kbit = false;
 		break;
-	case CMD_VISIBLE:
+	case CMD_VISIBLE: {
+		/* (the receiver announces itself, or not, when it starts: the announcement is never taken back while a
+		 * device mirrors, because an Apple device ends its mirroring then) */
 		A.visible = !A.visible;
 		save_settings();
-		if (A.proc)
-			proc_write(A.proc, A.visible ? "visible 1\n" : "visible 0\n");
+		SDL_LockMutex(A.mutex);
+		bool busy = A.state == MIRROR_CONNECTED || A.state == MIRROR_PIN;
+		SDL_UnlockMutex(A.mutex);
+		if (busy)
+			set_notice("Bağlantı bittikten sonra geçerli olur", false);
+		else
+			A.apply_at = SDL_GetTicks() + 300;
 		break;
-	case CMD_HIDE:
-		A.hide_connected = !A.hide_connected;
+	}
+	case CMD_RESET:
+		reset_everything();
+		break;
+	case CMD_VCAM_REMOVE: {
+		SDL_AtomicSet(&A.vcam_on, 0);
 		save_settings();
-		if (A.proc)
-			proc_write(A.proc, A.hide_connected ? "hide_connected 1\n" : "hide_connected 0\n");
+		struct rec_item item;
+		memset(&item, 0, sizeof(item));
+		item.kind = REC_SYNC;
+		rec_push(&item);
+		remove_camera();
 		break;
+	}
 	case CMD_CHOOSE_FOLDER:
 		choose_video_folder();
 		break;
@@ -3122,6 +3110,10 @@ static void ensure_firewall_rule(void)
 		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet enable=yes\"",
 		 netsh, netsh, A.exe, netsh, A.exe, internet6, netsh, self, internet6, netsh, A.exe, internet4, netsh, self,
 		 internet4, netsh, A.exe);
+	if (strlen(cmd) + 1 >= sizeof(cmd)) {
+		app_log("firewall rules not made: the folder names are too long");
+		return;
+	}
 	if (run_elevated(cmd_exe, cmd) == 0) {
 		FILE *f = fopen("firewall.txt", "w");
 		if (f) {
@@ -3170,7 +3162,6 @@ int main(int argc, char *argv[])
 	av_log_set_level(AV_LOG_ERROR);
 	load_settings();
 	find_video_folder();
-
 	A.win = SDL_CreateWindow(APP_NAME, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
 				 SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	if (A.win)
@@ -3183,9 +3174,6 @@ int main(int argc, char *argv[])
 	}
 	if (A.on_top)
 		SDL_SetWindowAlwaysOnTop(A.win, SDL_TRUE);
-#ifdef _WIN32
-	SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE); /* (the notification area icon's clicks) */
-#endif
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--tepsi"))
 			SDL_MinimizeWindow(A.win); /* started with Windows */
@@ -3236,15 +3224,6 @@ int main(int argc, char *argv[])
 						A.restart_at = SDL_GetTicks() + (failed ? 5000 : 700);
 						redraw = retitle = true;
 					}
-#ifdef _WIN32
-				} else if (e.type == SDL_SYSWMEVENT) {
-					if (e.syswm.msg && e.syswm.msg->msg.win.msg == TRAY_MESSAGE &&
-					    (LOWORD(e.syswm.msg->msg.win.lParam) == WM_LBUTTONUP ||
-					     LOWORD(e.syswm.msg->msg.win.lParam) == WM_LBUTTONDBLCLK)) {
-						tray_show();
-						redraw = true;
-					}
-#endif
 				} else if (e.type == SDL_WINDOWEVENT) {
 					if (e.window.event == SDL_WINDOWEVENT_LEAVE)
 						A.bar_until = 0;
@@ -3336,7 +3315,6 @@ int main(int argc, char *argv[])
 	SDL_UnlockMutex(R.mutex);
 	if (A.adev)
 		SDL_CloseAudioDevice(A.adev);
-	tray_show();
 	save_settings();
 	app_log("ended");
 	texts_clear();

@@ -29,6 +29,34 @@ jobs:
             mingw-w64-ucrt-x86_64-ffmpeg
             mingw-w64-ucrt-x86_64-SDL2
             mingw-w64-ucrt-x86_64-SDL2_ttf
+      # The virtual camera ("Relios Mirror Camera"): softcam (MIT), one fixed revision whose source was read before
+      # it was added here. It gets this camera's own name and class id, and needs no runtime DLLs.
+      - name: Build the virtual camera (softcam, a fixed revision)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rev = 'd1acde4617782f87a3929d7a7528fa3e524ec56b'
+          git init -q softcam
+          git -C softcam remote add origin https://github.com/tshino/softcam.git
+          git -C softcam fetch -q --depth 1 origin $rev
+          git -C softcam checkout -q FETCH_HEAD
+          if ((git -C softcam rev-parse HEAD) -ne $rev) { throw 'softcam: not the expected revision' }
+          $changed = 0
+          foreach ($file in (Get-ChildItem softcam/src/softcam, softcam/src/softcamcore -Include *.cpp, *.h -Recurse)) {
+            $text = [IO.File]::ReadAllText($file.FullName)
+            $new = $text.Replace('DirectShow Softcam', 'Relios Mirror Camera')
+            $new = $new.Replace('0xaef3b972, 0x5fa5, 0x4647, 0x95, 0x71, 0x35, 0x8e, 0xb4, 0x72, 0xbc, 0x9e', '0xa50eb610, 0xeeb2, 0x4c26, 0xa2, 0xe9, 0xb5, 0xd0, 0x0e, 0x01, 0xec, 0x2d')
+            if ($new -cne $text) { [IO.File]::WriteAllText($file.FullName, $new); $changed++; Write-Host "changed: $($file.Name)" }
+          }
+          if ($changed -lt 3) { throw 'softcam: the name was not found where it is expected' }
+          if (-not (Select-String -Path softcam/src/softcam/softcam.cpp -Pattern '0xa50eb610' -Quiet)) { throw 'softcam: the class id was not replaced' }
+          Set-Content softcam/Directory.Build.targets '<Project><ItemDefinitionGroup Condition="''$(Configuration)''==''Release''"><ClCompile><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile></ItemDefinitionGroup></Project>'
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          $root = (Resolve-Path softcam).Path + '\\'
+          & $msbuild softcam\src\softcam\softcam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=$root /m /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { throw 'softcam: the build failed' }
+          Get-ChildItem softcam\dist -Recurse -Filter softcam.dll | ForEach-Object { Write-Host "built: $($_.FullName) ($($_.Length) bytes)" }
       - name: Build and gather
         run: bash paketle.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
