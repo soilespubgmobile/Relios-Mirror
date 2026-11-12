@@ -234,10 +234,20 @@ void app_log(const char *fmt, ...)
 	va_start(args, fmt);
 	vsnprintf(text, sizeof(text), fmt, args);
 	va_end(args);
+	static size_t log_bytes;
+	static const size_t log_limit = 5 * 1024 * 1024;
 	if (!log_file)
 		return;
 	if (log_mutex)
 		SDL_LockMutex(log_mutex);
+	if (log_bytes > log_limit) {
+		if (log_mutex)
+			SDL_UnlockMutex(log_mutex);
+		return;
+	}
+	log_bytes += strlen(text) + 10;
+	if (log_bytes > log_limit)
+		snprintf(text, sizeof(text), "(the log is full; nothing more is written until the program starts again)");
 	char stamp[32];
 	time_t now = time(NULL);
 	struct tm *tm_now = localtime(&now);
@@ -528,6 +538,16 @@ static void load_settings(void)
 		} else if (!strncmp(line, "kayit_klasoru=", 14)) {
 			snprintf(A.custom_folder, sizeof(A.custom_folder), "%s", line + 14);
 			A.custom_folder[strcspn(A.custom_folder, "\r\n")] = '\0';
+#ifdef _WIN32
+			{
+				const char *c = A.custom_folder;
+				bool drive = ((c[0] >= 'A' && c[0] <= 'Z') || (c[0] >= 'a' && c[0] <= 'z')) && c[1] == ':' &&
+					     (c[2] == '\\' || c[2] == '/');
+				bool share = c[0] == '\\' && c[1] == '\\';
+				if (!drive && !share)
+					A.custom_folder[0] = '\0';
+			}
+#endif
 		} else if (sscanf(line, "surum=%d", &a) == 1) {
 			version = a;
 		} else if (sscanf(line, "oran169=%d", &a) == 1) {
@@ -829,7 +849,9 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 	if (av_frame_get_buffer(R.frame, 0) < 0)
 		return false;
 
-	if (avio_open(&R.oc->pb, R.path, AVIO_FLAG_WRITE) < 0) {
+	char local[1500];
+	snprintf(local, sizeof(local), "file:%s", R.path); /* (always a file on this computer, never an address) */
+	if (avio_open(&R.oc->pb, local, AVIO_FLAG_WRITE) < 0) {
 		app_log("recording: could not write %s", R.path);
 		return false;
 	}
@@ -1043,7 +1065,7 @@ static void rec_queue_close(void)
 /* ---- a screenshot: the newest picture as a PNG next to the recordings */
 static void save_png(const AVFrame *f, bool full, bool bt709)
 {
-	char path[1400], stamp[40] = "goruntu";
+	char path[1400], local[1500], stamp[40] = "goruntu";
 	time_t now = time(NULL);
 	struct tm *tm_now = localtime(&now);
 	if (tm_now)
@@ -1085,7 +1107,8 @@ static void save_png(const AVFrame *f, bool full, bool bt709)
 	avcodec_send_frame(enc, NULL);
 	if (avcodec_receive_packet(enc, pkt) < 0)
 		goto done;
-	if (avio_open(&out, path, AVIO_FLAG_WRITE) < 0)
+	snprintf(local, sizeof(local), "file:%s", path); /* (always a file on this computer, never an address) */
+	if (avio_open(&out, local, AVIO_FLAG_WRITE) < 0)
 		goto done;
 	avio_write(out, pkt->data, pkt->size);
 	avio_closep(&out);
