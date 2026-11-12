@@ -10,7 +10,7 @@ KULLANIM
 3. iPad'de Denetim Merkezi > Ekran Yansıtma > "Relios Mirror".
 4. İlk seferde pencerede 4 haneli kod çıkar; iPad'e girin. Sonraki bağlanmalarda kod sorulmaz.
 
-iPad listede "Relios Mirror" görünmüyorsa: guvenlik-duvari-izni.bat dosyasını bir kez çalıştırın.
+Program ilk açılışta güvenlik duvarı iznini kendisi ister (bir kez, Windows onayıyla).
 
 
 DÜĞMELER VE TUŞLAR

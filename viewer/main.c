@@ -190,6 +190,7 @@ static struct {
 
 	char audio_device[256]; /* "": the default one (under mutex) */
 	SDL_atomic_t audio_reopen;
+	SDL_atomic_t register_ok; /* a new device may be remembered (pairing was switched on here) */
 	SDL_atomic_t vcam_on;
 	char notice[300]; /* a short message shown for a few seconds at the top of the window (under mutex) */
 	Uint32 notice_until;
@@ -285,6 +286,49 @@ static wchar_t *to_wide(const char *utf8)
 	if (w && n > 0)
 		MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, n);
 	return w;
+}
+#endif
+
+#ifdef _WIN32
+/* a program of Windows itself by its full path: never one of the same name that someone put in another folder */
+static void system_program(const char *name, char *out, size_t size)
+{
+	wchar_t dir[MAX_PATH];
+	char dir8[800] = "C:\\Windows\\System32";
+	UINT n = GetSystemDirectoryW(dir, MAX_PATH);
+	if (n > 0 && n < MAX_PATH)
+		WideCharToMultiByte(CP_UTF8, 0, dir, -1, dir8, (int)sizeof(dir8), NULL, NULL);
+	snprintf(out, size, "%s\\%s", dir8, name);
+}
+
+/* runs a program with administrator rights (Windows asks the user: UAC) and waits; its exit code, or -1 */
+static int run_elevated(const char *program_utf8, const char *args_utf8)
+{
+	wchar_t *program = to_wide(program_utf8), *args = to_wide(args_utf8);
+	wchar_t dir[MAX_PATH] = L"";
+	int code = -1;
+	GetSystemDirectoryW(dir, MAX_PATH);
+	if (program && args) {
+		SHELLEXECUTEINFOW info;
+		memset(&info, 0, sizeof(info));
+		info.cbSize = sizeof(info);
+		info.fMask = SEE_MASK_NOCLOSEPROCESS;
+		info.lpVerb = L"runas";
+		info.lpFile = program;
+		info.lpParameters = args;
+		info.lpDirectory = dir;
+		info.nShow = SW_HIDE;
+		if (ShellExecuteExW(&info) && info.hProcess) {
+			DWORD exit_code = 1;
+			WaitForSingleObject(info.hProcess, 30000);
+			if (GetExitCodeProcess(info.hProcess, &exit_code))
+				code = (int)exit_code;
+			CloseHandle(info.hProcess);
+		}
+	}
+	free(program);
+	free(args);
+	return code;
 }
 #endif
 
@@ -561,6 +605,27 @@ static void add_paired_device(const char *line)
 		strftime(date, sizeof(date), "%Y-%m-%d %H:%M", tm_now);
 	fprintf(f, "%s\t%s\n", line, date);
 	fclose(f);
+}
+
+/* "<public key (base64)>\t<device id>\t<name>": nothing that could start a line of its own or pass for another key */
+static bool register_line_ok(const char *line, size_t len)
+{
+	if (len < 20 || len > 2000 || strlen(line) != len)
+		return false;
+	const char *tab = strchr(line, '\t');
+	if (!tab || tab - line < 16 || tab - line > 200)
+		return false;
+	for (const char *p = line; p < tab; p++) {
+		bool ok = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '+' ||
+			  *p == '/' || *p == '=';
+		if (!ok)
+			return false;
+	}
+	for (const char *p = tab; *p; p++) {
+		if ((unsigned char)*p < 0x20 && *p != '\t')
+			return false;
+	}
+	return true;
 }
 
 static size_t paired_count(const char *list)
@@ -1474,6 +1539,11 @@ static void handle_video(struct decoder *d, const uint8_t *payload, size_t len)
 			d->sw->colorspace = f->colorspace;
 			f = d->sw;
 		}
+		if (f->width < 16 || f->height < 16 || f->width > 8192 || f->height > 8192) {
+			av_frame_unref(d->frame);
+			av_frame_unref(d->sw);
+			continue;
+		}
 		bool full, bt709;
 		frame_colors(f, &full, &bt709);
 		present_frame(d, f, full, bt709);
@@ -1766,8 +1836,12 @@ static int out_thread(void *generation)
 			handle_pin((const char *)buf);
 			break;
 		case RA_MSG_REGISTER:
-			add_paired_device((const char *)buf);
-			app_log("a new device was paired and remembered");
+			if (SDL_AtomicCAS(&A.register_ok, 1, 0) && register_line_ok((const char *)buf, len)) {
+				add_paired_device((const char *)buf);
+				app_log("a new device was paired and remembered");
+			} else {
+				app_log("a pairing record that was not asked for (or is malformed) was ignored");
+			}
 			break;
 		case RA_MSG_VIDEO_FORMAT:
 			if (len >= sizeof(struct ra_video_format)) {
@@ -1908,14 +1982,12 @@ static void session_start(void)
 	/* the first device pairs with the code shown here; later ones only after "pair a new device" */
 	bool allow = pair || paired_n == 0;
 
+	SDL_AtomicSet(&A.register_ok, allow ? 1 : 0);
+	/* (the part that reads what the network sends runs at low integrity, or not at all) */
 	A.proc = proc_start(A.exe, "--serve", true);
 	if (!A.proc) {
-		app_log("the receiver did not start at low integrity; starting it normally");
-		A.proc = proc_start(A.exe, "--serve", false);
-	}
-	if (!A.proc) {
 		free(paired);
-		session_fail("Alıcı program başlatılamadı");
+		session_fail("Alıcı korumalı modda başlatılamadı");
 		return;
 	}
 	app_log("receiver started; paired devices: %d, pairing a new device: %s, asked %dx%d@%d %s", (int)paired_n,
@@ -2280,9 +2352,8 @@ static void draw_bar(int ow, int oh)
 		} else if (settings_tab == 3) {
 			bool autostart = autostart_get();
 			add_button(CMD_AUTOSTART, autostart, "Windows İle Başlat", autostart ? "Açık" : "Kapalı");
-			add_button(CMD_TRAY, A.to_tray, "Küçültünce Bildirim Alanına Al", A.to_tray ? "Açık" : "Kapalı");
 			add_button(CMD_ONTOP, A.on_top, "Pencere Her Zaman Üstte", A.on_top ? "Açık" : "Kapalı");
-			note = "Windows ile başlayınca bildirim alanında (saatin yanında) bekler.";
+			note = "Windows ile başlayınca pencere simge durumunda açılır.";
 		} else {
 			add_button(CMD_PAIR, pairing, "Yeni Cihaz Eşleştirme", pairing ? "Açık" : "Kapalı");
 			int paired = 0;
@@ -2789,6 +2860,7 @@ static void run_command(int cmd)
 		if (!on)
 			A.pin[0] = '\0';
 		SDL_UnlockMutex(A.mutex);
+		SDL_AtomicSet(&A.register_ok, on ? 1 : 0);
 		if (on && !A.visible) {
 			/* (a device can only pair with a receiver it sees) */
 			A.visible = true;
@@ -2985,14 +3057,17 @@ static int key_command(SDL_Keycode key)
  * Windows made for the receiver if its own question was dismissed are removed. */
 static void ensure_firewall_rule(void)
 {
+	char netsh[900], cmd_exe[900];
+	system_program("netsh.exe", netsh, sizeof(netsh));
+	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
 	/* (the rule names the receiver program: made again if the folder moved) */
 	char *made_for = read_text("firewall.txt");
 	bool same = made_for && !strcmp(made_for, A.exe);
 	free(made_for);
-	if (same && proc_run("netsh", "advfirewall firewall show rule name=\"Relios Mirror\"", 10000) == 0)
+	if (same && proc_run(netsh, "advfirewall firewall show rule name=\"Relios Mirror\"", 10000) == 0)
 		return;
-	if (strpbrk(A.exe, "%^!\"&")) {
-		app_log("firewall rule not made by the program: unusual letters in its folder's name");
+	if (strpbrk(A.exe, "%^!\"&") || strpbrk(netsh, "%^!\"&")) {
+		app_log("firewall rule not made by the program: unusual letters in a folder's name");
 		return;
 	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
@@ -3000,36 +3075,22 @@ static void ensure_firewall_rule(void)
 				 "İzin yalnızca alıcı programa ve yalnızca yerel ağdan gelen bağlantılara verilir.\n"
 				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.",
 				 A.win);
-	char cmd[8000];
+	char cmd[9000];
 	snprintf(cmd, sizeof(cmd),
-		 "/c \"netsh advfirewall firewall delete rule name=\"Relios Mirror\""
-		 " & netsh advfirewall firewall delete rule name=all program=\"%s\""
-		 " & netsh advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet enable=yes\"",
-		 A.exe, A.exe);
-	wchar_t *w = to_wide(cmd);
-	if (!w)
-		return;
-	SHELLEXECUTEINFOW info;
-	memset(&info, 0, sizeof(info));
-	info.cbSize = sizeof(info);
-	info.fMask = SEE_MASK_NOCLOSEPROCESS;
-	info.lpVerb = L"runas";
-	info.lpFile = L"cmd.exe";
-	info.lpParameters = w;
-	info.nShow = SW_HIDE;
-	if (ShellExecuteExW(&info) && info.hProcess) {
-		WaitForSingleObject(info.hProcess, 20000);
-		CloseHandle(info.hProcess);
+		 "/c \"\"%s\" advfirewall firewall delete rule name=\"Relios Mirror\""
+		 " & \"%s\" advfirewall firewall delete rule name=all program=\"%s\""
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet enable=yes\"",
+		 netsh, netsh, A.exe, netsh, A.exe);
+	if (run_elevated(cmd_exe, cmd) == 0) {
 		FILE *f = fopen("firewall.txt", "w");
 		if (f) {
 			fputs(A.exe, f);
 			fclose(f);
 		}
-		app_log("firewall rule asked for (the receiver program, local network only)");
+		app_log("firewall rule made (the receiver program, local network only)");
 	} else {
-		app_log("firewall rule not added (error %lu)", (unsigned long)GetLastError());
+		app_log("firewall rule not made (refused, or an error)");
 	}
-	free(w);
 }
 #endif
 
@@ -3086,7 +3147,7 @@ int main(int argc, char *argv[])
 #endif
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--tepsi"))
-			tray_hide(); /* started with Windows */
+			SDL_MinimizeWindow(A.win); /* started with Windows */
 	}
 	{
 		char path[2100];
@@ -3146,8 +3207,6 @@ int main(int argc, char *argv[])
 				} else if (e.type == SDL_WINDOWEVENT) {
 					if (e.window.event == SDL_WINDOWEVENT_LEAVE)
 						A.bar_until = 0;
-					if (e.window.event == SDL_WINDOWEVENT_MINIMIZED && A.to_tray)
-						tray_hide();
 					redraw = true;
 				} else if (e.type == SDL_MOUSEMOTION) {
 					A.bar_until = SDL_GetTicks() + 2500;

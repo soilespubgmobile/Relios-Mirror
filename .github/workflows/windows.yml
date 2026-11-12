@@ -4,6 +4,10 @@ on:
   push:
   workflow_dispatch:
 
+# (the build only reads the repository)
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
@@ -11,8 +15,8 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:
           msystem: UCRT64
           update: true
@@ -27,11 +31,11 @@ jobs:
             mingw-w64-ucrt-x86_64-SDL2_ttf
       - name: Build and gather
         run: bash paketle.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ReliosMirror-windows
           path: dist/ReliosMirror
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ReliosMirror-tek-exe
           path: dist/tek-exe

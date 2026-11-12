@@ -28,7 +28,7 @@ if [ -f "$prefix/bin/SDL3.dll" ]; then
 	copy_dlls "$prefix/bin/SDL3.dll"
 fi
 
-cp BENIOKU.txt LICENSE guvenlik-duvari-izni.bat assets/logo.bmp "$out/"
+cp BENIOKU.txt LICENSE assets/logo.bmp "$out/"
 # our own virtual camera (built by the workflow's "softcam" step; without it the program uses OBS's camera)
 cam=$(find softcam -name softcam.dll -path '*x64*' 2>/dev/null | head -1 || true)
 if [ -n "$cam" ]; then
