@@ -173,8 +173,11 @@ static struct {
 	char audio_device[256]; /* "": the default one (under mutex) */
 	SDL_atomic_t audio_reopen;
 	SDL_atomic_t vcam_on;
-	char notice[200]; /* a short message in the bar (under mutex) */
+	char notice[300]; /* a short message shown for a few seconds at the top of the window (under mutex) */
 	Uint32 notice_until;
+	bool notice_opens_folder; /* a click on it opens the recordings folder */
+	bool notice_drawn;
+	SDL_Rect notice_rect;
 } A;
 
 /* recording (under R.mutex) */
@@ -237,11 +240,12 @@ static uint64_t now_ns(void)
 
 static void push_event(int code);
 
-static void set_notice(const char *text)
+static void set_notice(const char *text, bool opens_folder)
 {
 	SDL_LockMutex(A.mutex);
 	snprintf(A.notice, sizeof(A.notice), "%s", text);
-	A.notice_until = SDL_GetTicks() + 5000;
+	A.notice_opens_folder = opens_folder;
+	A.notice_until = SDL_GetTicks() + 6000;
 	SDL_UnlockMutex(A.mutex);
 	push_event(EV_STATE);
 }
@@ -530,6 +534,10 @@ static void rec_close_locked(void)
 		rec_drain();
 		av_write_trailer(R.oc);
 		app_log("recording closed: %s", R.path);
+		const char *name = strrchr(R.path, PATH_SEP[0]);
+		char text[300];
+		snprintf(text, sizeof(text), "Kayıt kaydedildi: %s  •  Klasörü açmak için tıklayın", name ? name + 1 : R.path);
+		set_notice(text, true);
 	}
 	if (R.oc && R.oc->pb)
 		avio_closep(&R.oc->pb);
@@ -933,7 +941,7 @@ done:
 	av_frame_free(&rgb);
 	avcodec_free_context(&enc);
 	app_log("screenshot %s: %s", ok ? "saved" : "failed", path);
-	set_notice(ok ? "Ekran görüntüsü kayıt klasörüne kaydedildi" : "Ekran görüntüsü kaydedilemedi");
+	set_notice(ok ? "Ekran görüntüsü kaydedildi  •  Klasörü açmak için tıklayın" : "Ekran görüntüsü kaydedilemedi", ok);
 }
 
 /* ---- the virtual camera: the picture goes to "OBS Virtual Camera" (the camera OBS Studio installs), through the
@@ -1027,7 +1035,7 @@ static void vcam_write(const AVFrame *f)
 {
 	if (!V.h && !vcam_open()) {
 		SDL_AtomicSet(&A.vcam_on, 0);
-		set_notice("Sanal kamera açılamadı. OBS Studio kurulu, OBS'in kendi sanal kamerası kapalı olmalı");
+		set_notice("Sanal kamera açılamadı. OBS Studio kurulu, OBS'in kendi sanal kamerası kapalı olmalı", false);
 		return;
 	}
 	int aw = f->width, ah = f->height;
@@ -1800,10 +1808,7 @@ static void status_text(char *status, size_t size)
 	SDL_UnlockMutex(R.mutex);
 	size_t used = strlen(status);
 	snprintf(status + used, size - used, "%s%s", rec, SDL_AtomicGet(&A.vcam_on) ? "  •  Sanal kamera açık" : "");
-	SDL_LockMutex(A.mutex);
-	if (A.notice[0] && !SDL_TICKS_PASSED(SDL_GetTicks(), A.notice_until))
-		snprintf(status, size, "%s", A.notice);
-	SDL_UnlockMutex(A.mutex);
+
 }
 
 static void update_title(void)
@@ -2242,6 +2247,24 @@ static void draw(void)
 	A.bar_drawn = bar_wanted();
 	if (A.bar_drawn)
 		draw_bar(ow, oh);
+
+	/* a message for a few seconds, at the top in the middle */
+	char notice[300] = "";
+	SDL_LockMutex(A.mutex);
+	if (A.notice[0] && !SDL_TICKS_PASSED(SDL_GetTicks(), A.notice_until))
+		snprintf(notice, sizeof(notice), "%s", A.notice);
+	SDL_UnlockMutex(A.mutex);
+	A.notice_drawn = false;
+	struct text_entry *nt = notice[0] ? text_get(notice) : NULL;
+	if (nt) {
+		int f = A.font_px, w = nt->w + 2 * f < ow - f ? nt->w + 2 * f : ow - f;
+		A.notice_rect = (SDL_Rect){(ow - w) / 2, f, w, f * 5 / 2};
+		SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_BLEND);
+		fill_round(&A.notice_rect, f / 2, 0, 166, 126, 240);
+		draw_text(notice, A.notice_rect.x + f, A.notice_rect.y + (A.notice_rect.h - nt->h) / 2, w - 2 * f, 2, 16, 13);
+		SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_NONE);
+		A.notice_drawn = true;
+	}
 	SDL_RenderPresent(A.ren);
 }
 
@@ -2346,7 +2369,7 @@ static void run_command(int cmd)
 		}
 		SDL_UnlockMutex(A.frame_mutex);
 		if (!item.frame)
-			set_notice("Ekran görüntüsü için önce iPad'i yansıtın");
+			set_notice("Ekran görüntüsü için önce iPad'i yansıtın", false);
 		else if (!rec_push(&item))
 			av_frame_free(&item.frame);
 		break;
@@ -2648,6 +2671,20 @@ int main(int argc, char *argv[])
 				} else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
 					A.bar_until = SDL_GetTicks() + 2500;
 					bool inside = false;
+					if (A.notice_drawn && A.notice_opens_folder) {
+						int ow = 0, oh = 0, ww = 0, wh = 0;
+						SDL_GetRendererOutputSize(A.ren, &ow, &oh);
+						SDL_GetWindowSize(A.win, &ww, &wh);
+						SDL_Point p = {ww > 0 ? e.button.x * ow / ww : 0, wh > 0 ? e.button.y * oh / wh : 0};
+						if (SDL_PointInRect(&p, &A.notice_rect)) {
+							open_video_folder();
+							SDL_LockMutex(A.mutex);
+							A.notice[0] = '\0';
+							SDL_UnlockMutex(A.mutex);
+							redraw = true;
+							continue;
+						}
+					}
 					if (editing_kbit)
 						kbit_key(SDLK_RETURN); /* a click elsewhere accepts what was typed */
 					cmd = button_at(e.button.x, e.button.y, &inside);
@@ -2687,6 +2724,8 @@ int main(int argc, char *argv[])
 				redraw = true;
 		}
 		if (A.bar_drawn != bar_wanted())
+			redraw = true;
+		if (A.notice_drawn && SDL_TICKS_PASSED(now, A.notice_until))
 			redraw = true;
 		if (retitle)
 			update_title();
