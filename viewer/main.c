@@ -97,6 +97,7 @@ enum {
 	CMD_SCREENSHOT,
 	CMD_AUDIO_DEVICE,
 	CMD_VCAM,
+	CMD_ASPECT,
 };
 
 static struct {
@@ -121,6 +122,7 @@ static struct {
 	int width, height, fps;
 	bool h265;
 	bool on_top;
+	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
 	bool rec_gpu;   /* record with the graphics card's encoder */
 	int rec_format; /* 0: .mp4, 1: .mov (QuickTime), 2: .mkv */
 	int rec_mode;   /* 0: by quality, 1: CBR, 2: VBR */
@@ -411,6 +413,8 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (sscanf(line, "oran169=%d", &a) == 1) {
+			SDL_AtomicSet(&A.fit169, a != 0);
 		} else if (!strncmp(line, "ses_aygiti=", 11)) {
 			snprintf(A.audio_device, sizeof(A.audio_device), "%s", line + 11);
 			A.audio_device[strcspn(A.audio_device, "\r\n")] = '\0';
@@ -433,7 +437,7 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
-	fprintf(f, "ses_aygiti=%s\n", A.audio_device);
+	fprintf(f, "ses_aygiti=%s\noran169=%d\n", A.audio_device, SDL_AtomicGet(&A.fit169));
 	fclose(f);
 }
 
@@ -575,6 +579,8 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 			return false;
 		R.enc->width = f->width & ~1;
 		R.enc->height = f->height & ~1;
+		if (SDL_AtomicGet(&A.fit169) && f->width > f->height)
+			R.enc->width = (f->height * 16 / 9) & ~1; /* landscape: spread to 16:9 */
 		R.enc->pix_fmt = gpu ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
 		R.enc->time_base = (AVRational){1, R.fps}; /* a constant frame rate: one tick per frame */
 		R.enc->framerate = (AVRational){R.fps, 1};
@@ -696,7 +702,7 @@ static void rec_video(const AVFrame *f, bool full, bool bt709, uint64_t t)
 		}
 		if (R.oc && R.header_written && av_frame_make_writable(R.frame) >= 0) {
 			int w = R.enc->width, h = R.enc->height;
-			if (R.enc->pix_fmt == AV_PIX_FMT_YUV420P &&
+			if (R.enc->pix_fmt == AV_PIX_FMT_YUV420P && w == (f->width & ~1) && h == (f->height & ~1) &&
 			    (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P)) {
 				av_image_copy_plane(R.frame->data[0], R.frame->linesize[0], f->data[0], f->linesize[0], w, h);
 				av_image_copy_plane(R.frame->data[1], R.frame->linesize[1], f->data[1], f->linesize[1], w / 2,
@@ -955,6 +961,7 @@ static struct {
 	uint64_t *ts[3];
 	struct SwsContext *sws;
 	int src_w, src_h;
+	bool fit;
 } V;
 
 static void vcam_close(void)
@@ -1023,20 +1030,25 @@ static void vcam_write(const AVFrame *f)
 		set_notice("Sanal kamera açılamadı: OBS Studio kurulu olmalı ve OBS'in kendi sanal kamerası kapalı olmalı");
 		return;
 	}
-	int dw = VCAM_W, dh = (int)((int64_t)VCAM_W * f->height / f->width);
+	int aw = f->width, ah = f->height;
+	bool fit = SDL_AtomicGet(&A.fit169) && aw > ah;
+	if (fit)
+		aw = 16, ah = 9;
+	int dw = VCAM_W, dh = (int)((int64_t)VCAM_W * ah / aw);
 	if (dh > VCAM_H) {
 		dh = VCAM_H;
-		dw = (int)((int64_t)VCAM_H * f->width / f->height);
+		dw = (int)((int64_t)VCAM_H * aw / ah);
 	}
 	dw &= ~1;
 	dh &= ~1;
 	if (dw < 2 || dh < 2)
 		return;
 	int dx = ((VCAM_W - dw) / 2) & ~1, dy = ((VCAM_H - dh) / 2) & ~1;
-	if (V.src_w != f->width || V.src_h != f->height) {
+	if (V.src_w != f->width || V.src_h != f->height || V.fit != fit) {
 		vcam_black();
 		V.src_w = f->width;
 		V.src_h = f->height;
+		V.fit = fit;
 	}
 	V.sws = sws_getCachedContext(V.sws, f->width, f->height, (enum AVPixelFormat)f->format, dw, dh, AV_PIX_FMT_NV12,
 				     SWS_BILINEAR, NULL, NULL, NULL);
@@ -2008,7 +2020,9 @@ static void draw_bar(int ow, int oh)
 			add_button(CMD_FPS_NEXT, false, "Kare hızı", "%d fps", A.fps);
 			add_button(CMD_CODEC_NEXT, false, "Kodek", A.h265 ? "H.265" : "H.264");
 			add_button(CMD_HW_DECODE, false, "Görüntü çözme", A.hw_decode ? "Ekran kartı" : "İşlemci");
-			note = "Değişiklikten sonra iPad'den yeniden bağlanın.";
+			bool fit = SDL_AtomicGet(&A.fit169) != 0;
+			add_button(CMD_ASPECT, fit, "Görüntü oranı", fit ? "16:9 (yatayda yay)" : "Özgün");
+			note = "İlk dördü değişince iPad'den yeniden bağlanın. 16:9 dikey görüntüye dokunmaz.";
 		} else if (settings_tab == 1) {
 			add_button(CMD_REC_FORMAT, false, "Biçim",
 				   A.rec_format == 0 ? "MP4" : A.rec_format == 1 ? "MOV (Apple)" : "MKV");
@@ -2211,12 +2225,15 @@ static void draw(void)
 		draw_idle(ow, oh);
 	} else if (A.tex && ow > 0 && oh > 0) {
 		SDL_Rect dst;
-		if ((int64_t)ow * A.tex_h > (int64_t)oh * A.tex_w) {
+		int aw = A.tex_w, ah = A.tex_h;
+		if (SDL_AtomicGet(&A.fit169) && aw > ah)
+			aw = 16, ah = 9; /* landscape: spread to 16:9; portrait stays as it is */
+		if ((int64_t)ow * ah > (int64_t)oh * aw) {
 			dst.h = oh;
-			dst.w = (int)((int64_t)oh * A.tex_w / A.tex_h);
+			dst.w = (int)((int64_t)oh * aw / ah);
 		} else {
 			dst.w = ow;
-			dst.h = (int)((int64_t)ow * A.tex_h / A.tex_w);
+			dst.h = (int)((int64_t)ow * ah / aw);
 		}
 		dst.x = (ow - dst.w) / 2;
 		dst.y = (oh - dst.h) / 2;
@@ -2358,6 +2375,11 @@ static void run_command(int cmd)
 		rec_push(&item);
 		break;
 	}
+	case CMD_ASPECT:
+		/* (the window and the virtual camera at once; a recording from its next file) */
+		SDL_AtomicSet(&A.fit169, !SDL_AtomicGet(&A.fit169));
+		save_settings();
+		break;
 	case CMD_TAB_VIDEO:
 		settings_tab = 0;
 		editing_kbit = false;
