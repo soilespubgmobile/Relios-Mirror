@@ -14,10 +14,12 @@ iPad listede "Relios Mirror" görünmüyorsa: guvenlik-duvari-izni.bat dosyasın
 
 
 DÜĞMELER VE TUŞLAR
-Fareyi pencerenin üstünde oynatınca altta düğmeler çıkar (2,5 sn sonra gizlenir; yayında görünmez):
-kayıt başlat/durdur, kayıt işlemci / ekran kartı, ses - / + / sessiz, çözünürlük, fps, kodek,
-çözme işlemci / ekran kartı, tam ekran, üstte, yeni cihaz.
-Çözünürlük, fps, kodek değişince iPad'den yeniden bağlanın.
+Fareyi pencerenin üstünde oynatınca altta çubuk çıkar (2,5 sn sonra gizlenir; yayında görünmez):
+Kayıt, ses - / + , Sessiz, Tam ekran, Ayarlar.
+Ayarlar: çözünürlük, kare hızı, kodek, görüntü çözme (ekran kartı / işlemci), kayıt kodlayıcı,
+kayıt biçimi (MP4 / MOV / MKV), bit hızı modu (otomatik / CBR / VBR), bit hızı (tıklayıp yazın, Enter),
+kayıt klasörü, her zaman üstte, yeni cihaz, eşleşmiş cihazları unut.
+Çözünürlük, kare hızı, kodek değişince iPad'den yeniden bağlanın.
 Tuşlar: R kayıt, Yukarı/Aşağı ses, M sessiz, F tam ekran, T üstte, P yeni cihaz.
 
 

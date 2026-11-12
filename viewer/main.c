@@ -88,7 +88,12 @@ enum {
 	CMD_REC_ENCODER,
 	CMD_REC_FORMAT,
 	CMD_REC_BITRATE,
+	CMD_REC_MODE,
 	CMD_HW_DECODE,
+	CMD_SETTINGS,
+	CMD_TAB_VIDEO,
+	CMD_TAB_RECORD,
+	CMD_TAB_DEVICE,
 };
 
 static struct {
@@ -114,8 +119,9 @@ static struct {
 	bool h265;
 	bool on_top;
 	bool rec_gpu;   /* record with the graphics card's encoder */
-	bool rec_mov;   /* record a QuickTime .mov (Apple's own format); otherwise .mkv */
-	int rec_kbit;   /* the recording's fixed bit rate; 0: by quality */
+	int rec_format; /* 0: .mp4, 1: .mov (QuickTime), 2: .mkv */
+	int rec_mode;   /* 0: by quality, 1: CBR, 2: VBR */
+	int rec_kbit;   /* the recording's bit rate for CBR / VBR */
 	SDL_Texture *logo;
 	int logo_w, logo_h;
 	bool hw_decode; /* decode with the graphics card */
@@ -172,8 +178,12 @@ static struct {
 	uint64_t t0;
 	int64_t last_vpts, next_apts;
 	bool audio_started, header_written;
-	char encoder[32];
+	char encoder[48];
 	int fps;
+	AVCodecContext *aenc; /* the sound: AAC */
+	AVFrame *aframe;
+	float *abuf; /* interleaved stereo waiting for a full AAC frame */
+	int abuf_n, abuf_cap;
 	char path[1400];
 } R;
 
@@ -350,8 +360,9 @@ static void load_settings(void)
 	A.h265 = false;
 	A.on_top = false;
 	A.rec_gpu = false;
-	A.rec_mov = true;
-	A.rec_kbit = 0;
+	A.rec_format = 0;
+	A.rec_mode = 0;
+	A.rec_kbit = 15000;
 	A.hw_decode = true;
 	SDL_AtomicSet(&A.volume, 100);
 	SDL_AtomicSet(&A.muted, 0);
@@ -378,9 +389,11 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
-		} else if (sscanf(line, "kayit_mov=%d", &a) == 1) {
-			A.rec_mov = a != 0;
-		} else if (sscanf(line, "kayit_kbit=%d", &a) == 1 && a >= 0 && a <= 100000) {
+		} else if (sscanf(line, "kayit_bicim=%d", &a) == 1 && a >= 0 && a <= 2) {
+			A.rec_format = a;
+		} else if (sscanf(line, "kayit_mod=%d", &a) == 1 && a >= 0 && a <= 2) {
+			A.rec_mode = a;
+		} else if (sscanf(line, "kayit_kbit=%d", &a) == 1 && a >= 500 && a <= 200000) {
 			A.rec_kbit = a;
 		}
 	}
@@ -392,9 +405,9 @@ static void save_settings(void)
 	FILE *f = fopen("ayarlar.txt", "w");
 	if (!f)
 		return;
-	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_mov=%d\nkayit_kbit=%d\n", A.width,
+	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
-		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_mov ? 1 : 0, A.rec_kbit);
+		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
 	fclose(f);
 }
 
@@ -450,6 +463,8 @@ static size_t paired_count(const char *list)
 
 /* ------------------------------------------------------------------ recording */
 
+static SDL_atomic_t rec_on; /* recording is switched on (read by the reading thread without waiting) */
+
 static void rec_drain(void)
 {
 	while (avcodec_receive_packet(R.enc, R.pkt) == 0) {
@@ -460,9 +475,27 @@ static void rec_drain(void)
 	}
 }
 
+static const char *const rec_ext[] = {"mp4", "mov", "mkv"};
+static const char *const rec_muxer[] = {"mp4", "mov", "matroska"};
+static const char *const rec_format_name[] = {"MP4", "MOV", "MKV"};
+
+static void rec_drain_audio(void)
+{
+	while (avcodec_receive_packet(R.aenc, R.pkt) == 0) {
+		av_packet_rescale_ts(R.pkt, R.aenc->time_base, R.ast->time_base);
+		R.pkt->stream_index = R.ast->index;
+		av_interleaved_write_frame(R.oc, R.pkt);
+		av_packet_unref(R.pkt);
+	}
+}
+
 static void rec_close_locked(void)
 {
 	if (R.oc && R.enc && R.header_written) {
+		if (R.aenc) {
+			avcodec_send_frame(R.aenc, NULL);
+			rec_drain_audio();
+		}
 		avcodec_send_frame(R.enc, NULL);
 		rec_drain();
 		av_write_trailer(R.oc);
@@ -476,25 +509,28 @@ static void rec_close_locked(void)
 	R.header_written = false;
 	R.vst = R.ast = NULL;
 	avcodec_free_context(&R.enc);
+	avcodec_free_context(&R.aenc);
+	av_frame_free(&R.aframe);
+	R.abuf_n = 0;
 	av_frame_free(&R.frame);
 	av_packet_free(&R.pkt);
 	sws_freeContext(R.sws);
 	R.sws = NULL;
 }
 
-static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
+static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0)
 {
 	char stamp[40] = "kayit";
 	time_t now = time(NULL);
 	struct tm *tm_now = localtime(&now);
 	if (tm_now)
 		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm_now);
-	snprintf(R.path, sizeof(R.path), "%s" PATH_SEP "ReliosMirror-%s.%s", A.video_folder, stamp, A.rec_mov ? "mov" : "mkv");
+	snprintf(R.path, sizeof(R.path), "%s" PATH_SEP "ReliosMirror-%s.%s", A.video_folder, stamp, rec_ext[A.rec_format]);
 
 	R.w = f->width;
 	R.h = f->height;
 	R.fps = A.fps;
-	if (avformat_alloc_output_context2(&R.oc, NULL, A.rec_mov ? "mov" : "matroska", R.path) < 0 || !R.oc)
+	if (avformat_alloc_output_context2(&R.oc, NULL, rec_muxer[A.rec_format], R.path) < 0 || !R.oc)
 		return false;
 	R.frame = av_frame_alloc();
 	R.pkt = av_packet_alloc();
@@ -524,13 +560,20 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 		AVDictionary *opts = NULL;
 		if (!gpu)
 			av_dict_set(&opts, "preset", "veryfast", 0);
-		if (A.rec_kbit > 0) {
-			/* a fixed bit rate */
+		if (A.rec_mode == 1) {
+			/* CBR: a constant bit rate */
 			R.enc->bit_rate = (int64_t)A.rec_kbit * 1000;
 			R.enc->rc_max_rate = R.enc->bit_rate;
 			R.enc->rc_buffer_size = A.rec_kbit * 1000;
 			if (n == 0)
 				av_dict_set(&opts, "rc", "cbr", 0);
+		} else if (A.rec_mode == 2) {
+			/* VBR: this bit rate on average, up to one and a half times it where the picture needs it */
+			R.enc->bit_rate = (int64_t)A.rec_kbit * 1000;
+			R.enc->rc_max_rate = R.enc->bit_rate * 3 / 2;
+			R.enc->rc_buffer_size = A.rec_kbit * 2000;
+			if (n == 0)
+				av_dict_set(&opts, "rc", "vbr", 0);
 		} else if (gpu) {
 			R.enc->bit_rate = (int64_t)R.enc->width * R.enc->height * R.fps / 10; /* 1080p60: ~12 Mbit/s */
 		} else {
@@ -542,7 +585,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 			app_log("recording: the encoder %s did not open (%d)", names[n], ret);
 			avcodec_free_context(&R.enc);
 		} else {
-			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "ekran kartı" : "işlemci", A.rec_mov ? "MOV" : "MKV");
+			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "ekran kartı" : "işlemci", rec_format_name[A.rec_format]);
 		}
 	}
 	if (!R.enc) {
@@ -557,15 +600,35 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 	R.vst->time_base = R.enc->time_base;
 	if (avcodec_parameters_from_context(R.vst->codecpar, R.enc) < 0)
 		return false;
-	/* the sound as it is decoded (16-bit PCM): AirPlay's is 44.1 kHz stereo */
-	R.ast->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-	R.ast->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
-	R.ast->codecpar->sample_rate = 44100;
-	av_channel_layout_default(&R.ast->codecpar->ch_layout, 2);
-	R.ast->codecpar->format = AV_SAMPLE_FMT_S16;
-	R.ast->codecpar->bits_per_coded_sample = 16;
-	R.ast->codecpar->bit_rate = 44100 * 2 * 16;
+	/* the sound: AAC, 44.1 kHz stereo (what every player and editor reads in .mp4 / .mov / .mkv) */
+	const AVCodec *acodec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+	if (!acodec)
+		return false;
+	R.aenc = avcodec_alloc_context3(acodec);
+	R.aframe = av_frame_alloc();
+	if (!R.aenc || !R.aframe)
+		return false;
+	R.aenc->sample_rate = 44100;
+	av_channel_layout_default(&R.aenc->ch_layout, 2);
+	R.aenc->sample_fmt = AV_SAMPLE_FMT_FLTP;
+	R.aenc->bit_rate = 192000;
+	R.aenc->time_base = (AVRational){1, 44100};
+	if (R.oc->oformat->flags & AVFMT_GLOBALHEADER)
+		R.aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+	if (avcodec_open2(R.aenc, acodec, NULL) < 0) {
+		app_log("recording: the AAC encoder did not open");
+		return false;
+	}
+	if (avcodec_parameters_from_context(R.ast->codecpar, R.aenc) < 0)
+		return false;
 	R.ast->time_base = (AVRational){1, 44100};
+	R.aframe->format = AV_SAMPLE_FMT_FLTP;
+	R.aframe->sample_rate = 44100;
+	av_channel_layout_default(&R.aframe->ch_layout, 2);
+	R.aframe->nb_samples = R.aenc->frame_size > 0 ? R.aenc->frame_size : 1024;
+	if (av_frame_get_buffer(R.aframe, 0) < 0)
+		return false;
+	R.abuf_n = 0;
 
 	R.frame->format = R.enc->pix_fmt;
 	R.frame->width = R.enc->width;
@@ -582,7 +645,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 		return false;
 	}
 	R.header_written = true;
-	R.t0 = now_ns();
+	R.t0 = t0;
 	R.last_vpts = -1;
 	R.next_apts = 0;
 	R.audio_started = false;
@@ -590,7 +653,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709)
 	return true;
 }
 
-static void rec_video(const AVFrame *f, bool full, bool bt709)
+static void rec_video(const AVFrame *f, bool full, bool bt709, uint64_t t)
 {
 	SDL_LockMutex(R.mutex);
 	if (R.want && !R.failed) {
@@ -598,7 +661,7 @@ static void rec_video(const AVFrame *f, bool full, bool bt709)
 		if (R.oc && (R.w != f->width || R.h != f->height))
 			rec_close_locked(); /* the iPad turned: a new file */
 		if (!R.oc) {
-			if (!rec_open_locked(f, full, bt709)) {
+			if (!rec_open_locked(f, full, bt709, t)) {
 				rec_close_locked();
 				R.failed = true;
 			} else {
@@ -623,7 +686,7 @@ static void rec_video(const AVFrame *f, bool full, bool bt709)
 			}
 			/* constant frame rate: this picture fills every frame time up to now (the iPad sends none while
 			 * its screen does not change), and is left out if its frame time is already filled */
-			int64_t index = (int64_t)((now_ns() - R.t0) / 1000ull * (uint64_t)R.fps / 1000000ull);
+			int64_t index = (int64_t)((t > R.t0 ? t - R.t0 : 0) / 1000ull * (uint64_t)R.fps / 1000000ull);
 			int64_t first = R.last_vpts + 1;
 			if (index - first > R.fps * 2)
 				first = index - R.fps * 2;
@@ -641,35 +704,48 @@ static void rec_video(const AVFrame *f, bool full, bool bt709)
 }
 
 /* interleaved float samples, as they are played (before the volume) */
-static void rec_audio(const float *samples, int frames, int rate, int channels)
+static void rec_audio(const float *samples, int frames, int rate, int channels, uint64_t now)
 {
 	SDL_LockMutex(R.mutex);
-	if (R.oc && R.header_written && rate == 44100 && (channels == 1 || channels == 2) && frames > 0) {
-		int64_t t = (int64_t)((double)(now_ns() - R.t0) * 44100.0 / 1e9) - frames;
+	if (R.oc && R.header_written && R.aenc && rate == 44100 && (channels == 1 || channels == 2) && frames > 0) {
+		int64_t t = (int64_t)((double)(now > R.t0 ? now - R.t0 : 0) * 44100.0 / 1e9) - frames - R.abuf_n;
 		if (t < 0)
 			t = 0;
 		/* by the sample count; by the clock only at the start and after a gap */
 		if (!R.audio_started || t - R.next_apts > 44100 / 5)
 			R.next_apts = t > R.next_apts ? t : R.next_apts;
 		R.audio_started = true;
-		if (av_new_packet(R.pkt, frames * 4) >= 0) {
-			int16_t *out = (int16_t *)R.pkt->data;
-			for (int i = 0; i < frames; i++) {
-				for (int c = 0; c < 2; c++) {
-					float v = samples[i * channels + (channels == 2 ? c : 0)] * 32767.0f;
-					if (v > 32767.0f)
-						v = 32767.0f;
-					if (v < -32768.0f)
-						v = -32768.0f;
-					out[i * 2 + c] = (int16_t)v;
-				}
+		if (R.abuf_n + frames > R.abuf_cap) {
+			int cap = (R.abuf_n + frames) * 2;
+			float *bigger = realloc(R.abuf, (size_t)cap * 2 * sizeof(float));
+			if (bigger) {
+				R.abuf = bigger;
+				R.abuf_cap = cap;
 			}
-			R.pkt->pts = R.pkt->dts = R.next_apts;
-			R.pkt->duration = frames;
-			R.pkt->stream_index = R.ast->index;
-			av_interleaved_write_frame(R.oc, R.pkt);
-			av_packet_unref(R.pkt);
-			R.next_apts += frames;
+		}
+		if (R.abuf_n + frames <= R.abuf_cap) {
+			for (int i = 0; i < frames; i++) {
+				R.abuf[(R.abuf_n + i) * 2] = samples[i * channels];
+				R.abuf[(R.abuf_n + i) * 2 + 1] = samples[i * channels + (channels == 2 ? 1 : 0)];
+			}
+			R.abuf_n += frames;
+		}
+		int size = R.aframe->nb_samples, used = 0;
+		while (R.abuf_n - used >= size && av_frame_make_writable(R.aframe) >= 0) {
+			float *left = (float *)R.aframe->data[0], *right = (float *)R.aframe->data[1];
+			for (int i = 0; i < size; i++) {
+				left[i] = R.abuf[(used + i) * 2];
+				right[i] = R.abuf[(used + i) * 2 + 1];
+			}
+			R.aframe->pts = R.next_apts;
+			R.next_apts += size;
+			used += size;
+			if (avcodec_send_frame(R.aenc, R.aframe) >= 0)
+				rec_drain_audio();
+		}
+		if (used > 0) {
+			memmove(R.abuf, R.abuf + (size_t)used * 2, (size_t)(R.abuf_n - used) * 2 * sizeof(float));
+			R.abuf_n -= used;
 		}
 	}
 	SDL_UnlockMutex(R.mutex);
@@ -685,7 +761,125 @@ static void rec_toggle(void)
 		R.want = true;
 	}
 	R.failed = false;
+	SDL_AtomicSet(&rec_on, R.want ? 1 : 0);
 	SDL_UnlockMutex(R.mutex);
+}
+
+/* Recording has a thread of its own: compressing must never hold back the picture and the sound that are shown
+ * and played. The reading thread only hands over what it decoded (if the encoder cannot keep up, pictures are
+ * left out of the file, not out of the window). */
+enum { REC_VIDEO = 1, REC_AUDIO, REC_CLOSE };
+struct rec_item {
+	int kind;
+	AVFrame *frame;
+	bool full, bt709;
+	float *audio;
+	int frames, rate, channels;
+	uint64_t t;
+};
+#define REC_QUEUE 96
+static struct {
+	SDL_mutex *mutex;
+	SDL_cond *cond;
+	struct rec_item items[REC_QUEUE];
+	int head, count, videos;
+	bool quit;
+	SDL_Thread *thread;
+} Q;
+
+static bool rec_push(struct rec_item *item)
+{
+	bool ok = false;
+	SDL_LockMutex(Q.mutex);
+	if (Q.count < REC_QUEUE && !(item->kind == REC_VIDEO && Q.videos >= 8)) {
+		Q.items[(Q.head + Q.count) % REC_QUEUE] = *item;
+		Q.count++;
+		if (item->kind == REC_VIDEO)
+			Q.videos++;
+		ok = true;
+		SDL_CondSignal(Q.cond);
+	}
+	SDL_UnlockMutex(Q.mutex);
+	return ok;
+}
+
+static void rec_queue_video(const AVFrame *f, bool full, bool bt709)
+{
+	if (!SDL_AtomicGet(&rec_on))
+		return;
+	struct rec_item item;
+	memset(&item, 0, sizeof(item));
+	item.kind = REC_VIDEO;
+	item.frame = av_frame_clone(f);
+	item.full = full;
+	item.bt709 = bt709;
+	item.t = now_ns();
+	if (!item.frame || !rec_push(&item))
+		av_frame_free(&item.frame);
+}
+
+static void rec_queue_audio(const float *samples, int frames, int rate, int channels)
+{
+	if (!SDL_AtomicGet(&rec_on) || frames <= 0 || channels <= 0)
+		return;
+	struct rec_item item;
+	memset(&item, 0, sizeof(item));
+	size_t bytes = (size_t)frames * (size_t)channels * sizeof(float);
+	item.kind = REC_AUDIO;
+	item.audio = malloc(bytes);
+	if (!item.audio)
+		return;
+	memcpy(item.audio, samples, bytes);
+	item.frames = frames;
+	item.rate = rate;
+	item.channels = channels;
+	item.t = now_ns();
+	if (!rec_push(&item))
+		free(item.audio);
+}
+
+/* the session ended: the file is closed after what is still waiting was written */
+static void rec_queue_close(void)
+{
+	struct rec_item item;
+	memset(&item, 0, sizeof(item));
+	item.kind = REC_CLOSE;
+	rec_push(&item);
+}
+
+static int rec_thread(void *unused)
+{
+	(void)unused;
+	for (;;) {
+		struct rec_item item;
+		SDL_LockMutex(Q.mutex);
+		while (Q.count == 0 && !Q.quit)
+			SDL_CondWait(Q.cond, Q.mutex);
+		if (Q.count == 0) {
+			SDL_UnlockMutex(Q.mutex);
+			break;
+		}
+		item = Q.items[Q.head];
+		Q.head = (Q.head + 1) % REC_QUEUE;
+		Q.count--;
+		if (item.kind == REC_VIDEO)
+			Q.videos--;
+		SDL_UnlockMutex(Q.mutex);
+
+		if (item.kind == REC_VIDEO) {
+			rec_video(item.frame, item.full, item.bt709, item.t);
+			av_frame_free(&item.frame);
+		} else if (item.kind == REC_AUDIO) {
+			rec_audio(item.audio, item.frames, item.rate, item.channels, item.t);
+			free(item.audio);
+		} else {
+			SDL_LockMutex(R.mutex);
+			rec_close_locked();
+			SDL_UnlockMutex(R.mutex);
+			push_event(EV_STATE);
+		}
+	}
+	return 0;
 }
 
 /* ------------------------------------------------------------------ decoding (the reading thread) */
@@ -835,7 +1029,7 @@ static void handle_video(struct decoder *d, const uint8_t *payload, size_t len)
 		bool full, bt709;
 		frame_colors(f, &full, &bt709);
 		present_frame(d, f, full, bt709);
-		rec_video(f, full, bt709);
+		rec_queue_video(f, full, bt709);
 		av_frame_unref(d->frame);
 		av_frame_unref(d->sw);
 	}
@@ -939,7 +1133,7 @@ static void handle_audio(struct decoder *d, const uint8_t *payload, size_t len)
 					for (int i = 0; i < n; i++)
 						d->mix[(size_t)i * (size_t)ch + (size_t)c] = src[i];
 				}
-				rec_audio(d->mix, n, f->sample_rate, ch);
+				rec_queue_audio(d->mix, n, f->sample_rate, ch);
 
 				float gain = SDL_AtomicGet(&A.muted) ? 0.0f : (float)SDL_AtomicGet(&A.volume) / 100.0f;
 				if (gain != 1.0f) {
@@ -1150,9 +1344,7 @@ static int out_thread(void *generation)
 	av_frame_free(&d.sw);
 
 	/* the file ends with the session; recording stays switched on for the next one */
-	SDL_LockMutex(R.mutex);
-	rec_close_locked();
-	SDL_UnlockMutex(R.mutex);
+	rec_queue_close();
 
 	clear_picture();
 	SDL_LockMutex(A.mutex);
@@ -1422,56 +1614,36 @@ static struct text_entry *text_get(const char *text)
 	return t;
 }
 
-/* ---- the buttons: a bar at the bottom, shown while the mouse moves over the window (and while nothing is mirrored) */
+/* ---- the interface: a bar at the bottom (shown while the mouse moves over the window, and while nothing is
+ * mirrored) with the few things used all the time, and a settings panel for the rest */
 
 struct button {
 	int cmd;
 	bool on;
+	char label[64]; /* (settings rows: the name at the left) */
 	char text[64];
 	SDL_Rect r;
 };
-static struct button buttons[24];
+static struct button buttons[32];
 static int button_count;
+static bool settings_open;
+static int settings_tab; /* 0: picture, 1: recording, 2: device */
+static bool editing_kbit; /* the recording bit rate is being typed */
+static char kbit_text[8];
+static SDL_Rect panel_rect, bar_rect;
 
-static void add_button(int cmd, bool on, const char *fmt, ...)
+static void add_button(int cmd, bool on, const char *label, const char *fmt, ...)
 {
 	if (button_count >= (int)(sizeof(buttons) / sizeof(buttons[0])))
 		return;
 	struct button *b = &buttons[button_count++];
 	b->cmd = cmd;
 	b->on = on;
+	snprintf(b->label, sizeof(b->label), "%s", label);
 	va_list args;
 	va_start(args, fmt);
 	vsnprintf(b->text, sizeof(b->text), fmt, args);
 	va_end(args);
-}
-
-static void build_buttons(void)
-{
-	SDL_LockMutex(R.mutex);
-	bool recording = R.want;
-	SDL_UnlockMutex(R.mutex);
-	bool muted = SDL_AtomicGet(&A.muted) != 0;
-	button_count = 0;
-	add_button(CMD_RECORD, recording, recording ? "Kaydı durdur" : "Kayıt başlat");
-	add_button(CMD_REC_ENCODER, false, A.rec_gpu ? "Kayıt: ekran kartı" : "Kayıt: işlemci");
-	add_button(CMD_REC_FORMAT, false, A.rec_mov ? "Biçim: MOV" : "Biçim: MKV");
-	if (A.rec_kbit > 0)
-		add_button(CMD_REC_BITRATE, false, "Kayıt: %d kbit", A.rec_kbit);
-	else
-		add_button(CMD_REC_BITRATE, false, "Kayıt: otomatik bit");
-	add_button(CMD_OPEN_FOLDER, false, "Kayıt klasörü");
-	add_button(CMD_VOL_DOWN, false, "Ses -");
-	add_button(CMD_VOL_100, false, "Ses %%%d", SDL_AtomicGet(&A.volume));
-	add_button(CMD_VOL_UP, false, "Ses +");
-	add_button(CMD_MUTE, muted, "Sessiz");
-	add_button(CMD_RES_NEXT, false, "%d×%d", A.width, A.height);
-	add_button(CMD_FPS_NEXT, false, "%d fps", A.fps);
-	add_button(CMD_CODEC_NEXT, false, A.h265 ? "H.265" : "H.264");
-	add_button(CMD_HW_DECODE, false, A.hw_decode ? "Çözme: ekran kartı" : "Çözme: işlemci");
-	add_button(CMD_FULLSCREEN, A.fullscreen, "Tam ekran");
-	add_button(CMD_ONTOP, A.on_top, "Üstte");
-	add_button(CMD_PAIR, false, "Yeni cihaz");
 }
 
 static bool bar_wanted(void)
@@ -1479,78 +1651,156 @@ static bool bar_wanted(void)
 	SDL_LockMutex(A.frame_mutex);
 	bool mirroring = A.have_frame;
 	SDL_UnlockMutex(A.frame_mutex);
-	return !mirroring || (A.bar_until && !SDL_TICKS_PASSED(SDL_GetTicks(), A.bar_until));
+	return !mirroring || settings_open || (A.bar_until && !SDL_TICKS_PASSED(SDL_GetTicks(), A.bar_until));
+}
+
+/* soft corners: two overlapping rectangles */
+static void fill_round(const SDL_Rect *r, int c, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha)
+{
+	SDL_Rect wide = {r->x, r->y + c, r->w, r->h - 2 * c};
+	SDL_Rect tall = {r->x + c, r->y, r->w - 2 * c, r->h};
+	SDL_SetRenderDrawColor(A.ren, red, green, blue, alpha);
+	SDL_RenderFillRect(A.ren, &wide);
+	SDL_RenderFillRect(A.ren, &tall);
+}
+
+static void draw_text(const char *text, int x, int y, int max_w, Uint8 red, Uint8 green, Uint8 blue)
+{
+	struct text_entry *t = text_get(text);
+	if (!t || max_w <= 0)
+		return;
+	SDL_SetTextureColorMod(t->tex, red, green, blue);
+	SDL_Rect src = {0, 0, t->w < max_w ? t->w : max_w, t->h};
+	SDL_Rect dst = {x, y, src.w, src.h};
+	SDL_RenderCopy(A.ren, t->tex, &src, &dst);
+}
+
+static void draw_button(const struct button *b)
+{
+	if (b->on)
+		fill_round(&b->r, A.font_px / 4, 0, 166, 126, 255);
+	else
+		fill_round(&b->r, A.font_px / 4, 12, 48, 40, 255);
+	struct text_entry *t = text_get(b->text);
+	if (t) {
+		if (b->on)
+			SDL_SetTextureColorMod(t->tex, 2, 16, 13);
+		else
+			SDL_SetTextureColorMod(t->tex, 214, 240, 232);
+		SDL_Rect dst = {b->r.x + (b->r.w - t->w) / 2, b->r.y + (b->r.h - t->h) / 2, t->w, t->h};
+		SDL_RenderCopy(A.ren, t->tex, NULL, &dst);
+	}
 }
 
 static void draw_bar(int ow, int oh)
 {
-	build_buttons();
+	SDL_LockMutex(R.mutex);
+	bool recording = R.want;
+	SDL_UnlockMutex(R.mutex);
+	bool muted = SDL_AtomicGet(&A.muted) != 0;
+	int f = A.font_px, pad = f, bh = f * 2, gap = f / 2;
 
-	int pad = A.font_px * 2 / 3, bh = A.font_px * 2, gap = A.font_px / 2;
-	/* the buttons from the left, in as many rows as they need */
-	int x = gap, rows = 1;
-	for (int i = 0; i < button_count; i++) {
+	button_count = 0;
+	add_button(CMD_RECORD, recording, "", recording ? "Kaydı durdur" : "Kayıt");
+	add_button(CMD_VOL_DOWN, false, "", "-");
+	add_button(CMD_VOL_100, false, "", "Ses %%%d", SDL_AtomicGet(&A.volume));
+	add_button(CMD_VOL_UP, false, "", "+");
+	add_button(CMD_MUTE, muted, "", "Sessiz");
+	add_button(CMD_FULLSCREEN, A.fullscreen, "", "Tam ekran");
+	add_button(CMD_SETTINGS, settings_open, "", "Ayarlar");
+	int bar_buttons = button_count;
+
+	/* one row: the state at the left, the buttons at the right */
+	int bar_h = bh + 2 * gap, y0 = oh - bar_h, x = ow - gap;
+	for (int i = bar_buttons - 1; i >= 0; i--) {
 		struct text_entry *t = text_get(buttons[i].text);
-		int bw = (t ? t->w : A.font_px * 4) + pad * 2;
-		if (x + bw + gap > ow && x > gap) {
-			x = gap;
-			rows++;
-		}
-		buttons[i].r.x = x;
-		buttons[i].r.y = rows - 1; /* (the row, for now) */
-		buttons[i].r.w = bw;
-		buttons[i].r.h = bh;
-		x += bw + gap;
+		int bw = (t ? t->w : f * 2) + pad * 2;
+		x -= bw;
+		buttons[i].r = (SDL_Rect){x, y0 + gap, bw, bh};
+		/* (volume: - value + sit together) */
+		x -= (buttons[i].cmd == CMD_VOL_100 || buttons[i].cmd == CMD_VOL_UP) ? 2 : gap;
 	}
-	int status_h = A.font_px * 2;
-	int bar_h = status_h + rows * (bh + gap);
-	int y0 = oh - bar_h;
-	for (int i = 0; i < button_count; i++)
-		buttons[i].r.y = y0 + status_h + buttons[i].r.y * (bh + gap);
+	bar_rect = (SDL_Rect){0, y0, ow, bar_h};
 
 	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_BLEND);
-	SDL_Rect bar = {0, y0, ow, bar_h};
-	SDL_SetRenderDrawColor(A.ren, 3, 13, 11, 228);
-	SDL_RenderFillRect(A.ren, &bar);
-	SDL_Rect line = {0, y0, ow, A.font_px / 8 > 1 ? A.font_px / 8 : 1};
+	SDL_SetRenderDrawColor(A.ren, 3, 13, 11, 235);
+	SDL_RenderFillRect(A.ren, &bar_rect);
+	SDL_Rect line = {0, y0, ow, f / 10 > 1 ? f / 10 : 1};
 	SDL_SetRenderDrawColor(A.ren, 0, 166, 126, 255);
 	SDL_RenderFillRect(A.ren, &line);
 
 	char status[600];
 	status_text(status, sizeof(status));
 	struct text_entry *st = text_get(status);
-	if (st) {
-		SDL_SetTextureColorMod(st->tex, 150, 205, 190);
-		SDL_Rect dst = {gap, y0 + (status_h - st->h) / 2, st->w, st->h};
-		if (dst.w > ow - 2 * gap) {
-			SDL_Rect src = {0, 0, ow - 2 * gap, st->h};
-			dst.w = src.w;
-			SDL_RenderCopy(A.ren, st->tex, &src, &dst);
+	if (st)
+		draw_text(status, gap * 2, y0 + (bar_h - st->h) / 2, x - gap * 3, 150, 205, 190);
+	for (int i = 0; i < bar_buttons; i++)
+		draw_button(&buttons[i]);
+
+	panel_rect = (SDL_Rect){0, 0, 0, 0};
+	if (settings_open) {
+		/* three folders, one open at a time */
+		int tabs = button_count;
+		add_button(CMD_TAB_VIDEO, settings_tab == 0, "", "Görüntü");
+		add_button(CMD_TAB_RECORD, settings_tab == 1, "", "Kayıt");
+		add_button(CMD_TAB_DEVICE, settings_tab == 2, "", "Cihaz");
+		int first = button_count;
+		const char *note = "";
+		SDL_LockMutex(A.mutex);
+		bool pairing = A.pair_requested;
+		SDL_UnlockMutex(A.mutex);
+		if (settings_tab == 0) {
+			add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
+			add_button(CMD_FPS_NEXT, false, "Kare hızı", "%d fps", A.fps);
+			add_button(CMD_CODEC_NEXT, false, "Kodek", A.h265 ? "H.265" : "H.264");
+			add_button(CMD_HW_DECODE, false, "Görüntü çözme", A.hw_decode ? "Ekran kartı" : "İşlemci");
+			note = "Değişiklikten sonra iPad'den yeniden bağlanın.";
+		} else if (settings_tab == 1) {
+			add_button(CMD_REC_FORMAT, false, "Biçim",
+				   A.rec_format == 0 ? "MP4" : A.rec_format == 1 ? "MOV (Apple)" : "MKV");
+			add_button(CMD_REC_ENCODER, false, "Kodlayıcı", A.rec_gpu ? "Ekran kartı" : "İşlemci");
+			add_button(CMD_REC_MODE, false, "Bit hızı modu",
+				   A.rec_mode == 0 ? "Otomatik (kalite)" : A.rec_mode == 1 ? "CBR (sabit)" : "VBR (değişken)");
+			if (editing_kbit)
+				add_button(CMD_REC_BITRATE, true, "Bit hızı", "%s_ kbit", kbit_text);
+			else if (A.rec_mode != 0)
+				add_button(CMD_REC_BITRATE, false, "Bit hızı", "%d kbit", A.rec_kbit);
+			add_button(CMD_OPEN_FOLDER, false, "Kayıt klasörü", "Aç");
+			note = editing_kbit ? "Rakamları yazın, Enter ile onaylayın." :
+			       A.rec_mode != 0 ? "Bit hızını değiştirmek için değerine tıklayıp yazın." :
+						 "Ayarlar bir sonraki kayıtta geçerli olur.";
 		} else {
-			SDL_RenderCopy(A.ren, st->tex, NULL, &dst);
+			add_button(CMD_PAIR, pairing, "Yeni cihaz eşleştirme", pairing ? "Açık" : "Kapalı");
+			add_button(CMD_FORGET, false, "Eşleşmiş cihazlar", "Unut");
+			add_button(CMD_ONTOP, A.on_top, "Pencere her zaman üstte", A.on_top ? "Açık" : "Kapalı");
+			note = "Eşleştirme açıkken yeni bir cihaz kodla bağlanabilir.";
 		}
-	}
-	for (int i = 0; i < button_count; i++) {
-		struct button *b = &buttons[i];
-		/* soft corners: two overlapping rectangles */
-		int c = A.font_px / 4;
-		SDL_Rect wide = {b->r.x, b->r.y + c, b->r.w, b->r.h - 2 * c};
-		SDL_Rect tall = {b->r.x + c, b->r.y, b->r.w - 2 * c, b->r.h};
-		if (b->on)
-			SDL_SetRenderDrawColor(A.ren, 0, 166, 126, 255);
-		else
-			SDL_SetRenderDrawColor(A.ren, 10, 44, 37, 255);
-		SDL_RenderFillRect(A.ren, &wide);
-		SDL_RenderFillRect(A.ren, &tall);
-		struct text_entry *t = text_get(b->text);
-		if (t) {
-			if (b->on)
-				SDL_SetTextureColorMod(t->tex, 2, 16, 13);
-			else
-				SDL_SetTextureColorMod(t->tex, 214, 240, 232);
-			SDL_Rect dst = {b->r.x + (b->r.w - t->w) / 2, b->r.y + (b->r.h - t->h) / 2, t->w, t->h};
-			SDL_RenderCopy(A.ren, t->tex, NULL, &dst);
+		int rows = button_count - first;
+		int row_h = bh + gap, value_w = f * 11;
+		int pw = f * 26 < ow - 2 * gap ? f * 26 : ow - 2 * gap;
+		int ph = f + row_h + f / 2 + 5 * row_h + f * 2;
+		int px = ow - pw - gap, py = y0 - ph - gap;
+		if (py < gap)
+			py = gap;
+		panel_rect = (SDL_Rect){px, py, pw, ph};
+		fill_round(&panel_rect, f / 2, 5, 22, 18, 245);
+		int tx = px + f;
+		for (int i = tabs; i < first; i++) {
+			struct text_entry *t = text_get(buttons[i].text);
+			int bw = (t ? t->w : f * 3) + pad * 2;
+			buttons[i].r = (SDL_Rect){tx, py + f, bw, bh};
+			draw_button(&buttons[i]);
+			tx += bw + gap;
 		}
+		for (int i = 0; i < rows; i++) {
+			struct button *b = &buttons[first + i];
+			int ry = py + f + row_h + f / 2 + i * row_h;
+			b->r = (SDL_Rect){px + pw - f - value_w, ry, value_w, bh};
+			struct text_entry *t = text_get(b->label);
+			draw_text(b->label, px + f, ry + (bh - (t ? t->h : f)) / 2, pw - 3 * f - value_w, 214, 240, 232);
+			draw_button(b);
+		}
+		draw_text(note, px + f, py + ph - f * 2, pw - 2 * f, 110, 160, 148);
 	}
 	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_NONE);
 }
@@ -1581,10 +1831,11 @@ static void draw_idle(int ow, int oh)
 	}
 }
 
-/* the button at this place of the window (window coordinates), or CMD_NONE */
-static int button_at(int mx, int my)
+/* the button at this place of the window (window coordinates), or CMD_NONE; inside: on the bar or the panel */
+static int button_at(int mx, int my, bool *inside)
 {
 	int ow = 0, oh = 0, ww = 0, wh = 0;
+	*inside = false;
 	if (!A.bar_drawn)
 		return CMD_NONE;
 	SDL_GetRendererOutputSize(A.ren, &ow, &oh);
@@ -1592,6 +1843,7 @@ static int button_at(int mx, int my)
 	if (ww <= 0 || wh <= 0)
 		return CMD_NONE;
 	SDL_Point p = {mx * ow / ww, my * oh / wh};
+	*inside = SDL_PointInRect(&p, &bar_rect) || SDL_PointInRect(&p, &panel_rect);
 	for (int i = 0; i < button_count; i++) {
 		if (SDL_PointInRect(&p, &buttons[i].r))
 			return buttons[i].cmd;
@@ -1765,31 +2017,51 @@ static void run_command(int cmd)
 		save_settings();
 		break;
 	case CMD_REC_FORMAT:
-		A.rec_mov = !A.rec_mov;
+		A.rec_format = (A.rec_format + 1) % 3;
 		save_settings();
 		break;
-	case CMD_REC_BITRATE: {
-		static const int steps[] = {0, 10000, 15000, 20000, 30000, 50000};
-		int n = (int)(sizeof(steps) / sizeof(steps[0])), at = 0;
-		for (int i = 0; i < n; i++) {
-			if (steps[i] == A.rec_kbit)
-				at = i;
-		}
-		A.rec_kbit = steps[(at + 1) % n];
+	case CMD_REC_MODE:
+		A.rec_mode = (A.rec_mode + 1) % 3;
 		save_settings();
 		break;
-	}
+	case CMD_REC_BITRATE:
+		editing_kbit = true;
+		kbit_text[0] = '\0';
+		break;
 	case CMD_OPEN_FOLDER:
 		open_video_folder();
 		break;
-	case CMD_PAIR:
+	case CMD_SETTINGS:
+		settings_open = !settings_open;
+		break;
+	case CMD_FORGET:
+		remove("paired-devices.txt");
+		restart = true;
+		break;
+	case CMD_PAIR: {
+		/* on / off: while on, one new device can pair with the code shown here */
 		SDL_LockMutex(A.mutex);
-		A.pair_requested = true;
-		if (A.state == MIRROR_PAIRING_OFF)
+		A.pair_requested = !A.pair_requested;
+		bool on = A.pair_requested;
+		if (on && A.state == MIRROR_PAIRING_OFF)
 			A.state = MIRROR_LISTENING;
+		if (!on)
+			A.pin[0] = '\0';
 		SDL_UnlockMutex(A.mutex);
 		if (A.proc)
-			proc_write(A.proc, "allow_pairing 1\n");
+			proc_write(A.proc, on ? "allow_pairing 1\n" : "allow_pairing 0\n");
+		break;
+	}
+	case CMD_TAB_VIDEO:
+		settings_tab = 0;
+		editing_kbit = false;
+		break;
+	case CMD_TAB_RECORD:
+		settings_tab = 1;
+		break;
+	case CMD_TAB_DEVICE:
+		settings_tab = 2;
+		editing_kbit = false;
 		break;
 	case CMD_RES_NEXT:
 		if (A.height < 1080)
@@ -1826,6 +2098,34 @@ static void run_command(int cmd)
 	update_title();
 }
 
+/* typing the recording's bit rate: digits, Backspace, Enter (accept), Esc (leave as it was) */
+static void kbit_key(SDL_Keycode key)
+{
+	int digit = -1;
+	size_t len = strlen(kbit_text);
+	if (key >= SDLK_0 && key <= SDLK_9)
+		digit = (int)(key - SDLK_0);
+	else if (key >= SDLK_KP_1 && key <= SDLK_KP_9)
+		digit = (int)(key - SDLK_KP_1) + 1;
+	else if (key == SDLK_KP_0)
+		digit = 0;
+	if (digit >= 0 && len < 6) {
+		kbit_text[len] = (char)('0' + digit);
+		kbit_text[len + 1] = '\0';
+	} else if (key == SDLK_BACKSPACE && len > 0) {
+		kbit_text[len - 1] = '\0';
+	} else if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
+		int v = atoi(kbit_text);
+		if (v > 0) {
+			A.rec_kbit = v < 500 ? 500 : v > 200000 ? 200000 : v;
+			save_settings();
+		}
+		editing_kbit = false;
+	} else if (key == SDLK_ESCAPE) {
+		editing_kbit = false;
+	}
+}
+
 static int key_command(SDL_Keycode key)
 {
 	switch (key) {
@@ -1833,7 +2133,7 @@ static int key_command(SDL_Keycode key)
 	case SDLK_F11:
 		return CMD_FULLSCREEN;
 	case SDLK_ESCAPE:
-		return A.fullscreen ? CMD_FULLSCREEN : CMD_NONE;
+		return settings_open ? CMD_SETTINGS : A.fullscreen ? CMD_FULLSCREEN : CMD_NONE;
 	case SDLK_m:
 		return CMD_MUTE;
 	case SDLK_UP:
@@ -1918,6 +2218,9 @@ int main(int argc, char *argv[])
 	A.mutex = SDL_CreateMutex();
 	A.frame_mutex = SDL_CreateMutex();
 	R.mutex = SDL_CreateMutex();
+	Q.mutex = SDL_CreateMutex();
+	Q.cond = SDL_CreateCond();
+	Q.thread = SDL_CreateThread(rec_thread, "recording", NULL);
 	log_mutex = SDL_CreateMutex();
 	A.event_type = SDL_RegisterEvents(1);
 	A.pending = av_frame_alloc();
@@ -2005,13 +2308,21 @@ int main(int argc, char *argv[])
 					A.bar_until = SDL_GetTicks() + 2500;
 					if (!A.bar_drawn)
 						redraw = true;
+				} else if (e.type == SDL_KEYDOWN && editing_kbit) {
+					kbit_key(e.key.keysym.sym);
+					redraw = true;
 				} else if (e.type == SDL_KEYDOWN &&
 					   (!e.key.repeat || e.key.keysym.sym == SDLK_UP || e.key.keysym.sym == SDLK_DOWN)) {
 					cmd = key_command(e.key.keysym.sym);
 				} else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
 					A.bar_until = SDL_GetTicks() + 2500;
-					cmd = button_at(e.button.x, e.button.y);
-					if (cmd == CMD_NONE && e.button.clicks == 2)
+					bool inside = false;
+					if (editing_kbit)
+						kbit_key(SDLK_RETURN); /* a click elsewhere accepts what was typed */
+					cmd = button_at(e.button.x, e.button.y, &inside);
+					if (cmd == CMD_NONE && settings_open && !inside)
+						cmd = CMD_SETTINGS; /* a click beside the panel closes it */
+					else if (cmd == CMD_NONE && !inside && e.button.clicks == 2)
 						cmd = CMD_FULLSCREEN;
 					redraw = true;
 				}
@@ -2053,6 +2364,12 @@ int main(int argc, char *argv[])
 	}
 
 	session_stop();
+	SDL_LockMutex(Q.mutex);
+	Q.quit = true;
+	SDL_CondSignal(Q.cond);
+	SDL_UnlockMutex(Q.mutex);
+	if (Q.thread)
+		SDL_WaitThread(Q.thread, NULL);
 	SDL_LockMutex(R.mutex);
 	rec_close_locked();
 	SDL_UnlockMutex(R.mutex);
