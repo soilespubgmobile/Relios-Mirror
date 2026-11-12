@@ -1,7 +1,7 @@
 # Relios Mirror: the iPad's AirPlay screen mirroring in a window of its own (no OBS).
 #
 #   ReliosMirror(.exe)             the window: decodes (FFmpeg), shows and plays (SDL2), records
-#   relios-airplay-receiver(.exe)    ReliosOBS's receiver, unchanged (receiver/): the network side
+#   relios-airplay-receiver(.exe)    ReliosOBS's receiver (receiver/; what Relios Mirror changed is marked): the network side
 #
 # Windows: built in MSYS2's UCRT64 (see paketle.sh, derle.bat and .github/workflows/windows.yml).
 cmake_minimum_required(VERSION 3.20)

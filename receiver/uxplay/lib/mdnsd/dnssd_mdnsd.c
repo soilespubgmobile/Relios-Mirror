@@ -356,3 +356,20 @@ void dnssd_error_text(int *dnssd_error, const  char *appname) {
         printf("Socket error %d: %s\n", sock_err, SOCKET_ERROR_STRING(sock_err));
     }
 }
+
+/* RELIOS: see dnssd.h */
+unsigned int dnssd_ipv4(dnssd_t *dnssd_public)
+{
+    if (!dnssd_public || !dnssd_public->dnssd_private) {
+        return 0;
+    }
+    return (unsigned int) mdnsd_ipv4(((dnssd_private_t *) dnssd_public->dnssd_private)->mdnsd);
+}
+
+int dnssd_address_changed(dnssd_t *dnssd_public)
+{
+    if (!dnssd_public || !dnssd_public->dnssd_private) {
+        return 0;
+    }
+    return mdnsd_address_changed(((dnssd_private_t *) dnssd_public->dnssd_private)->mdnsd);
+}

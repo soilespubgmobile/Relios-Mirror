@@ -1151,3 +1151,32 @@ void mdnsd_goodbye(mdnsd_t *mdnsd, const mdnsd_service_t *service)
     mdns_send_service_locked(mdnsd, service, 0, 0, MDNS_FAMILY_IPV6, NULL);
     MUTEX_UNLOCK(mdnsd->mutex);
 }
+
+/* RELIOS: see mdnsd.h */
+uint32_t mdnsd_ipv4(mdnsd_t *mdnsd)
+{
+    uint32_t addr;
+
+    if (!mdnsd) {
+        return 0;
+    }
+    MUTEX_LOCK(mdnsd->mutex);
+    addr = mdnsd->running ? mdnsd->ipv4_addr : 0;
+    MUTEX_UNLOCK(mdnsd->mutex);
+    return addr;
+}
+
+int mdnsd_address_changed(mdnsd_t *mdnsd)
+{
+    uint32_t addr;
+    int changed;
+
+    if (!mdnsd) {
+        return 0;
+    }
+    addr = mdns_get_default_ipv4();
+    MUTEX_LOCK(mdnsd->mutex);
+    changed = mdnsd->running && addr != mdnsd->ipv4_addr;
+    MUTEX_UNLOCK(mdnsd->mutex);
+    return changed;
+}

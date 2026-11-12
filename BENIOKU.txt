@@ -1,70 +1,115 @@
 RELIOS MIRROR
-iPad / iPhone ekranını Wi-Fi üzerinden (AirPlay) bilgisayarda kendi penceresinde gösterir. OBS gerekmez.
-Pencereyi Discord'da, OBS'te ya da başka bir programda "pencere" olarak seçip yayınlayabilirsiniz.
+Apple cihazının (iPad / iPhone) ekranını Wi-Fi üzerinden (AirPlay) bilgisayarda kendi penceresinde gösterir.
+OBS gerekmez. Pencereyi Discord'da, OBS'te ya da başka bir programda "pencere" olarak seçip yayınlayabilirsiniz.
 
 
 KULLANIM
-1. ReliosMirror.exe'yi açın (klasördeki diğer dosyalar yanında kalmalı).
-   Windows Güvenlik Duvarı sorarsa "Özel ağlar" için izin verin.
-2. iPad ve bilgisayar aynı Wi-Fi ağında olsun.
-3. iPad'de Denetim Merkezi > Ekran Yansıtma > "Relios Mirror".
-4. İlk seferde pencerede 4 haneli kod çıkar; iPad'e girin. Sonraki bağlanmalarda kod sorulmaz.
+1. ReliosMirror.exe'yi açın. (Tek dosyalık sürüm kendini ilk açılışta
+   %LOCALAPPDATA%\ReliosMirror\app-<tarih> klasörüne açar.)
+2. İlk açılışta Windows bir kez yönetici onayı ister: program, güvenlik duvarı kurallarını kendisi ekler.
+3. Apple cihazı ile bilgisayar aynı ağda olsun.
+4. Cihazda Denetim Merkezi > Ekran Yansıtma > "Relios Mirror".
+5. İlk seferde pencerede 4 haneli kod çıkar; cihaza girin. Sonraki bağlanmalarda kod sorulmaz.
 
-Program ilk açılışta güvenlik duvarı iznini kendisi ister (bir kez, Windows onayıyla).
+
+ÇUBUK, AYARLAR VE TUŞLAR
+Fareyi pencerenin üstünde oynatınca altta çubuk çıkar (kısa süre sonra gizlenir; yayında görünmez):
+Kayıt, Ekran Görüntüsü, ses - / +, Sessiz, Tam Ekran, Ayarlar.
+
+Ayarlar > Görüntü : Çözünürlük (varsayılan 1920x1080), Kare Hızı, Kodek, Görüntü Çözme (ekran kartı / işlemci),
+                    Görüntü Oranı (Özgün / 16:9). Çözünürlük, kare hızı ya da kodek değişince cihazdan yeniden bağlanın.
+Ayarlar > Kayıt   : Biçim (MOV / MP4 / MKV), Kodlayıcı (ekran kartı / işlemci), Bit Hızı (Otomatik / CBR / VBR;
+                    değere tıklayıp yazın, Enter), Sesi Kaydet, Kayıt Klasörü.
+Ayarlar > Cihaz   : Yeni Cihaz Eşleştirme, eşleşmiş cihazlar (Unut), Bağlıyken Listeden Gizle, Ses Çıkışı,
+                    Sanal Kamera.
+Ayarlar > Program : Windows İle Başlat, Pencere Her Zaman Üstte, Varsayılan Ayarlara Dön (İlk Açılış Gibi).
+
+Tuşlar: R kayıt, S ekran görüntüsü, Yukarı / Aşağı ses, M sessiz, F ya da F11 tam ekran, T üstte, P eşleştirme.
 
 
-DÜĞMELER VE TUŞLAR
-Fareyi pencerenin üstünde oynatınca altta çubuk çıkar (2,5 sn sonra gizlenir; yayında görünmez):
-Kayıt, ses - / + , Sessiz, Tam ekran, Ayarlar.
-Ayarlar: çözünürlük, kare hızı, kodek, görüntü çözme (ekran kartı / işlemci), kayıt kodlayıcı,
-kayıt biçimi (MP4 / MOV / MKV), bit hızı modu (otomatik / CBR / VBR), bit hızı (tıklayıp yazın, Enter),
-kayıt klasörü, her zaman üstte, yeni cihaz, eşleşmiş cihazları unut.
-Çözünürlük, kare hızı, kodek değişince iPad'den yeniden bağlanın.
-Tuşlar: R kayıt, S ekran görüntüsü, Yukarı/Aşağı ses, M sessiz, F tam ekran, T üstte, P eşleştirme.
+BAĞLIYKEN LİSTEDEN GİZLE (Ayarlar > Cihaz; varsayılan: açık)
+Eşleşmiş bir cihaz yansıtmaya başladıktan 10 saniye sonra "Relios Mirror" adı ağdan çekilir: başka hiçbir cihaz
+onu Ekran Yansıtma listesinde görmez. Yansıtma bitince ad yeniden duyurulur.
+Bir Apple cihazı, ad ağdan çekilince yansıtmayı kendisi kesebilir. Yansıtma, ad gizlendikten sonraki 20 saniye
+içinde kesilirse program bu seçeneği kendisi kapatır ve bunu pencerede yazar; cihazdan bir kez yeniden bağlanmak
+yeter. Yansıtma sırasında beklenmedik kopmalar olursa önce bu seçeneği kapatıp deneyin.
 
-Sanal kamera (Ayarlar > Cihaz): görüntüyü "Relios Mirror Camera" adlı kameraya verir. İlk açışta Windows'a
-bir kez kurulur (yönetici onayı ister). Önce burada açın, sonra Discord, Zoom vb. programda kamerayı seçin;
-program açıksa kapatıp yeniden açın. OBS gerekmez. Aynı yerden Windows'tan kaldırılabilir.
-Ses çıkışı (Ayarlar > Cihaz): sesin çalınacağı aygıt (hoparlör, kulaklık, sanal ses kablosu).
+
+SANAL KAMERA (Ayarlar > Cihaz)
+Görüntüyü "Relios Mirror Camera" adlı kameraya verir; OBS gerekmez. İlk açışta Windows'a bir kez kurulur
+(yönetici onayı ister; dosya: %ProgramFiles%\Relios Mirror\ReliosMirrorCamera.dll). Önce burada açın, sonra
+Discord, Zoom vb. programda kamerayı seçin; o program açıksa kapatıp yeniden açın. Aynı yerden Windows'tan
+kaldırılabilir.
+
+
+BAĞLANMAZSA
+- Cihaz ile bilgisayar aynı ağda mı? (Misafir ağı ve "AP yalıtımı" cihazların birbirini görmesini engeller.)
+- Aynı anda yalnızca bir Relios Mirror açık olmalı (OBS'teki "iPad Yansıtma" kaynağı da aynı portu ister).
+  Program açılırken başka bir kopya bulursa sorar ve onu kapatır.
+- VPN açıksa kapatıp deneyin: bilgisayar, cihaza yanlış ağ adresini duyurabilir.
+- Ad listede görünüyor ama bağlanmıyorsa Ayarlar > Cihaz > Unut ile eşleşmeyi silin, cihazdan yeniden bağlanın.
+- Ağ sonradan geldiyse (Windows ile başlatma) ya da bilgisayar uykudan uyandıysa program alıcıyı kendisi
+  yeniden başlatır; birkaç saniye bekleyin.
+- Hâlâ olmuyorsa %APPDATA%\ReliosMirror klasöründeki log.txt ve log-onceki.txt dosyalarını gönderin.
 
 
 KABLOLU BAĞLANTI
-AirPlay ağ üzerinden çalışır; kabloyla kullanmak için iPad ile bilgisayar arasında kablolu AĞ gerekir:
-- iPad'e USB-C Ethernet adaptörü takıp modeme bağlayın, ya da
-- hücresel iPad/iPhone'da Kişisel Erişim Noktası'nı açıp USB kabloyla bilgisayara bağlayın.
+AirPlay ağ üzerinden çalışır; kabloyla kullanmak için cihaz ile bilgisayar arasında kablolu AĞ gerekir:
+- cihaza USB-C Ethernet adaptörü takıp modeme bağlayın, ya da
+- hücresel iPad / iPhone'da Kişisel Erişim Noktası'nı açıp USB kabloyla bilgisayara bağlayın.
 Sonra yine Ekran Yansıtma > Relios Mirror.
 
 
-DISCORD
-Ekran paylaş > Uygulamalar > "Relios Mirror" penceresi. Ses de paylaşılsın isterseniz paylaşım
-penceresinde sesi açık bırakın; ses seviyesini bu programdan ayarlayabilirsiniz.
+DISCORD VE OBS
+Discord: Ekran Paylaş > Uygulamalar > "Relios Mirror" penceresi; ya da kamera olarak "Relios Mirror Camera".
+OBS: Kaynak Ekle > Pencere Yakalama > ReliosMirror.exe. Ses için: Uygulama Ses Yakalama > ReliosMirror.exe.
 
-OBS
-Kaynak ekle > Pencere Yakalama > ReliosMirror.exe. Ses için: Uygulama Ses Yakalama > ReliosMirror.exe.
-Sanal kamera: OBS'te "Sanal Kamerayı Başlat" (bu programın kendi sanal kamerası yok).
+
+GÜVENLİK VE AĞ
+- Program internete çıkmaz: güncelleme denetlemez, hiçbir yere veri göndermez, hiçbir şey indirmez. Yalnızca yerel
+  ağda AirPlay alıcısı olarak dinler (TCP 7000 ve 7100; UDP 6000, 6001, 7011 ve 5353).
+- Güvenlik duvarı kuralları ("Relios Mirror" adıyla): alıcıya yalnızca yerel ağdan gelen bağlantılara izin
+  verilir; alıcının ve programın yerel ağ dışındaki bütün adreslere çıkışı engellenir.
+- Alıcı (relios-airplay-receiver.exe) düşük yetkiyle ve kendi iş nesnesi içinde çalışır; yalnızca yerel ağ
+  adreslerinden bağlantı kabul eder; yeni cihaz yalnızca penceredeki kodla eşleşir.
+- Yönetici onayı yalnızca şunlar için istenir: güvenlik duvarı kuralları, sanal kameranın kurulması / kaldırılması.
 
 
 BİLMENİZ GEREKENLER
-- Bit hızını iPad kendisi seçer; AirPlay'de dışarıdan ayarlanamaz.
-- Şarj, kablosuz bağlantıda bilgisayardan açılıp kapatılamaz.
+- Yansıtmanın bit hızını Apple cihazı kendisi seçer; AirPlay'de dışarıdan ayarlanamaz.
+- Şarj, bilgisayardan açılıp kapatılamaz.
+- Cihaz aynı anda kendi ekran kaydını da alıyorsa yansıtma yavaşlayabilir: iki işi de cihazın kendisi yapar.
+  Kaydı bu programdan almak (R) cihazı yormaz.
 - Ses beklemeden çalınır (en çok ~0,15 sn birikir, fazlası atılır). Discord'un kendi gecikmesi buna eklenir.
-- Kayıt: H.264, sabit fps, QuickTime .mov (Apple biçimi) ya da .mkv; sabit bit hızı seçilebilir
-  (10000 - 50000 kbit) ya da otomatik. İşlemciyle ya da ekran kartıyla sıkıştırılır.
-- Güvenlik: alıcı düşük yetkiyle çalışır, yalnızca yerel ağdan bağlantı kabul eder, yeni cihaz kodla eşleşir;
-  güvenlik duvarı izni yalnızca alıcı programa ve yerel ağa verilir.
-- OBS'teki "iPad Yansıtma" kaynağı aynı anda açıksa ikisi aynı portu (7000) ister; birini kapatın.
-- Ayarlar ve günlük: %APPDATA%\ReliosMirror (ayarlar.txt, log.txt). Sorun olursa log.txt'yi gönderin.
+- Kayıt: H.264 + AAC, sabit kare hızı; MOV, MP4 ya da MKV.
+- Yansıtma sürerken ekran kapanmaz ve bilgisayar uyumaz; yansıtma yokken Windows'un güç ayarları geçerlidir.
+- Ayarlar ve günlük: %APPDATA%\ReliosMirror (ayarlar.txt, paired-devices.txt, log.txt, log-onceki.txt).
+- Eski sürümlerin açıldığı %LOCALAPPDATA%\ReliosMirror\app-<tarih> klasörleri, program kapalıyken silinebilir.
 
 
 EXE'Yİ DERLEMEK (kaynak koddan)
 A) GitHub ile (bilgisayara bir şey kurmadan):
-   1. github.com'da yeni bir depo açın, bu klasörün tamamını (.github klasörü dahil) yükleyin.
-   2. Depoda "Actions" sekmesi > "Windows exe" > en son çalışma bitince "ReliosMirror-windows"u indirin.
+   1. github.com'da bir depo açın, bu klasörün tamamını (.github klasörü dahil) yükleyin.
+   2. Depoda Actions > "Windows exe" > en son çalışma bitince "ReliosMirror-tek-exe"yi (tek dosya) ya da
+      "ReliosMirror-windows"u (klasör) indirin.
 B) Bilgisayarda:
    1. https://www.msys2.org adresinden MSYS2'yi kurun (C:\msys64).
-   2. derle.bat'a çift tıklayın. Sonuç: dist\ReliosMirror klasörü.
+   2. derle.bat'a çift tıklayın. Sonuç: dist\ReliosMirror klasörü ve dist\tek-exe\ReliosMirror.exe.
+      (Sanal kamera dosyası yalnızca GitHub derlemesinde üretilir; bkz. .github/workflows/windows.yml.)
+
+
+KAYNAK KODUN DÜZENİ
+viewer\main.c        pencere: görüntü / ses çözme (FFmpeg), gösterme ve çalma (SDL2), kayıt, ayarlar, sanal kamera
+viewer\proc_win.c    alıcıyı düşük yetkiyle ve iş nesnesi içinde başlatır
+viewer\launcher.c    tek dosyalık sürümün başlatıcısı
+receiver\receiver.c  AirPlay alıcısı (ağ tarafı); receiver\uxplay: UxPlay kitaplığı; receiver\libplist
+paketle.sh, derle.bat, .github\workflows\windows.yml   derleme
 
 
 LİSANS
-GPL-3.0. Ağ tarafı ReliosOBS'un alıcısıdır (receiver klasörü, değiştirilmedi); o da UxPlay'in
-AirPlay kitaplığını kullanır (https://github.com/FDH2/UxPlay). Görüntü/ses çözme: FFmpeg. Pencere/ses: SDL2.
+GPL-3.0 (LICENSE). Ağ tarafı ReliosOBS'un alıcısıdır (receiver klasörü; Relios Mirror için yapılan değişiklikler
+kodda "Relios Mirror" ya da "RELIOS:" diye işaretlidir); o da UxPlay'in AirPlay kitaplığını kullanır
+(https://github.com/FDH2/UxPlay, GPL-3.0; kitaplık dosyalarının çoğu LGPL-2.1) ve libplist'i (LGPL-2.1).
+Görüntü / ses çözme ve kayıt: FFmpeg. Pencere / ses: SDL2, SDL2_ttf. Sanal kamera: softcam
+(https://github.com/tshino/softcam, MIT; sabit bir sürümü derleme sırasında alınır, adı ve sınıf kimliği
+değiştirilir; lisansı pakette softcam-LICENSE.txt olarak yer alır).

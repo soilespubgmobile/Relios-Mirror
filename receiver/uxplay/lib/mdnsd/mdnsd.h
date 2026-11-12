@@ -49,4 +49,9 @@ void mdnsd_set_services(mdnsd_t *mdnsd, const mdnsd_service_t *airplay,
 void mdnsd_announce(mdnsd_t *mdnsd, uint32_t ttl);
 void mdnsd_goodbye(mdnsd_t *mdnsd, const mdnsd_service_t *service);
 
+/* RELIOS: the IPv4 address the answers carry (network byte order; 0: none was found), and whether the
+ * machine's address is now another one (it is looked up only when the responder starts) */
+uint32_t mdnsd_ipv4(mdnsd_t *mdnsd);
+int mdnsd_address_changed(mdnsd_t *mdnsd);
+
 #endif

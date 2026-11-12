@@ -53,6 +53,13 @@ static char *registered[MAX_REGISTERED];
 static int registered_count = 0;
 static bool allow_pairing = false;
 static bool visible = true; /* Relios Mirror: announced on the network ("visible 0" before "start": not) */
+/* Relios Mirror ("hide_connected 1"): once a paired device has been mirroring for ten seconds the name is taken off
+ * the network (no other device sees the receiver in its list), and it is announced again when the mirroring stops.
+ * Should an Apple device end its mirroring because the name left, the program that starts this receiver notices
+ * and switches the option off. */
+static bool hide_when_mirroring = false;
+static uint64_t mirroring_since = 0; /* wall clock; 0: no mirroring */
+#define HIDE_AFTER_NS (10ull * 1000000000ull)
 static int pairing_failures = 0;
 static int open_connections = 0;
 static bool had_trusted_client = false;
@@ -76,6 +83,18 @@ static uint64_t wall_ns(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* milliseconds that also pass while the computer sleeps (Windows); never set back */
+static uint64_t steady_ms(void)
+{
+#ifdef _WIN32
+	return (uint64_t)GetTickCount64();
+#else
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+#endif
 }
 
 static void send_message(uint8_t type, const void *head, size_t head_len, const void *data, size_t data_len)
@@ -122,6 +141,16 @@ static void log_line(const char *fmt, ...)
 	}
 	fprintf(stderr, "%s\n", text);
 	fflush(stderr);
+}
+
+static void log_address(dnssd_t *dnssd)
+{
+	unsigned int a = dnssd_ipv4(dnssd); /* (network byte order) */
+	const unsigned char *b = (const unsigned char *)&a;
+	if (a)
+		log_line("[info] announced on the network with the address %u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+	else
+		log_line("[warning] announced without an address: no network connection with a gateway was found yet");
 }
 
 /* ------------------------------------------------------------------ the library's callbacks */
@@ -231,6 +260,8 @@ static void cb_conn_destroy(void *cls)
 	(void)cls;
 	pthread_mutex_lock(&state_mutex);
 	open_connections--;
+	if (open_connections <= 0)
+		mirroring_since = 0;
 	bool idle = open_connections <= 0 && had_trusted_client;
 	if (idle)
 		idle_since = wall_ns();
@@ -253,6 +284,9 @@ static void cb_conn_feedback(void *cls)
 static void cb_mirror_video_running(void *cls, bool is_running)
 {
 	(void)cls;
+	pthread_mutex_lock(&state_mutex);
+	mirroring_since = is_running ? wall_ns() : 0;
+	pthread_mutex_unlock(&state_mutex);
 	send_text(RA_MSG_STATUS, "mirroring %s", is_running ? "on" : "off");
 }
 
@@ -423,6 +457,10 @@ static void handle_command(char *line)
 		pthread_mutex_lock(&state_mutex);
 		if (registered_count < MAX_REGISTERED && strlen(line + 9) > 0)
 			registered[registered_count++] = strdup(line + 9);
+		pthread_mutex_unlock(&state_mutex);
+	} else if (!strncmp(line, "hide_connected ", 15)) {
+		pthread_mutex_lock(&state_mutex);
+		hide_when_mirroring = atoi(line + 15) != 0;
 		pthread_mutex_unlock(&state_mutex);
 	} else if (!strncmp(line, "visible ", 8)) {
 		/* (only looked at when the receiver starts: the announcement is never taken back while it runs,
@@ -659,18 +697,66 @@ int main(int argc, char **argv)
 	} else if (dnssd_register_raop(dnssd, port) || dnssd_register_airplay(dnssd, port)) {
 		send_text(RA_MSG_STATUS, "error text=could not announce the receiver on the network");
 		return 1;
+	} else {
+		log_address(dnssd);
 	}
 	send_text(RA_MSG_STATUS, "listening port=%u", (unsigned)port);
 
 	pthread_t input;
 	pthread_create(&input, NULL, stdin_thread, NULL);
+	bool announced = visible;
+	uint64_t started = steady_ms(), last_turn = started, checked = started, retry_at = 0;
+	int changed_checks = 0, announce_failures = 0;
 
 	for (;;) {
 		if (quit_requested)
 			break;
+		uint64_t turn = steady_ms();
+		if (turn - last_turn > 60000) {
+			/* the computer slept (this loop stood still for over a minute): what was connected is gone and the
+			 * network may be another one. The receiver ends; the program starts a new one. */
+			log_line("[info] the computer slept: ending, to start afresh");
+			break;
+		}
+		last_turn = turn;
 		pthread_mutex_lock(&state_mutex);
 		uint64_t since = idle_since;
+		int connections = open_connections;
+		bool hide = hide_when_mirroring && mirroring_since && wall_ns() - mirroring_since > HIDE_AFTER_NS;
 		pthread_mutex_unlock(&state_mutex);
+		if (visible && hide == announced && turn >= retry_at) {
+			/* (only ever with "hide_connected 1") */
+			if (hide) {
+				dnssd_unregister_raop(dnssd);
+				dnssd_unregister_airplay(dnssd);
+				announced = false;
+				log_line("[info] mirroring: the name is taken off the network");
+				send_text(RA_MSG_STATUS, "hidden 1");
+			} else if (dnssd_register_raop(dnssd, port) || dnssd_register_airplay(dnssd, port)) {
+				/* (tried again every two seconds: without the announcement no device finds the receiver) */
+				if (announce_failures++ % 30 == 0)
+					log_line("[warning] could not announce the receiver again; trying until it works");
+				retry_at = turn + 2000;
+			} else {
+				announced = true;
+				announce_failures = 0;
+				log_line("[info] announced on the network again");
+				log_address(dnssd);
+				send_text(RA_MSG_STATUS, "hidden 0");
+			}
+		}
+		if (announced && connections <= 0 && turn - checked > 3000) {
+			/* The announcement carries the address the computer had when the receiver started. If the network
+			 * came up only later (a start with Windows), or is another one now, no device can connect: the
+			 * receiver ends, and the program starts a new one with the right address. Never while a device is
+			 * connected. */
+			checked = turn;
+			changed_checks = dnssd_address_changed(dnssd) ? changed_checks + 1 : 0;
+			if (changed_checks >= 2 && turn - started > 15000) {
+				log_line("[info] the computer's network address changed: ending, to announce the new one");
+				break;
+			}
+		}
 		if (since && wall_ns() - since > RECONNECT_GRACE_NS) {
 			log_line("[info] the iPad did not reconnect: ending");
 			break;

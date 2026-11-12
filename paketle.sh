@@ -33,6 +33,7 @@ cp BENIOKU.txt LICENSE assets/logo.bmp "$out/"
 cam=$(find softcam -name softcam.dll -path '*x64*' 2>/dev/null | head -1 || true)
 if [ -n "$cam" ]; then
 	cp "$cam" "$out/softcam.dll"
+	cp softcam/LICENSE "$out/softcam-LICENSE.txt" # (MIT: the notice goes with the DLL)
 	echo "Sanal kamera: $cam ($(stat -c %s "$cam") bayt)"
 	# (for the build log: what the camera DLL needs from Windows, and what it offers)
 	objdump -p "$out/softcam.dll" | grep -E "DLL Name:" | sed 's/^[[:space:]]*/  ihtiyac: /' || true

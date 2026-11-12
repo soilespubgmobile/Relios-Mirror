@@ -72,3 +72,23 @@ jobs:
         with:
           name: ReliosMirror-tek-exe
           path: dist/tek-exe
+      # The source code this build was made from, next to the program (only what is in the repository: no
+      # .git folder, nothing that was built).
+      - name: Gather the source code
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist/kaynak | Out-Null
+          git archive --format=tar -o dist/kaynak.tar HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
+          tar -xf dist/kaynak.tar -C dist/kaynak
+          if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
+          Remove-Item dist/kaynak.tar
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        continue-on-error: true
+        with:
+          name: ReliosMirror-kaynak-kod
+          path: dist/kaynak
+          include-hidden-files: true
+          if-no-files-found: warn

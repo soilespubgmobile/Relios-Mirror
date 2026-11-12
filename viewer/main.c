@@ -18,11 +18,13 @@
 #include <bcrypt.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 #else
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -95,9 +97,7 @@ enum {
 	CMD_REC_MODE,
 	CMD_HW_DECODE,
 	CMD_SETTINGS,
-	CMD_TAB_VIDEO,
-	CMD_TAB_RECORD,
-	CMD_TAB_DEVICE,
+	CMD_TAB,
 	CMD_SCREENSHOT,
 	CMD_AUDIO_DEVICE,
 	CMD_VCAM,
@@ -105,9 +105,7 @@ enum {
 	CMD_HIDE,
 	CMD_CHOOSE_FOLDER,
 	CMD_REC_AUDIO,
-	CMD_TAB_APP,
 	CMD_AUTOSTART,
-	CMD_TRAY,
 	CMD_VISIBLE,
 	CMD_RESET,
 	CMD_VCAM_REMOVE,
@@ -140,7 +138,8 @@ static struct {
 	bool in_tray;
 	bool res_auto;       /* the size is left to the iPad (the largest is asked for) */
 	bool visible;        /* announced on the network (in the Apple device's Screen Mirroring list) */
-	bool hide_connected; /* not in the iPad's list while a paired device is connected */
+	bool hide_connected; /* the name leaves the Screen Mirroring lists while a paired device is mirroring */
+	bool keep_awake;     /* the screen is kept on (while something is mirrored) */
 	char custom_folder[1024]; /* where recordings go, if chosen */
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
 	bool rec_gpu;   /* record with the graphics card's encoder */
@@ -194,6 +193,12 @@ static struct {
 	SDL_atomic_t audio_reopen;
 	SDL_atomic_t register_ok; /* a new device may be remembered (pairing was switched on here) */
 	SDL_atomic_t vcam_on;
+	bool camera_saved;       /* the camera switch as it is remembered */
+	bool camera_arming;      /* switched on again at the start: remembered again only once it runs */
+	SDL_atomic_t camera_ok;  /* the camera has started */
+	Uint32 hidden_at;        /* when the receiver took its name off the network (SDL ticks; 0: it is announced) */
+	SDL_atomic_t hide_broke; /* the mirroring stopped right after that */
+	int hover;               /* the button under the mouse (its index), for redrawing when it changes */
 	char notice[300]; /* a short message shown for a few seconds at the top of the window (under mutex) */
 	Uint32 notice_until;
 	bool notice_opens_folder; /* a click on it opens the recordings folder */
@@ -494,7 +499,8 @@ static void load_settings(void)
 	A.res_auto = false;
 	A.rec_audio = true;
 	A.to_tray = false;
-	A.hide_connected = true;
+	A.hide_connected = true; /* (on unless switched off; it switches itself off if it ends a mirroring) */
+	A.camera_saved = false;
 	A.visible = true;
 	SDL_AtomicSet(&A.vcam_on, 0);
 	A.rec_gpu = true;
@@ -528,6 +534,8 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (sscanf(line, "sanal_kamera=%d", &a) == 1) {
+			A.camera_saved = a != 0;
 		} else if (sscanf(line, "listede_goster=%d", &a) == 1) {
 			A.visible = a != 0;
 		} else if (sscanf(line, "kayit_ses=%d", &a) == 1) {
@@ -578,6 +586,9 @@ static void load_settings(void)
 		A.height = 1080;
 	}
 	A.res_auto = false;
+	if (version < 5)
+		A.hide_connected = true; /* (earlier builds saved it without having the option: on, as at a first start) */
+	A.visible = true; /* (always announced while the program runs: a hidden receiver cannot be connected to) */
 }
 
 static void save_settings(void)
@@ -588,9 +599,10 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
-	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=4\n", A.audio_device,
+	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=5\n", A.audio_device,
 		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
 		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
+	fprintf(f, "sanal_kamera=%d\n", A.camera_saved ? 1 : 0);
 	fclose(f);
 }
 
@@ -1224,6 +1236,7 @@ static bool camera_start(void)
 	memset(S.bgr, 0, (size_t)VCAM_W * VCAM_H * 3);
 	S.send(S.cam, S.bgr);
 	app_log("virtual camera: started");
+	SDL_AtomicSet(&A.camera_ok, 1);
 	return true;
 }
 
@@ -1652,6 +1665,20 @@ static void clear_picture(void)
 	SDL_UnlockMutex(A.frame_mutex);
 }
 
+/* The mirroring stopped (or the receiver ended). If that was within twenty seconds of the name leaving the network,
+ * hiding is taken to be what stopped it: the window thread switches the option off and says so. (Someone who stops
+ * a mirroring that early finds the option off too, and can switch it on again.) */
+static void hide_check(void)
+{
+	SDL_LockMutex(A.mutex);
+	Uint32 at = A.hidden_at;
+	A.hidden_at = 0;
+	SDL_UnlockMutex(A.mutex);
+	/* (not when the program itself is stopping the receiver: a changed setting, the end of the program) */
+	if (at && !SDL_AtomicGet(&A.stopping) && SDL_GetTicks() - at < 20000)
+		SDL_AtomicSet(&A.hide_broke, 1);
+}
+
 static void handle_status(const char *text)
 {
 	if (!strncmp(text, "integrity", 9)) {
@@ -1687,10 +1714,18 @@ static void handle_status(const char *text)
 		bool on = strstr(text, " on") != NULL;
 		app_log("screen mirroring %s", on ? "started" : "stopped");
 		if (!on) {
+			hide_check();
 			clear_picture();
 			if (A.adev)
 				SDL_ClearQueuedAudio(A.adev);
 		}
+		push_event(EV_STATE);
+	} else if (!strncmp(text, "hidden", 6)) {
+		bool hidden = strstr(text, " 1") != NULL;
+		app_log("the receiver's name is %s", hidden ? "off the network (hidden while mirroring)" : "announced again");
+		SDL_LockMutex(A.mutex);
+		A.hidden_at = hidden ? (SDL_GetTicks() | 1) : 0;
+		SDL_UnlockMutex(A.mutex);
 		push_event(EV_STATE);
 	} else if (!strncmp(text, "pairing_failed", 14)) {
 		app_log("a pairing with a wrong or missing code was refused (%s)", text + 14);
@@ -1827,6 +1862,7 @@ static int out_thread(void *generation)
 
 	/* the file ends with the session; recording stays switched on for the next one */
 	rec_queue_close();
+	hide_check();
 
 	clear_picture();
 	SDL_LockMutex(A.mutex);
@@ -1943,9 +1979,9 @@ static void session_start(void)
 
 	char config[512];
 	snprintf(config, sizeof(config),
-		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nvisible %d\n",
+		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nvisible %d\nhide_connected %d\n",
 		 id, A.res_auto ? 3840 : A.width, A.res_auto ? 2160 : A.height, A.fps, A.h265 ? 1 : 0, allow ? 1 : 0,
-		 A.visible ? 1 : 0);
+		 A.visible ? 1 : 0, A.hide_connected ? 1 : 0);
 	proc_write(A.proc, config);
 	for (const char *p = paired; p && *p;) {
 		const char *end = strchr(p, '\n');
@@ -2025,7 +2061,11 @@ static void status_text(char *status, size_t size)
 		snprintf(rec, sizeof(rec), "  •  Kayıt görüntüyü bekliyor");
 	SDL_UnlockMutex(R.mutex);
 	size_t used = strlen(status);
-	snprintf(status + used, size - used, "%s%s", rec, SDL_AtomicGet(&A.vcam_on) ? "  •  Sanal kamera açık" : "");
+	SDL_LockMutex(A.mutex);
+	bool hidden = A.hidden_at != 0;
+	SDL_UnlockMutex(A.mutex);
+	snprintf(status + used, size - used, "%s%s%s", rec, SDL_AtomicGet(&A.vcam_on) ? "  •  Sanal kamera açık" : "",
+		 hidden ? "  •  Listede gizli" : "");
 
 }
 
@@ -2152,33 +2192,65 @@ static bool camera_installed_cached(void)
 /* ---- the interface: a bar at the bottom (shown while the mouse moves over the window, and while nothing is
  * mirrored) with the few things used all the time, and a settings panel for the rest */
 
+enum { KIND_BUTTON, KIND_CHOICE, KIND_SWITCH };
+
 struct button {
-	int cmd;
+	int cmd, arg;
+	int kind;
 	bool on;
-	char label[64]; /* (settings rows: the name at the left) */
+	int row; /* (settings: its row; -1: the bar or a folder's tab) */
 	char text[64];
 	SDL_Rect r;
 };
-static struct button buttons[32];
+static struct button buttons[64];
 static int button_count;
 static bool settings_open;
 static int settings_tab; /* 0: picture, 1: recording, 2: device, 3: program */
 static bool editing_kbit; /* the recording bit rate is being typed */
 static char kbit_text[8];
 static SDL_Rect panel_rect, bar_rect;
+static char row_labels[12][80];
+static int row_count;
 
-static void add_button(int cmd, bool on, const char *label, const char *fmt, ...)
+static struct button *add_button(int cmd, int arg, int kind, bool on, const char *fmt, ...)
 {
-	if (button_count >= (int)(sizeof(buttons) / sizeof(buttons[0])))
-		return;
-	struct button *b = &buttons[button_count++];
+	static struct button spare;
+	struct button *b = button_count < (int)(sizeof(buttons) / sizeof(buttons[0])) ? &buttons[button_count++] : &spare;
+	memset(b, 0, sizeof(*b));
 	b->cmd = cmd;
+	b->arg = arg;
+	b->kind = kind;
 	b->on = on;
-	snprintf(b->label, sizeof(b->label), "%s", label);
+	b->row = -1;
 	va_list args;
 	va_start(args, fmt);
 	vsnprintf(b->text, sizeof(b->text), fmt, args);
 	va_end(args);
+	return b;
+}
+
+/* settings: a row with its name at the left; what follows (choices, a switch, buttons) sits at its right */
+static void row(const char *label)
+{
+	if (row_count < (int)(sizeof(row_labels) / sizeof(row_labels[0])))
+		snprintf(row_labels[row_count++], sizeof(row_labels[0]), "%s", label);
+}
+
+static void choice(int cmd, int arg, bool selected, const char *text)
+{
+	add_button(cmd, arg, KIND_CHOICE, selected, "%s", text)->row = row_count - 1;
+}
+
+static void toggle(const char *label, int cmd, bool on)
+{
+	row(label);
+	add_button(cmd, 0, KIND_SWITCH, on, "%s", "")->row = row_count - 1;
+}
+
+static void action(const char *label, int cmd, const char *text)
+{
+	row(label);
+	add_button(cmd, 0, KIND_BUTTON, false, "%s", text)->row = row_count - 1;
 }
 
 static bool bar_wanted(void)
@@ -2189,14 +2261,28 @@ static bool bar_wanted(void)
 	return !mirroring || settings_open || (A.bar_until && !SDL_TICKS_PASSED(SDL_GetTicks(), A.bar_until));
 }
 
-/* soft corners: two overlapping rectangles */
-static void fill_round(const SDL_Rect *r, int c, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha)
+/* a rectangle with round corners (row by row along the corners' circle) */
+static void fill_round(const SDL_Rect *r, int rad, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha)
 {
-	SDL_Rect wide = {r->x, r->y + c, r->w, r->h - 2 * c};
-	SDL_Rect tall = {r->x + c, r->y, r->w - 2 * c, r->h};
+	if (r->w <= 0 || r->h <= 0)
+		return;
+	if (rad * 2 > r->h)
+		rad = r->h / 2;
+	if (rad * 2 > r->w)
+		rad = r->w / 2;
+	if (rad < 0)
+		rad = 0;
 	SDL_SetRenderDrawColor(A.ren, red, green, blue, alpha);
-	SDL_RenderFillRect(A.ren, &wide);
-	SDL_RenderFillRect(A.ren, &tall);
+	SDL_Rect middle = {r->x, r->y + rad, r->w, r->h - 2 * rad};
+	SDL_RenderFillRect(A.ren, &middle);
+	for (int i = 0; i < rad; i++) {
+		double dy = (double)rad - (double)i - 0.5;
+		int inset = (int)((double)rad - sqrt((double)rad * (double)rad - dy * dy) + 0.5);
+		SDL_Rect top = {r->x + inset, r->y + i, r->w - 2 * inset, 1};
+		SDL_Rect bottom = {r->x + inset, r->y + r->h - 1 - i, r->w - 2 * inset, 1};
+		SDL_RenderFillRect(A.ren, &top);
+		SDL_RenderFillRect(A.ren, &bottom);
+	}
 }
 
 static void draw_text(const char *text, int x, int y, int max_w, Uint8 red, Uint8 green, Uint8 blue)
@@ -2210,21 +2296,149 @@ static void draw_text(const char *text, int x, int y, int max_w, Uint8 red, Uint
 	SDL_RenderCopy(A.ren, t->tex, &src, &dst);
 }
 
-static void draw_button(const struct button *b)
+static void draw_centered(const char *text, const SDL_Rect *r, Uint8 red, Uint8 green, Uint8 blue)
 {
-	if (b->on)
-		fill_round(&b->r, A.font_px / 4, 0, 166, 126, 255);
-	else
-		fill_round(&b->r, A.font_px / 4, 12, 48, 40, 255);
-	struct text_entry *t = text_get(b->text);
-	if (t) {
+	struct text_entry *t = text_get(text);
+	if (t)
+		draw_text(text, r->x + (r->w - t->w) / 2, r->y + (r->h - t->h) / 2, r->w, red, green, blue);
+}
+
+/* the mouse, in the picture's coordinates */
+static SDL_Point mouse_point(int ow, int oh)
+{
+	int mx = 0, my = 0, ww = 0, wh = 0;
+	SDL_GetMouseState(&mx, &my);
+	SDL_GetWindowSize(A.win, &ww, &wh);
+	SDL_Point p = {ww > 0 ? mx * ow / ww : -1, wh > 0 ? my * oh / wh : -1};
+	return p;
+}
+
+static void draw_button(const struct button *b, const SDL_Point *mouse)
+{
+	bool hover = SDL_PointInRect(mouse, &b->r) == SDL_TRUE;
+	int f = A.font_px;
+	if (b->kind == KIND_SWITCH) {
+		/* a switch: a pill with a round knob, at the right when on */
+		int h = b->r.h, knob = h - 6;
 		if (b->on)
-			SDL_SetTextureColorMod(t->tex, 2, 16, 13);
+			fill_round(&b->r, h / 2, 0, hover ? 196 : 178, hover ? 150 : 135, 255);
 		else
-			SDL_SetTextureColorMod(t->tex, 214, 240, 232);
-		SDL_Rect dst = {b->r.x + (b->r.w - t->w) / 2, b->r.y + (b->r.h - t->h) / 2, t->w, t->h};
-		SDL_RenderCopy(A.ren, t->tex, NULL, &dst);
+			fill_round(&b->r, h / 2, hover ? 66 : 52, hover ? 80 : 66, hover ? 76 : 62, 255);
+		SDL_Rect k = {b->on ? b->r.x + b->r.w - knob - 3 : b->r.x + 3, b->r.y + 3, knob, knob};
+		fill_round(&k, knob / 2, 244, 248, 246, 255);
+	} else if (b->kind == KIND_CHOICE) {
+		/* one of a strip of choices: the chosen one is filled */
+		SDL_Rect in = {b->r.x + 2, b->r.y + 2, b->r.w - 4, b->r.h - 4};
+		if (b->on)
+			fill_round(&in, f / 3, 0, 178, 135, 255);
+		else if (hover)
+			fill_round(&in, f / 3, 36, 50, 46, 255);
+		if (b->on)
+			draw_centered(b->text, &b->r, 4, 20, 16);
+		else
+			draw_centered(b->text, &b->r, hover ? 232 : 170, hover ? 240 : 186, hover ? 237 : 180);
+	} else {
+		/* a button: a quiet surface with a hairline edge; filled when it is "on" */
+		SDL_Rect in = {b->r.x + 1, b->r.y + 1, b->r.w - 2, b->r.h - 2};
+		if (b->on) {
+			fill_round(&b->r, f / 2, 0, hover ? 196 : 178, hover ? 150 : 135, 255);
+			draw_centered(b->text, &b->r, 4, 20, 16);
+		} else {
+			fill_round(&b->r, f / 2, hover ? 72 : 46, hover ? 94 : 62, hover ? 88 : 58, 255);
+			fill_round(&in, f / 2 - 1, hover ? 34 : 23, hover ? 48 : 34, hover ? 44 : 31, 255);
+			draw_centered(b->text, &b->r, 232, 240, 237);
+		}
 	}
+}
+
+/* the settings of the open folder: rows of names with their controls */
+static const char *build_settings(void)
+{
+	const char *note = "";
+	if (settings_tab == 0) {
+		row("Çözünürlük");
+		choice(CMD_RES_NEXT, 0, A.height == 720, "720p");
+		choice(CMD_RES_NEXT, 1, A.height == 1080, "1080p");
+		choice(CMD_RES_NEXT, 2, A.height == 1440, "1440p");
+		choice(CMD_RES_NEXT, 3, A.height == 2160, "4K");
+		row("Kare Hızı");
+		choice(CMD_FPS_NEXT, 30, A.fps == 30, "30 fps");
+		choice(CMD_FPS_NEXT, 60, A.fps != 30, "60 fps");
+		row("Kodek");
+		choice(CMD_CODEC_NEXT, 0, !A.h265, "H.264");
+		choice(CMD_CODEC_NEXT, 1, A.h265, "H.265");
+		row("Görüntü Çözme");
+		choice(CMD_HW_DECODE, 1, A.hw_decode, "Ekran Kartı");
+		choice(CMD_HW_DECODE, 0, !A.hw_decode, "İşlemci");
+		bool fit = SDL_AtomicGet(&A.fit169) != 0;
+		row("Görüntü Oranı");
+		choice(CMD_ASPECT, 0, !fit, "Özgün");
+		choice(CMD_ASPECT, 1, fit, "16:9");
+		note = "İlk dört ayar değişince cihazdan yeniden bağlanın. 16:9 yalnızca yatay görüntüye uygulanır.";
+	} else if (settings_tab == 1) {
+		row("Biçim");
+		choice(CMD_REC_FORMAT, 0, A.rec_format == 0, "MP4");
+		choice(CMD_REC_FORMAT, 1, A.rec_format == 1, "MOV");
+		choice(CMD_REC_FORMAT, 2, A.rec_format == 2, "MKV");
+		row("Kodlayıcı");
+		choice(CMD_REC_ENCODER, 1, A.rec_gpu, "Ekran Kartı");
+		choice(CMD_REC_ENCODER, 0, !A.rec_gpu, "İşlemci");
+		row("Bit Hızı");
+		choice(CMD_REC_MODE, 0, A.rec_mode == 0, "Otomatik");
+		choice(CMD_REC_MODE, 1, A.rec_mode == 1, "CBR");
+		choice(CMD_REC_MODE, 2, A.rec_mode == 2, "VBR");
+		if (A.rec_mode != 0 || editing_kbit) {
+			row("Bit Hızı Değeri");
+			if (editing_kbit)
+				add_button(CMD_REC_BITRATE, 0, KIND_BUTTON, true, "%s_ kbit", kbit_text)->row = row_count - 1;
+			else
+				add_button(CMD_REC_BITRATE, 0, KIND_BUTTON, false, "%d kbit", A.rec_kbit)->row = row_count - 1;
+		}
+		toggle("Sesi Kaydet", CMD_REC_AUDIO, A.rec_audio);
+		row("Kayıt Klasörü");
+		add_button(CMD_OPEN_FOLDER, 0, KIND_BUTTON, false, "Aç")->row = row_count - 1;
+		add_button(CMD_CHOOSE_FOLDER, 0, KIND_BUTTON, false, "Değiştir")->row = row_count - 1;
+		note = editing_kbit ? "Rakamları yazın, Enter ile onaylayın." :
+		       A.rec_mode != 0 ? "Bit hızını değiştirmek için değerine tıklayıp yazın." :
+					 "Ayarlar bir sonraki kayıtta geçerli olur.";
+	} else if (settings_tab == 3) {
+		toggle("Windows İle Başlat", CMD_AUTOSTART, autostart_get());
+		toggle("Pencere Her Zaman Üstte", CMD_ONTOP, A.on_top);
+		action("Varsayılan Ayarlara Dön (İlk Açılış Gibi)", CMD_RESET, "Sıfırla");
+		note = "Sıfırlama ayarları ve eşleşmiş cihazları siler; önce onay ister.";
+	} else {
+		int paired = 0;
+		const char *names = paired_names(&paired);
+		SDL_LockMutex(A.mutex);
+		bool pairing = A.pair_requested || paired == 0; /* (the first device always pairs with the code) */
+		SDL_UnlockMutex(A.mutex);
+		toggle("Yeni Cihaz Eşleştirme", CMD_PAIR, pairing);
+		char paired_label[80];
+		if (paired > 0) {
+			/* (shortened to fit, at a whole letter) */
+			size_t len = strlen(names), keep = len > 44 ? 44 : len;
+			while (keep > 0 && keep < len && ((unsigned char)names[keep] & 0xC0) == 0x80)
+				keep--;
+			snprintf(paired_label, sizeof(paired_label), "Eşleşmiş: %.*s%s", (int)keep, names, keep < len ? "…" : "");
+			action(paired_label, CMD_FORGET, "Unut");
+		} else {
+			row("Eşleşmiş Cihaz Yok");
+		}
+		toggle("Bağlıyken Listeden Gizle", CMD_HIDE, A.hide_connected);
+		char device[64] = "Varsayılan";
+		if (A.audio_device[0]) {
+			size_t len = strlen(A.audio_device), keep = len > 22 ? 22 : len;
+			while (keep > 0 && keep < len && ((unsigned char)A.audio_device[keep] & 0xC0) == 0x80)
+				keep--;
+			snprintf(device, sizeof(device), "%.*s%s", (int)keep, A.audio_device, keep < len ? "…" : "");
+		}
+		action("Ses Çıkışı", CMD_AUDIO_DEVICE, device);
+		toggle("Sanal Kamera", CMD_VCAM, SDL_AtomicGet(&A.vcam_on) != 0);
+		if (camera_installed_cached())
+			action("Sanal Kamerayı Windows'tan Kaldır", CMD_VCAM_REMOVE, "Kaldır");
+		note = "Sanal kamerayı önce burada açın, sonra programda \"Relios Mirror Camera\"yı seçin.";
+	}
+	return note;
 }
 
 static void draw_bar(int ow, int oh)
@@ -2234,16 +2448,18 @@ static void draw_bar(int ow, int oh)
 	SDL_UnlockMutex(R.mutex);
 	bool muted = SDL_AtomicGet(&A.muted) != 0;
 	int f = A.font_px, pad = f, bh = f * 2, gap = f / 2;
+	SDL_Point mouse = mouse_point(ow, oh);
 
 	button_count = 0;
-	add_button(CMD_RECORD, recording, "", recording ? "Kaydı Durdur" : "Kayıt");
-	add_button(CMD_SCREENSHOT, false, "", "Ekran Görüntüsü");
-	add_button(CMD_VOL_DOWN, false, "", "-");
-	add_button(CMD_VOL_100, false, "", "Ses %%%d", SDL_AtomicGet(&A.volume));
-	add_button(CMD_VOL_UP, false, "", "+");
-	add_button(CMD_MUTE, muted, "", "Sessiz");
-	add_button(CMD_FULLSCREEN, A.fullscreen, "", "Tam Ekran");
-	add_button(CMD_SETTINGS, settings_open, "", "Ayarlar");
+	row_count = 0;
+	add_button(CMD_RECORD, 0, KIND_BUTTON, recording, recording ? "Kaydı Durdur" : "Kayıt");
+	add_button(CMD_SCREENSHOT, 0, KIND_BUTTON, false, "Ekran Görüntüsü");
+	add_button(CMD_VOL_DOWN, 0, KIND_BUTTON, false, "-");
+	add_button(CMD_VOL_100, 0, KIND_BUTTON, false, "Ses %%%d", SDL_AtomicGet(&A.volume));
+	add_button(CMD_VOL_UP, 0, KIND_BUTTON, false, "+");
+	add_button(CMD_MUTE, 0, KIND_BUTTON, muted, "Sessiz");
+	add_button(CMD_FULLSCREEN, 0, KIND_BUTTON, A.fullscreen, "Tam Ekran");
+	add_button(CMD_SETTINGS, 0, KIND_BUTTON, settings_open, "Ayarlar");
 	int bar_buttons = button_count;
 
 	/* one row: the state at the left, the buttons at the right */
@@ -2254,126 +2470,101 @@ static void draw_bar(int ow, int oh)
 		x -= bw;
 		buttons[i].r = (SDL_Rect){x, y0 + gap, bw, bh};
 		/* (volume: - value + sit together) */
-		x -= (buttons[i].cmd == CMD_VOL_100 || buttons[i].cmd == CMD_VOL_UP) ? 2 : gap;
+		x -= (buttons[i].cmd == CMD_VOL_100 || buttons[i].cmd == CMD_VOL_UP) ? 3 : gap;
 	}
 	bar_rect = (SDL_Rect){0, y0, ow, bar_h};
 
 	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_BLEND);
-	SDL_SetRenderDrawColor(A.ren, 3, 13, 11, 235);
+	SDL_SetRenderDrawColor(A.ren, 8, 13, 12, 238);
 	SDL_RenderFillRect(A.ren, &bar_rect);
-	SDL_Rect line = {0, y0, ow, f / 10 > 1 ? f / 10 : 1};
-	SDL_SetRenderDrawColor(A.ren, 0, 166, 126, 255);
+	SDL_Rect line = {0, y0, ow, 1};
+	SDL_SetRenderDrawColor(A.ren, 36, 52, 48, 255);
 	SDL_RenderFillRect(A.ren, &line);
 
 	char status[600];
 	status_text(status, sizeof(status));
 	struct text_entry *st = text_get(status);
 	if (st)
-		draw_text(status, gap * 2, y0 + (bar_h - st->h) / 2, x - gap * 3, 150, 205, 190);
+		draw_text(status, gap * 2, y0 + (bar_h - st->h) / 2, x - gap * 3, 150, 170, 164);
 	for (int i = 0; i < bar_buttons; i++)
-		draw_button(&buttons[i]);
+		draw_button(&buttons[i], &mouse);
 
 	panel_rect = (SDL_Rect){0, 0, 0, 0};
 	if (settings_open) {
-		/* three folders, one open at a time */
+		static const char *const tab_names[] = {"Görüntü", "Kayıt", "Cihaz", "Program"};
 		int tabs = button_count;
-		add_button(CMD_TAB_VIDEO, settings_tab == 0, "", "Görüntü");
-		add_button(CMD_TAB_RECORD, settings_tab == 1, "", "Kayıt");
-		add_button(CMD_TAB_DEVICE, settings_tab == 2, "", "Cihaz");
-		add_button(CMD_TAB_APP, settings_tab == 3, "", "Program");
+		for (int t = 0; t < 4; t++)
+			add_button(CMD_TAB, t, KIND_CHOICE, settings_tab == t, "%s", tab_names[t]);
 		int first = button_count;
-		const char *note = "";
-		SDL_LockMutex(A.mutex);
-		bool pairing = A.pair_requested;
-		SDL_UnlockMutex(A.mutex);
-		if (settings_tab == 0) {
-			add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
-			add_button(CMD_FPS_NEXT, false, "Kare Hızı", "%d fps", A.fps);
-			add_button(CMD_CODEC_NEXT, false, "Kodek", A.h265 ? "H.265" : "H.264");
-			add_button(CMD_HW_DECODE, false, "Görüntü Çözme", A.hw_decode ? "Ekran Kartı" : "İşlemci");
-			bool fit = SDL_AtomicGet(&A.fit169) != 0;
-			add_button(CMD_ASPECT, fit, "Görüntü Oranı", fit ? "16:9 (Yatay)" : "Özgün");
-			note = "İlk dört ayar değişince cihazdan yeniden bağlanın. 16:9 yalnızca yatay görüntüye uygulanır.";
-		} else if (settings_tab == 1) {
-			add_button(CMD_REC_FORMAT, false, "Biçim",
-				   A.rec_format == 0 ? "MP4" : A.rec_format == 1 ? "MOV (Apple)" : "MKV");
-			add_button(CMD_REC_ENCODER, false, "Kodlayıcı", A.rec_gpu ? "Ekran Kartı" : "İşlemci");
-			add_button(CMD_REC_AUDIO, A.rec_audio, "Sesi Kaydet", A.rec_audio ? "Açık" : "Kapalı");
-			add_button(CMD_REC_MODE, false, "Bit Hızı Modu",
-				   A.rec_mode == 0 ? "Otomatik (Kalite)" : A.rec_mode == 1 ? "CBR (Sabit)" : "VBR (Değişken)");
-			if (editing_kbit)
-				add_button(CMD_REC_BITRATE, true, "Bit Hızı", "%s_ kbit", kbit_text);
-			else if (A.rec_mode != 0)
-				add_button(CMD_REC_BITRATE, false, "Bit Hızı", "%d kbit", A.rec_kbit);
-			add_button(CMD_OPEN_FOLDER, false, "Kayıt Klasörü", "Aç");
-			add_button(CMD_CHOOSE_FOLDER, false, "Kayıt Yeri", "Değiştir");
-			note = editing_kbit ? "Rakamları yazın, Enter ile onaylayın." :
-			       A.rec_mode != 0 ? "Bit hızını değiştirmek için değerine tıklayıp yazın." :
-						 "Ayarlar bir sonraki kayıtta geçerli olur.";
-		} else if (settings_tab == 3) {
-			bool autostart = autostart_get();
-			add_button(CMD_AUTOSTART, autostart, "Windows İle Başlat", autostart ? "Açık" : "Kapalı");
-			add_button(CMD_ONTOP, A.on_top, "Pencere Her Zaman Üstte", A.on_top ? "Açık" : "Kapalı");
-			add_button(CMD_RESET, false, "Varsayılan Ayarlara Dön (İlk Açılış Gibi)", "Sıfırla");
-			note = "Sıfırlama ayarları ve eşleşmiş cihazları siler; önce onay ister.";
-		} else {
-			add_button(CMD_PAIR, pairing, "Yeni Cihaz Eşleştirme", pairing ? "Açık" : "Kapalı");
-			int paired = 0;
-			const char *names = paired_names(&paired);
-			char paired_label[64];
-			if (paired > 0) {
-				/* (shortened to fit, at a whole letter) */
-				size_t len = strlen(names), keep = len > 44 ? 44 : len;
-				while (keep > 0 && keep < len && ((unsigned char)names[keep] & 0xC0) == 0x80)
-					keep--;
-				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş: %.*s%s", (int)keep, names,
-					 keep < len ? "…" : "");
-			} else {
-				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş Cihaz Yok");
-			}
-			add_button(CMD_FORGET, false, paired_label, "Unut");
-			add_button(CMD_VISIBLE, A.visible, "Ekran Yansıtma Listesinde Göster", A.visible ? "Açık" : "Kapalı");
-			char device[64] = "Varsayılan";
-			if (A.audio_device[0]) {
-				/* (shortened to fit, at a whole letter) */
-				size_t len = strlen(A.audio_device), keep = len > 22 ? 22 : len;
-				while (keep > 0 && keep < len && ((unsigned char)A.audio_device[keep] & 0xC0) == 0x80)
-					keep--;
-				snprintf(device, sizeof(device), "%.*s%s", (int)keep, A.audio_device, keep < len ? "…" : "");
-			}
-			add_button(CMD_AUDIO_DEVICE, false, "Ses Çıkışı", "%s", device);
-			bool vcam = SDL_AtomicGet(&A.vcam_on) != 0;
-			add_button(CMD_VCAM, vcam, "Sanal Kamera", vcam ? "Açık" : "Kapalı");
-			if (camera_installed_cached())
-				add_button(CMD_VCAM_REMOVE, false, "Sanal Kamerayı Windows'tan Kaldır", "Kaldır");
-			note = "Sanal kamerayı önce burada açın, sonra programda \"Relios Mirror Camera\"yı seçin.";
-		}
-		int rows = button_count - first;
-		int row_h = bh + gap, value_w = f * 13;
-		int pw = f * 32 < ow - 2 * gap ? f * 26 : ow - 2 * gap;
-		int ph = f + row_h + f / 2 + 7 * row_h + f * 2;
+		const char *note = build_settings();
+
+		int edge = f * 3 / 2, row_h = f * 3, ctl_h = f * 2;
+		int pw = f * 36 < ow - 2 * gap ? f * 36 : ow - 2 * gap;
+		int head_h = f * 4, foot_h = f * 3;
+		int ph = head_h + 7 * row_h + foot_h;
 		int px = ow - pw - gap, py = y0 - ph - gap;
 		if (py < gap)
 			py = gap;
 		panel_rect = (SDL_Rect){px, py, pw, ph};
-		fill_round(&panel_rect, f / 2, 5, 22, 18, 245);
-		int tx = px + f;
+		SDL_Rect inner = {px + 1, py + 1, pw - 2, ph - 2};
+		fill_round(&panel_rect, f, 40, 56, 52, 255);
+		fill_round(&inner, f - 1, 11, 17, 16, 252);
+
+		/* the folders: a strip of choices at the top */
+		int tx = px + edge;
 		for (int i = tabs; i < first; i++) {
 			struct text_entry *t = text_get(buttons[i].text);
 			int bw = (t ? t->w : f * 3) + pad * 2;
-			buttons[i].r = (SDL_Rect){tx, py + f, bw, bh};
-			draw_button(&buttons[i]);
-			tx += bw + gap;
+			buttons[i].r = (SDL_Rect){tx, py + f, bw, ctl_h};
+			tx += bw;
 		}
-		for (int i = 0; i < rows; i++) {
-			struct button *b = &buttons[first + i];
-			int ry = py + f + row_h + f / 2 + i * row_h;
-			b->r = (SDL_Rect){px + pw - f - value_w, ry, value_w, bh};
-			struct text_entry *t = text_get(b->label);
-			draw_text(b->label, px + f, ry + (bh - (t ? t->h : f)) / 2, pw - 3 * f - value_w, 214, 240, 232);
-			draw_button(b);
+		SDL_Rect strip = {px + edge - 2, py + f - 2, tx - (px + edge) + 4, ctl_h + 4};
+		fill_round(&strip, f / 2, 22, 32, 29, 255);
+		for (int i = tabs; i < first; i++)
+			draw_button(&buttons[i], &mouse);
+
+		for (int r = 0; r < row_count; r++) {
+			int ry = py + head_h + r * row_h;
+			if (r > 0) {
+				SDL_Rect divider = {px + edge, ry, pw - 2 * edge, 1};
+				SDL_SetRenderDrawColor(A.ren, 26, 38, 35, 255);
+				SDL_RenderFillRect(A.ren, &divider);
+			}
+			/* its controls, from the right */
+			int right = px + pw - edge, cx = right, left = right, n = 0;
+			bool choices = false;
+			for (int i = button_count - 1; i >= first; i--) {
+				struct button *b = &buttons[i];
+				if (b->row != r)
+					continue;
+				int bw;
+				if (b->kind == KIND_SWITCH) {
+					bw = f * 5 / 2;
+					b->r = (SDL_Rect){cx - bw, ry + (row_h - f * 3 / 2) / 2, bw, f * 3 / 2};
+				} else {
+					struct text_entry *t = text_get(b->text);
+					bw = (t ? t->w : f * 2) + pad * 2;
+					if (b->kind == KIND_BUTTON && bw < f * 5)
+						bw = f * 5;
+					b->r = (SDL_Rect){cx - bw, ry + (row_h - ctl_h) / 2, bw, ctl_h};
+				}
+				choices = b->kind == KIND_CHOICE;
+				left = b->r.x;
+				cx = left - (choices ? 0 : gap);
+				n++;
+			}
+			if (choices && n > 0) {
+				SDL_Rect group = {left - 2, ry + (row_h - ctl_h) / 2 - 2, right - left + 4, ctl_h + 4};
+				fill_round(&group, f / 2, 22, 32, 29, 255);
+			}
+			for (int i = first; i < button_count; i++) {
+				if (buttons[i].row == r)
+					draw_button(&buttons[i], &mouse);
+			}
+			struct text_entry *t = text_get(row_labels[r]);
+			draw_text(row_labels[r], px + edge, ry + (row_h - (t ? t->h : f)) / 2, left - gap - (px + edge), 222, 232, 228);
 		}
-		draw_text(note, px + f, py + ph - f * 2, pw - 2 * f, 110, 160, 148);
+		draw_text(note, px + edge, py + ph - foot_h + f / 2, pw - 2 * edge, 120, 142, 135);
 	}
 	SDL_SetRenderDrawBlendMode(A.ren, SDL_BLENDMODE_NONE);
 }
@@ -2404,24 +2595,24 @@ static void draw_idle(int ow, int oh)
 	}
 }
 
-/* the button at this place of the window (window coordinates), or CMD_NONE; inside: on the bar or the panel */
-static int button_at(int mx, int my, bool *inside)
+/* the button at this place of the window (window coordinates), or NULL; inside: on the bar or the panel */
+static const struct button *button_at(int mx, int my, bool *inside)
 {
 	int ow = 0, oh = 0, ww = 0, wh = 0;
 	*inside = false;
 	if (!A.bar_drawn)
-		return CMD_NONE;
+		return NULL;
 	SDL_GetRendererOutputSize(A.ren, &ow, &oh);
 	SDL_GetWindowSize(A.win, &ww, &wh);
 	if (ww <= 0 || wh <= 0)
-		return CMD_NONE;
+		return NULL;
 	SDL_Point p = {mx * ow / ww, my * oh / wh};
 	*inside = SDL_PointInRect(&p, &bar_rect) || SDL_PointInRect(&p, &panel_rect);
 	for (int i = 0; i < button_count; i++) {
 		if (SDL_PointInRect(&p, &buttons[i].r))
-			return buttons[i].cmd;
+			return &buttons[i];
 	}
-	return CMD_NONE;
+	return NULL;
 }
 
 /* the pairing code, as large seven-segment digits */
@@ -2722,12 +2913,13 @@ static void autostart_set(bool on)
 }
 #endif
 
-/* a question with "Evet" and "Vazgeç" (Enter and Esc: Vazgeç); true: Evet */
-static bool confirm(const char *text)
+/* a question with "Evet" and "Vazgeç" (Esc: Vazgeç; Enter: Vazgeç too, unless yes_is_default); true: Evet */
+static bool confirm(const char *text, bool yes_is_default)
 {
 	const SDL_MessageBoxButtonData buttons[] = {
-		{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Vazgeç"},
-		{0, 1, "Evet"},
+		{SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT | (yes_is_default ? 0 : SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT), 0,
+		 "Vazgeç"},
+		{yes_is_default ? SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT : 0, 1, "Evet"},
 	};
 	SDL_MessageBoxData data;
 	int hit = 0;
@@ -2746,7 +2938,8 @@ static bool confirm(const char *text)
 static void reset_everything(void)
 {
 	if (!confirm("Bütün ayarlar ilk açılıştaki haline dönecek ve eşleşmiş cihazlar unutulacak.\n"
-		     "(Güvenlik duvarı izni ve kurulu sanal kamera yerinde kalır.)\n\nDevam edilsin mi?"))
+		     "(Güvenlik duvarı izni ve kurulu sanal kamera yerinde kalır.)\n\nDevam edilsin mi?",
+		     false))
 		return;
 	session_stop();
 	A.restart_at = 0;
@@ -2758,6 +2951,8 @@ static void reset_everything(void)
 	SDL_AtomicSet(&rec_on, 0);
 	SDL_UnlockMutex(R.mutex);
 	SDL_AtomicSet(&A.vcam_on, 0);
+	A.camera_saved = false;
+	A.camera_arming = false;
 	struct rec_item item;
 	memset(&item, 0, sizeof(item));
 	item.kind = REC_SYNC;
@@ -2785,7 +2980,7 @@ static void reset_everything(void)
 	set_notice("Ayarlar ilk açılıştaki haline döndü", false);
 }
 
-static void run_command(int cmd)
+static void run_command(int cmd, int arg)
 {
 	bool restart = false;
 	switch (cmd) {
@@ -2815,34 +3010,67 @@ static void run_command(int cmd)
 		rec_toggle();
 		break;
 	case CMD_REC_ENCODER:
-		/* (for the next recording) */
-		A.rec_gpu = !A.rec_gpu;
+		/* (these: for the next recording) */
+		A.rec_gpu = arg != 0;
 		save_settings();
 		break;
 	case CMD_REC_FORMAT:
-		A.rec_format = (A.rec_format + 1) % 3;
+		A.rec_format = arg >= 0 && arg <= 2 ? arg : 0;
 		save_settings();
 		break;
 	case CMD_REC_MODE:
-		A.rec_mode = (A.rec_mode + 1) % 3;
+		A.rec_mode = arg >= 0 && arg <= 2 ? arg : 0;
+		editing_kbit = false;
 		save_settings();
 		break;
 	case CMD_REC_BITRATE:
 		editing_kbit = true;
 		kbit_text[0] = '\0';
 		break;
+	case CMD_REC_AUDIO:
+		A.rec_audio = !A.rec_audio;
+		save_settings();
+		break;
 	case CMD_OPEN_FOLDER:
 		open_video_folder();
 		break;
+	case CMD_CHOOSE_FOLDER:
+		choose_video_folder();
+		break;
 	case CMD_SETTINGS:
 		settings_open = !settings_open;
+		editing_kbit = false;
+		break;
+	case CMD_TAB:
+		settings_tab = arg >= 0 && arg <= 3 ? arg : 0;
+		editing_kbit = false;
 		break;
 	case CMD_FORGET:
+		if (!confirm("Eşleşmiş cihazlar unutulacak; yeniden bağlanırken kod sorulacak.\n\nDevam edilsin mi?", false))
+			break;
 		remove("paired-devices.txt");
+		SDL_LockMutex(A.mutex);
+		A.pair_requested = false;
+		SDL_UnlockMutex(A.mutex);
 		restart = true;
 		break;
 	case CMD_PAIR: {
 		/* on / off: while on, one new device can pair with the code shown here */
+		int paired = 0;
+		paired_names(&paired);
+		if (paired == 0) {
+			/* with no paired device it stays on: the first device always pairs with the code (and after three
+			 * wrong codes this switches it on again) */
+			SDL_LockMutex(A.mutex);
+			if (A.state == MIRROR_PAIRING_OFF)
+				A.state = MIRROR_LISTENING;
+			SDL_UnlockMutex(A.mutex);
+			SDL_AtomicSet(&A.register_ok, 1);
+			if (A.proc)
+				proc_write(A.proc, "allow_pairing 1\n");
+			set_notice("Eşleşmiş cihaz yokken eşleştirme açık kalır; ilk cihaz kodla eşleşir", false);
+			break;
+		}
 		SDL_LockMutex(A.mutex);
 		A.pair_requested = !A.pair_requested;
 		bool on = A.pair_requested;
@@ -2852,16 +3080,19 @@ static void run_command(int cmd)
 			A.pin[0] = '\0';
 		SDL_UnlockMutex(A.mutex);
 		SDL_AtomicSet(&A.register_ok, on ? 1 : 0);
-		if (on && !A.visible) {
-			/* (a device can only pair with a receiver it sees: the receiver starts again, announced) */
-			A.visible = true;
-			save_settings();
-			A.apply_at = SDL_GetTicks() + 300;
-		} else if (A.proc) {
+		if (A.proc)
 			proc_write(A.proc, on ? "allow_pairing 1\n" : "allow_pairing 0\n");
-		}
 		break;
 	}
+	case CMD_HIDE:
+		A.hide_connected = !A.hide_connected;
+		save_settings();
+		if (A.proc)
+			proc_write(A.proc, A.hide_connected ? "hide_connected 1\n" : "hide_connected 0\n");
+		if (A.hide_connected)
+			set_notice("Yansıtma başladıktan 10 sn sonra ad listeden çekilir; yansıtma kesilirse seçenek kendini kapatır",
+				   false);
+		break;
 	case CMD_SCREENSHOT: {
 		struct rec_item item;
 		memset(&item, 0, sizeof(item));
@@ -2902,6 +3133,8 @@ static void run_command(int cmd)
 			break;
 		}
 		SDL_AtomicSet(&A.vcam_on, on ? 1 : 0);
+		A.camera_saved = on;
+		A.camera_arming = false;
 		save_settings();
 		struct rec_item item;
 		memset(&item, 0, sizeof(item));
@@ -2911,56 +3144,12 @@ static void run_command(int cmd)
 			set_notice("Sanal kamera açık: programlarda \"Relios Mirror Camera\"yı seçin", false);
 		break;
 	}
-	case CMD_ASPECT:
-		/* (the window and the virtual camera at once; a recording from its next file) */
-		SDL_AtomicSet(&A.fit169, !SDL_AtomicGet(&A.fit169));
-		save_settings();
-		break;
-	case CMD_REC_AUDIO:
-		A.rec_audio = !A.rec_audio;
-		save_settings();
-		break;
-	case CMD_AUTOSTART:
-		autostart_set(!autostart_get());
-		break;
-	case CMD_TRAY:
-		A.to_tray = !A.to_tray;
-		save_settings();
-		break;
-	case CMD_TAB_APP:
-		settings_tab = 3;
-		editing_kbit = false;
-		break;
-	case CMD_TAB_VIDEO:
-		settings_tab = 0;
-		editing_kbit = false;
-		break;
-	case CMD_TAB_RECORD:
-		settings_tab = 1;
-		break;
-	case CMD_TAB_DEVICE:
-		settings_tab = 2;
-		editing_kbit = false;
-		break;
-	case CMD_VISIBLE: {
-		/* (the receiver announces itself, or not, when it starts: the announcement is never taken back while a
-		 * device mirrors, because an Apple device ends its mirroring then) */
-		A.visible = !A.visible;
-		save_settings();
-		SDL_LockMutex(A.mutex);
-		bool busy = A.state == MIRROR_CONNECTED || A.state == MIRROR_PIN;
-		SDL_UnlockMutex(A.mutex);
-		if (busy)
-			set_notice("Bağlantı bittikten sonra geçerli olur", false);
-		else
-			A.apply_at = SDL_GetTicks() + 300;
-		break;
-	}
-	case CMD_RESET:
-		reset_everything();
-		break;
 	case CMD_VCAM_REMOVE: {
+		if (!confirm("Sanal kamera Windows'tan kaldırılacak.\n\nDevam edilsin mi?", false))
+			break;
 		SDL_AtomicSet(&A.vcam_on, 0);
+		A.camera_saved = false;
+		A.camera_arming = false;
 		save_settings();
 		struct rec_item item;
 		memset(&item, 0, sizeof(item));
@@ -2969,37 +3158,44 @@ static void run_command(int cmd)
 		remove_camera();
 		break;
 	}
-	case CMD_CHOOSE_FOLDER:
-		choose_video_folder();
+	case CMD_ASPECT:
+		/* (the window and the virtual camera at once; a recording from its next file) */
+		SDL_AtomicSet(&A.fit169, arg != 0);
+		save_settings();
 		break;
-	case CMD_RES_NEXT:
-		if (A.height < 1080)
-			A.width = 1920, A.height = 1080;
-		else if (A.height < 1440)
-			A.width = 2560, A.height = 1440;
-		else if (A.height < 2160)
-			A.width = 3840, A.height = 2160;
-		else
-			A.width = 1280, A.height = 720;
-		restart = true;
+	case CMD_AUTOSTART:
+		autostart_set(!autostart_get());
 		break;
-	case CMD_FPS_NEXT:
-		A.fps = A.fps >= 60 ? 30 : 60;
-		restart = true;
+	case CMD_RESET:
+		reset_everything();
 		break;
+	case CMD_RES_NEXT: {
+		static const int sizes[4][2] = {{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+		int at = arg >= 0 && arg <= 3 ? arg : 1;
+		restart = A.width != sizes[at][0] || A.height != sizes[at][1];
+		A.width = sizes[at][0];
+		A.height = sizes[at][1];
+		break;
+	}
+	case CMD_FPS_NEXT: {
+		int fps = arg == 30 ? 30 : 60;
+		restart = A.fps != fps;
+		A.fps = fps;
+		break;
+	}
 	case CMD_CODEC_NEXT:
-		A.h265 = !A.h265;
-		restart = true;
+		restart = A.h265 != (arg != 0);
+		A.h265 = arg != 0;
 		break;
 	case CMD_HW_DECODE:
-		A.hw_decode = !A.hw_decode;
-		restart = true;
+		restart = A.hw_decode != (arg != 0);
+		A.hw_decode = arg != 0;
 		break;
 	default:
 		break;
 	}
 	if (restart) {
-		/* the iPad learns the new size / rate / codec when it connects again: the receiver restarts a moment
+		/* the device learns the new size / rate / codec when it connects again: the receiver restarts a moment
 		 * after the last click */
 		save_settings();
 		A.apply_at = SDL_GetTicks() + 1500;
@@ -3127,14 +3323,72 @@ static void ensure_firewall_rule(void)
 }
 #endif
 
+#ifdef _WIN32
+/* Other running copies of this program (or of its receiver). With two, the Apple device reaches now one, now the
+ * other (on Windows both can listen on the same port), and nothing works as expected. Counts them; ends them if
+ * asked to. (Not this process, and not the one-file starter that started it.) */
+static int other_copies(bool end_them)
+{
+	DWORD self = GetCurrentProcessId(), parent = 0;
+	int found = 0;
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE)
+		return 0;
+	PROCESSENTRY32W e;
+	memset(&e, 0, sizeof(e));
+	e.dwSize = sizeof(e);
+	if (Process32FirstW(snap, &e)) {
+		do {
+			if (e.th32ProcessID == self)
+				parent = e.th32ParentProcessID;
+		} while (Process32NextW(snap, &e));
+	}
+	memset(&e, 0, sizeof(e));
+	e.dwSize = sizeof(e);
+	if (Process32FirstW(snap, &e)) {
+		do {
+			bool program = !_wcsicmp(e.szExeFile, L"ReliosMirror.exe");
+			bool receiver = !_wcsicmp(e.szExeFile, L"relios-airplay-receiver.exe");
+			if ((!program && !receiver) || e.th32ProcessID == self || (program && e.th32ProcessID == parent))
+				continue;
+			found++;
+			if (end_them) {
+				HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, e.th32ProcessID);
+				if (process) {
+					TerminateProcess(process, 0);
+					WaitForSingleObject(process, 3000);
+					CloseHandle(process);
+				}
+			}
+		} while (Process32NextW(snap, &e));
+	}
+	CloseHandle(snap);
+	return found;
+}
+#endif
+
 int main(int argc, char *argv[])
 {
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+	/* (the program may stay open all day: the screen may switch off and the computer may sleep, except while
+	 * something is mirrored; see the loop) */
+	SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP_NAME, SDL_GetError(), NULL);
 		return 1;
 	}
 	TTF_Init();
+#ifdef _WIN32
+	if (other_copies(false) > 0) {
+		if (!confirm("Relios Mirror (ya da OBS'teki iPad Yansıtma) zaten çalışıyor; penceresi simge durumunda ya da\n"
+			     "gizli olabilir. İkisi aynı anda açıkken Apple cihazı doğru bağlanamaz.\n\n"
+			     "Öteki kapatılıp bu açılsın mı?",
+			     true))
+			return 0;
+		other_copies(true);
+		SDL_Delay(500);
+	}
+#endif
 	A.mutex = SDL_CreateMutex();
 	A.frame_mutex = SDL_CreateMutex();
 	R.mutex = SDL_CreateMutex();
@@ -3157,11 +3411,30 @@ int main(int argc, char *argv[])
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP_NAME, "Ayar klasörü açılamadı.", NULL);
 		return 1;
 	}
+	remove("log-onceki.txt"); /* (the log of the run before is kept: what went wrong can be looked up) */
+	rename("log.txt", "log-onceki.txt");
 	log_file = fopen("log.txt", "w");
 	app_log("Relios Mirror started; receiver: %s", A.exe);
 	av_log_set_level(AV_LOG_ERROR);
 	load_settings();
 	find_video_folder();
+	A.hover = -1;
+	if (A.camera_saved) {
+		/* The camera was left on: it is switched on again, and remembered again only once it runs (a fault in it
+		 * could otherwise repeat at every start). */
+		A.camera_saved = false;
+		save_settings();
+		if (camera_installed()) {
+			struct rec_item item;
+			memset(&item, 0, sizeof(item));
+			item.kind = REC_SYNC;
+			SDL_AtomicSet(&A.vcam_on, 1);
+			A.camera_arming = true;
+			rec_push(&item);
+		}
+	}
+	if (autostart_get())
+		autostart_set(true); /* (starting with Windows follows the copy that was used last) */
 	A.win = SDL_CreateWindow(APP_NAME, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 720,
 				 SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	if (A.win)
@@ -3172,6 +3445,7 @@ int main(int argc, char *argv[])
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP_NAME, SDL_GetError(), NULL);
 		return 1;
 	}
+	SDL_SetWindowMinimumSize(A.win, 900, 540);
 	if (A.on_top)
 		SDL_SetWindowAlwaysOnTop(A.win, SDL_TRUE);
 	for (int i = 1; i < argc; i++) {
@@ -3205,7 +3479,7 @@ int main(int argc, char *argv[])
 		bool redraw = false, retitle = false;
 		if (SDL_WaitEventTimeout(&e, 100)) {
 			do {
-				int cmd = CMD_NONE;
+				int cmd = CMD_NONE, arg = 0;
 				if (e.type == SDL_QUIT) {
 					quit = true;
 				} else if (e.type == A.event_type) {
@@ -3230,8 +3504,12 @@ int main(int argc, char *argv[])
 					redraw = true;
 				} else if (e.type == SDL_MOUSEMOTION) {
 					A.bar_until = SDL_GetTicks() + 2500;
-					if (!A.bar_drawn)
-						redraw = true;
+					bool over = false;
+					const struct button *under = button_at(e.motion.x, e.motion.y, &over);
+					int hover = under ? (int)(under - buttons) : -1;
+					if (!A.bar_drawn || hover != A.hover)
+						redraw = true; /* (what the mouse is over lights up) */
+					A.hover = hover;
 				} else if (e.type == SDL_KEYDOWN && editing_kbit) {
 					kbit_key(e.key.keysym.sym);
 					redraw = true;
@@ -3257,7 +3535,11 @@ int main(int argc, char *argv[])
 					}
 					if (editing_kbit)
 						kbit_key(SDLK_RETURN); /* a click elsewhere accepts what was typed */
-					cmd = button_at(e.button.x, e.button.y, &inside);
+					const struct button *hit = button_at(e.button.x, e.button.y, &inside);
+					if (hit) {
+						cmd = hit->cmd;
+						arg = hit->arg;
+					}
 					if (cmd == CMD_NONE && settings_open && !inside)
 						cmd = CMD_SETTINGS; /* a click beside the panel closes it */
 					else if (cmd == CMD_NONE && !inside && e.button.clicks == 2)
@@ -3265,7 +3547,7 @@ int main(int argc, char *argv[])
 					redraw = true;
 				}
 				if (cmd != CMD_NONE) {
-					run_command(cmd);
+					run_command(cmd, arg);
 					redraw = true;
 				}
 			} while (!quit && SDL_PollEvent(&e));
@@ -3292,6 +3574,41 @@ int main(int argc, char *argv[])
 			retitle = true;
 			if (A.bar_drawn)
 				redraw = true;
+		}
+		if (A.camera_arming) {
+			if (SDL_AtomicGet(&A.camera_ok)) {
+				A.camera_arming = false;
+				A.camera_saved = true;
+				save_settings();
+			} else if (!SDL_AtomicGet(&A.vcam_on)) {
+				A.camera_arming = false;
+			}
+		}
+		if (SDL_AtomicCAS(&A.hide_broke, 1, 0) && A.hide_connected) {
+			/* hiding the name ended the mirroring: the option is switched off (until someone switches it on) */
+			A.hide_connected = false;
+			save_settings();
+			if (A.proc)
+				proc_write(A.proc, "hide_connected 0\n");
+			set_notice("Yansıtma, ad gizlenince kesildi: \"Bağlıyken Listeden Gizle\" kapatıldı. Cihazdan yeniden bağlanın.",
+				   false);
+			SDL_LockMutex(A.mutex);
+			A.notice_until = SDL_GetTicks() + 20000;
+			SDL_UnlockMutex(A.mutex);
+			app_log("hiding the name while mirroring ended the mirroring: the option was switched off");
+			redraw = retitle = true;
+		}
+		{
+			SDL_LockMutex(A.frame_mutex);
+			bool mirroring = A.have_frame;
+			SDL_UnlockMutex(A.frame_mutex);
+			if (mirroring != A.keep_awake) {
+				A.keep_awake = mirroring;
+				if (mirroring)
+					SDL_DisableScreenSaver();
+				else
+					SDL_EnableScreenSaver();
+			}
 		}
 		if (A.bar_drawn != bar_wanted())
 			redraw = true;
