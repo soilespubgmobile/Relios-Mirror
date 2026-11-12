@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #else
 #include <sys/stat.h>
 #include <unistd.h>
@@ -46,7 +47,7 @@
 #include "proc.h"
 
 #define APP_NAME "Relios Mirror"
-#define RECEIVER_NAME "PC Mirror" /* what the iPad shows in Screen Mirroring */
+#define RECEIVER_NAME "Relios Mirror" /* what the iPad shows in Screen Mirroring */
 #define CONFIG_FOLDER "ReliosMirror"
 
 #ifdef _WIN32
@@ -98,6 +99,8 @@ enum {
 	CMD_AUDIO_DEVICE,
 	CMD_VCAM,
 	CMD_ASPECT,
+	CMD_HIDE,
+	CMD_CHOOSE_FOLDER,
 };
 
 static struct {
@@ -122,6 +125,9 @@ static struct {
 	int width, height, fps;
 	bool h265;
 	bool on_top;
+	bool res_auto;       /* the size is left to the iPad (the largest is asked for) */
+	bool hide_connected; /* not in the iPad's list while a paired device is connected */
+	char custom_folder[1024]; /* where recordings go, if chosen */
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
 	bool rec_gpu;   /* record with the graphics card's encoder */
 	int rec_format; /* 0: .mp4, 1: .mov (QuickTime), 2: .mkv */
@@ -308,20 +314,41 @@ static bool enter_config_folder(void)
 
 static void find_video_folder(void)
 {
+	if (A.custom_folder[0]) {
+		SDL_LockMutex(A.mutex);
+		snprintf(A.video_folder, sizeof(A.video_folder), "%s", A.custom_folder);
+		SDL_UnlockMutex(A.mutex);
+		make_folder(A.custom_folder);
+		return;
+	}
+	char folder[1024];
+
 #ifdef _WIN32
 	char home[800] = "";
 	const wchar_t *w = _wgetenv(L"USERPROFILE");
 	if (w)
 		WideCharToMultiByte(CP_UTF8, 0, w, -1, home, (int)sizeof(home), NULL, NULL);
-	snprintf(A.video_folder, sizeof(A.video_folder), "%s\\Videos", home);
-	make_folder(A.video_folder);
-	snprintf(A.video_folder, sizeof(A.video_folder), "%s\\Videos\\" CONFIG_FOLDER, home);
+	snprintf(folder, sizeof(folder), "%s\\Videos", home);
+	make_folder(folder);
+	snprintf(folder, sizeof(folder), "%s\\Videos\\" CONFIG_FOLDER, home);
 #else
 	const char *home = getenv("HOME");
-	snprintf(A.video_folder, sizeof(A.video_folder), "%s/" CONFIG_FOLDER, home ? home : ".");
+	snprintf(folder, sizeof(folder), "%s/" CONFIG_FOLDER, home ? home : ".");
 #endif
-	make_folder(A.video_folder);
+	make_folder(folder);
+	SDL_LockMutex(A.mutex);
+	snprintf(A.video_folder, sizeof(A.video_folder), "%s", folder);
+	SDL_UnlockMutex(A.mutex);
 }
+
+/* (the folder may be changed by the window thread while another thread starts a file) */
+static void video_folder(char *out, size_t size)
+{
+	SDL_LockMutex(A.mutex);
+	snprintf(out, size, "%s", A.video_folder);
+	SDL_UnlockMutex(A.mutex);
+}
+
 
 static bool file_exists(const char *name)
 {
@@ -387,6 +414,8 @@ static void load_settings(void)
 	A.fps = 60;
 	A.h265 = false;
 	A.on_top = false;
+	A.res_auto = true;
+	A.hide_connected = true;
 	A.rec_gpu = true;
 	A.rec_format = 1;
 	A.rec_mode = 0;
@@ -397,7 +426,7 @@ static void load_settings(void)
 	FILE *f = fopen("ayarlar.txt", "r");
 	if (!f)
 		return;
-	char line[400];
+	char line[1400];
 	int version = 1;
 	while (fgets(line, sizeof(line), f)) {
 		int a = 0, b = 0;
@@ -418,6 +447,13 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (sscanf(line, "cozunurluk_oto=%d", &a) == 1) {
+			A.res_auto = a != 0;
+		} else if (sscanf(line, "bagliyken_gizle=%d", &a) == 1) {
+			A.hide_connected = a != 0;
+		} else if (!strncmp(line, "kayit_klasoru=", 14)) {
+			snprintf(A.custom_folder, sizeof(A.custom_folder), "%s", line + 14);
+			A.custom_folder[strcspn(A.custom_folder, "\r\n")] = '\0';
 		} else if (sscanf(line, "surum=%d", &a) == 1) {
 			version = a;
 		} else if (sscanf(line, "oran169=%d", &a) == 1) {
@@ -439,6 +475,8 @@ static void load_settings(void)
 		A.rec_gpu = true;
 		A.rec_format = 1;
 	}
+	if (version < 3)
+		A.res_auto = true; /* (the iPad's own size became the default) */
 }
 
 static void save_settings(void)
@@ -449,7 +487,8 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
-	fprintf(f, "ses_aygiti=%s\noran169=%d\nsurum=2\n", A.audio_device, SDL_AtomicGet(&A.fit169));
+	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nsurum=3\n", A.audio_device,
+		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder);
 	fclose(f);
 }
 
@@ -571,7 +610,9 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 	struct tm *tm_now = localtime(&now);
 	if (tm_now)
 		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm_now);
-	snprintf(R.path, sizeof(R.path), "%s" PATH_SEP "ReliosMirror-%s.%s", A.video_folder, stamp, rec_ext[A.rec_format]);
+	char folder[1024];
+	video_folder(folder, sizeof(folder));
+	snprintf(R.path, sizeof(R.path), "%s" PATH_SEP "ReliosMirror-%s.%s", folder, stamp, rec_ext[A.rec_format]);
 
 	R.w = f->width;
 	R.h = f->height;
@@ -633,7 +674,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 			app_log("recording: the encoder %s did not open (%d)", names[n], ret);
 			avcodec_free_context(&R.enc);
 		} else {
-			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "Ekran kartı" : "İşlemci", rec_format_name[A.rec_format]);
+			snprintf(R.encoder, sizeof(R.encoder), "%s, %s", gpu ? "Ekran Kartı" : "İşlemci", rec_format_name[A.rec_format]);
 		}
 	}
 	if (!R.enc) {
@@ -903,7 +944,9 @@ static void save_png(const AVFrame *f, bool full, bool bt709)
 	struct tm *tm_now = localtime(&now);
 	if (tm_now)
 		strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tm_now);
-	snprintf(path, sizeof(path), "%s" PATH_SEP "ReliosMirror-%s.png", A.video_folder, stamp);
+	char folder[1024];
+	video_folder(folder, sizeof(folder));
+	snprintf(path, sizeof(path), "%s" PATH_SEP "ReliosMirror-%s.png", folder, stamp);
 
 	const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
 	AVCodecContext *enc = codec ? avcodec_alloc_context3(codec) : NULL;
@@ -1735,8 +1778,9 @@ static void session_start(void)
 
 	char config[512];
 	snprintf(config, sizeof(config),
-		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\n",
-		 id, A.width, A.height, A.fps, A.h265 ? 1 : 0, allow ? 1 : 0);
+		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nhide_connected %d\n",
+		 id, A.res_auto ? 3840 : A.width, A.res_auto ? 2160 : A.height, A.fps, A.h265 ? 1 : 0, allow ? 1 : 0,
+		 A.hide_connected ? 1 : 0);
 	proc_write(A.proc, config);
 	for (const char *p = paired; p && *p;) {
 		const char *end = strchr(p, '\n');
@@ -1771,7 +1815,7 @@ static void status_text(char *status, size_t size)
 		snprintf(status, size, "Başlatılıyor…");
 		break;
 	case MIRROR_LISTENING:
-		snprintf(status, size, "Hazır  •  iPad'de Ekran Yansıtma → " RECEIVER_NAME "%s",
+		snprintf(status, size, "Hazır  •  iPad'de Ekran Yansıtma'dan " RECEIVER_NAME "'ı seçin%s",
 			 A.pair_requested ? "  •  Yeni cihaz eşleştirme açık" : "");
 		break;
 	case MIRROR_PIN:
@@ -2011,13 +2055,13 @@ static void draw_bar(int ow, int oh)
 	int f = A.font_px, pad = f, bh = f * 2, gap = f / 2;
 
 	button_count = 0;
-	add_button(CMD_RECORD, recording, "", recording ? "Kaydı durdur" : "Kayıt");
-	add_button(CMD_SCREENSHOT, false, "", "Ekran görüntüsü");
+	add_button(CMD_RECORD, recording, "", recording ? "Kaydı Durdur" : "Kayıt");
+	add_button(CMD_SCREENSHOT, false, "", "Ekran Görüntüsü");
 	add_button(CMD_VOL_DOWN, false, "", "-");
 	add_button(CMD_VOL_100, false, "", "Ses %%%d", SDL_AtomicGet(&A.volume));
 	add_button(CMD_VOL_UP, false, "", "+");
 	add_button(CMD_MUTE, muted, "", "Sessiz");
-	add_button(CMD_FULLSCREEN, A.fullscreen, "", "Tam ekran");
+	add_button(CMD_FULLSCREEN, A.fullscreen, "", "Tam Ekran");
 	add_button(CMD_SETTINGS, settings_open, "", "Ayarlar");
 	int bar_buttons = button_count;
 
@@ -2061,29 +2105,33 @@ static void draw_bar(int ow, int oh)
 		bool pairing = A.pair_requested;
 		SDL_UnlockMutex(A.mutex);
 		if (settings_tab == 0) {
-			add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
-			add_button(CMD_FPS_NEXT, false, "Kare hızı", "%d fps", A.fps);
+			if (A.res_auto)
+				add_button(CMD_RES_NEXT, false, "Çözünürlük", "Otomatik (iPad)");
+			else
+				add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
+			add_button(CMD_FPS_NEXT, false, "Kare Hızı", "%d fps", A.fps);
 			add_button(CMD_CODEC_NEXT, false, "Kodek", A.h265 ? "H.265" : "H.264");
-			add_button(CMD_HW_DECODE, false, "Görüntü çözme", A.hw_decode ? "Ekran kartı" : "İşlemci");
+			add_button(CMD_HW_DECODE, false, "Görüntü Çözme", A.hw_decode ? "Ekran Kartı" : "İşlemci");
 			bool fit = SDL_AtomicGet(&A.fit169) != 0;
-			add_button(CMD_ASPECT, fit, "Görüntü oranı", fit ? "16:9 (yatayda)" : "Özgün");
-			note = "İlk dört ayar değişince iPad'den yeniden bağlanın. 16:9, dikey görüntüyü değiştirmez.";
+			add_button(CMD_ASPECT, fit, "Görüntü Oranı", fit ? "16:9 (Yatay)" : "Özgün");
+			note = "İlk dört ayar değişince iPad'den yeniden bağlanın. 16:9 yalnızca yatay görüntüye uygulanır.";
 		} else if (settings_tab == 1) {
 			add_button(CMD_REC_FORMAT, false, "Biçim",
 				   A.rec_format == 0 ? "MP4" : A.rec_format == 1 ? "MOV (Apple)" : "MKV");
-			add_button(CMD_REC_ENCODER, false, "Kodlayıcı", A.rec_gpu ? "Ekran kartı" : "İşlemci");
-			add_button(CMD_REC_MODE, false, "Bit hızı modu",
-				   A.rec_mode == 0 ? "Otomatik (kalite)" : A.rec_mode == 1 ? "CBR (sabit)" : "VBR (değişken)");
+			add_button(CMD_REC_ENCODER, false, "Kodlayıcı", A.rec_gpu ? "Ekran Kartı" : "İşlemci");
+			add_button(CMD_REC_MODE, false, "Bit Hızı Modu",
+				   A.rec_mode == 0 ? "Otomatik (Kalite)" : A.rec_mode == 1 ? "CBR (Sabit)" : "VBR (Değişken)");
 			if (editing_kbit)
-				add_button(CMD_REC_BITRATE, true, "Bit hızı", "%s_ kbit", kbit_text);
+				add_button(CMD_REC_BITRATE, true, "Bit Hızı", "%s_ kbit", kbit_text);
 			else if (A.rec_mode != 0)
-				add_button(CMD_REC_BITRATE, false, "Bit hızı", "%d kbit", A.rec_kbit);
-			add_button(CMD_OPEN_FOLDER, false, "Kayıt klasörü", "Aç");
+				add_button(CMD_REC_BITRATE, false, "Bit Hızı", "%d kbit", A.rec_kbit);
+			add_button(CMD_OPEN_FOLDER, false, "Kayıt Klasörü", "Aç");
+			add_button(CMD_CHOOSE_FOLDER, false, "Kayıt Yeri", "Değiştir");
 			note = editing_kbit ? "Rakamları yazın, Enter ile onaylayın." :
 			       A.rec_mode != 0 ? "Bit hızını değiştirmek için değerine tıklayıp yazın." :
 						 "Ayarlar bir sonraki kayıtta geçerli olur.";
 		} else {
-			add_button(CMD_PAIR, pairing, "Yeni cihaz eşleştirme", pairing ? "Açık" : "Kapalı");
+			add_button(CMD_PAIR, pairing, "Yeni Cihaz Eşleştirme", pairing ? "Açık" : "Kapalı");
 			int paired = 0;
 			const char *names = paired_names(&paired);
 			char paired_label[64];
@@ -2095,10 +2143,11 @@ static void draw_bar(int ow, int oh)
 				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş: %.*s%s", (int)keep, names,
 					 keep < len ? "…" : "");
 			} else {
-				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş cihaz yok");
+				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş Cihaz Yok");
 			}
 			add_button(CMD_FORGET, false, paired_label, "Unut");
-			add_button(CMD_ONTOP, A.on_top, "Pencere her zaman üstte", A.on_top ? "Açık" : "Kapalı");
+			add_button(CMD_HIDE, A.hide_connected, "Bağlıyken iPad Listesinde Gizle", A.hide_connected ? "Açık" : "Kapalı");
+			add_button(CMD_ONTOP, A.on_top, "Pencere Her Zaman Üstte", A.on_top ? "Açık" : "Kapalı");
 			char device[64] = "Varsayılan";
 			if (A.audio_device[0]) {
 				/* (shortened to fit, at a whole letter) */
@@ -2107,15 +2156,15 @@ static void draw_bar(int ow, int oh)
 					keep--;
 				snprintf(device, sizeof(device), "%.*s%s", (int)keep, A.audio_device, keep < len ? "…" : "");
 			}
-			add_button(CMD_AUDIO_DEVICE, false, "Ses çıkışı", "%s", device);
+			add_button(CMD_AUDIO_DEVICE, false, "Ses Çıkışı", "%s", device);
 			bool vcam = SDL_AtomicGet(&A.vcam_on) != 0;
-			add_button(CMD_VCAM, vcam, "Sanal kamera (OBS Virtual Camera)", vcam ? "Açık" : "Kapalı");
+			add_button(CMD_VCAM, vcam, "Sanal Kamera (OBS Virtual Camera)", vcam ? "Açık" : "Kapalı");
 			note = "Sanal kamera için OBS Studio kurulu olmalı (açık olması gerekmez).";
 		}
 		int rows = button_count - first;
 		int row_h = bh + gap, value_w = f * 13;
 		int pw = f * 32 < ow - 2 * gap ? f * 26 : ow - 2 * gap;
-		int ph = f + row_h + f / 2 + 5 * row_h + f * 2;
+		int ph = f + row_h + f / 2 + 6 * row_h + f * 2;
 		int px = ow - pw - gap, py = y0 - ph - gap;
 		if (py < gap)
 			py = gap;
@@ -2340,6 +2389,31 @@ static void open_video_folder(void)
 #endif
 }
 
+/* another folder for the recordings and screenshots (Windows' folder dialog) */
+static void choose_video_folder(void)
+{
+#ifdef _WIN32
+	BROWSEINFOW info;
+	memset(&info, 0, sizeof(info));
+	info.lpszTitle = L"Kayıtların ve ekran görüntülerinin kaydedileceği klasörü seçin";
+	info.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+	CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	PIDLIST_ABSOLUTE chosen = SHBrowseForFolderW(&info);
+	if (!chosen)
+		return;
+	wchar_t wide[MAX_PATH];
+	char folder[1024];
+	if (SHGetPathFromIDListW(chosen, wide) &&
+	    WideCharToMultiByte(CP_UTF8, 0, wide, -1, folder, (int)sizeof(folder), NULL, NULL) > 1) {
+		snprintf(A.custom_folder, sizeof(A.custom_folder), "%s", folder);
+		find_video_folder();
+		save_settings();
+		set_notice("Kayıt yeri değişti  •  Klasörü açmak için tıklayın", true);
+	}
+	CoTaskMemFree(chosen);
+#endif
+}
+
 static void run_command(int cmd)
 {
 	bool restart = false;
@@ -2467,15 +2541,26 @@ static void run_command(int cmd)
 		settings_tab = 2;
 		editing_kbit = false;
 		break;
+	case CMD_HIDE:
+		A.hide_connected = !A.hide_connected;
+		save_settings();
+		if (A.proc)
+			proc_write(A.proc, A.hide_connected ? "hide_connected 1\n" : "hide_connected 0\n");
+		break;
+	case CMD_CHOOSE_FOLDER:
+		choose_video_folder();
+		break;
 	case CMD_RES_NEXT:
-		if (A.height < 1080)
+		if (A.res_auto)
+			A.res_auto = false, A.width = 1280, A.height = 720;
+		else if (A.height < 1080)
 			A.width = 1920, A.height = 1080;
 		else if (A.height < 1440)
 			A.width = 2560, A.height = 1440;
 		else if (A.height < 2160)
 			A.width = 3840, A.height = 2160;
 		else
-			A.width = 1280, A.height = 720;
+			A.res_auto = true;
 		restart = true;
 		break;
 	case CMD_FPS_NEXT:
