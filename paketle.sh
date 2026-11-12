@@ -29,6 +29,14 @@ if [ -f "$prefix/bin/SDL3.dll" ]; then
 fi
 
 cp BENIOKU.txt LICENSE guvenlik-duvari-izni.bat assets/logo.bmp "$out/"
+# our own virtual camera (built by the workflow's "softcam" step; without it the program uses OBS's camera)
+cam=$(find softcam -name softcam.dll -path '*x64*' 2>/dev/null | head -1 || true)
+if [ -n "$cam" ]; then
+	cp "$cam" "$out/softcam.dll"
+	echo "Sanal kamera: $cam"
+else
+	echo "Sanal kamera: softcam.dll YOK (OBS kamerasi kullanilir)"
+fi
 # the one-file version: the launcher + the folder as .tgz + "RLSM" + size (16 hex digits) + build stamp (14 digits)
 mkdir -p dist/tek-exe
 tar -czf build/payload.tgz -C "$out" .

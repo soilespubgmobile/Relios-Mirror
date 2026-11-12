@@ -33,6 +33,9 @@
 
 #include <SDL.h>
 #include <SDL_ttf.h>
+#ifdef _WIN32
+#include <SDL_syswm.h>
+#endif
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -101,6 +104,11 @@ enum {
 	CMD_ASPECT,
 	CMD_HIDE,
 	CMD_CHOOSE_FOLDER,
+	CMD_REC_AUDIO,
+	CMD_TAB_APP,
+	CMD_AUTOSTART,
+	CMD_TRAY,
+	CMD_VISIBLE,
 };
 
 static struct {
@@ -125,7 +133,11 @@ static struct {
 	int width, height, fps;
 	bool h265;
 	bool on_top;
+	bool rec_audio;      /* the sound goes into the recording */
+	bool to_tray;        /* a minimized window goes to the notification area */
+	bool in_tray;
 	bool res_auto;       /* the size is left to the iPad (the largest is asked for) */
+	bool visible;        /* announced on the network (in the Apple device's Screen Mirroring list) */
 	bool hide_connected; /* not in the iPad's list while a paired device is connected */
 	char custom_folder[1024]; /* where recordings go, if chosen */
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
@@ -350,6 +362,15 @@ static void video_folder(char *out, size_t size)
 }
 
 
+/* (a path anywhere, whatever letters it has) */
+static bool file_exists_utf8(const char *path)
+{
+	SDL_RWops *rw = SDL_RWFromFile(path, "rb");
+	if (rw)
+		SDL_RWclose(rw);
+	return rw != NULL;
+}
+
 static bool file_exists(const char *name)
 {
 	FILE *f = fopen(name, "rb");
@@ -415,7 +436,10 @@ static void load_settings(void)
 	A.h265 = false;
 	A.on_top = false;
 	A.res_auto = true;
+	A.rec_audio = true;
+	A.to_tray = false;
 	A.hide_connected = true;
+	A.visible = true;
 	A.rec_gpu = true;
 	A.rec_format = 1;
 	A.rec_mode = 0;
@@ -447,6 +471,12 @@ static void load_settings(void)
 			A.rec_gpu = a != 0;
 		} else if (sscanf(line, "gpu_cozme=%d", &a) == 1) {
 			A.hw_decode = a != 0;
+		} else if (sscanf(line, "listede_goster=%d", &a) == 1) {
+			A.visible = a != 0;
+		} else if (sscanf(line, "kayit_ses=%d", &a) == 1) {
+			A.rec_audio = a != 0;
+		} else if (sscanf(line, "tepsi=%d", &a) == 1) {
+			A.to_tray = a != 0;
 		} else if (sscanf(line, "cozunurluk_oto=%d", &a) == 1) {
 			A.res_auto = a != 0;
 		} else if (sscanf(line, "bagliyken_gizle=%d", &a) == 1) {
@@ -487,8 +517,9 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
-	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nsurum=3\n", A.audio_device,
-		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder);
+	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=3\n", A.audio_device,
+		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
+		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
 	fclose(f);
 }
 
@@ -683,15 +714,18 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 	}
 
 	R.vst = avformat_new_stream(R.oc, NULL);
-	R.ast = avformat_new_stream(R.oc, NULL);
-	if (!R.vst || !R.ast)
+	if (!R.vst)
 		return false;
 	R.vst->time_base = R.enc->time_base;
 	if (avcodec_parameters_from_context(R.vst->codecpar, R.enc) < 0)
 		return false;
 	/* the sound: AAC, 44.1 kHz stereo (what every player and editor reads in .mp4 / .mov / .mkv) */
-	const AVCodec *acodec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-	if (!acodec)
+	const AVCodec *acodec = A.rec_audio ? avcodec_find_encoder(AV_CODEC_ID_AAC) : NULL;
+	if (A.rec_audio && !acodec)
+		return false;
+	if (acodec) {
+	R.ast = avformat_new_stream(R.oc, NULL);
+	if (!R.ast)
 		return false;
 	R.aenc = avcodec_alloc_context3(acodec);
 	R.aframe = av_frame_alloc();
@@ -717,6 +751,7 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 	R.aframe->nb_samples = R.aenc->frame_size > 0 ? R.aenc->frame_size : 1024;
 	if (av_frame_get_buffer(R.aframe, 0) < 0)
 		return false;
+	}
 	R.abuf_n = 0;
 
 	R.frame->format = R.enc->pix_fmt;
@@ -1002,6 +1037,108 @@ done:
 #ifdef _WIN32
 #define VCAM_W 1920
 #define VCAM_H 1080
+
+/* Our own camera, "Relios Mirror Camera": softcam (github.com/tshino/softcam, MIT), a DirectShow camera in
+ * softcam.dll next to the program. The DLL is registered once with the user's consent (see register_camera); the
+ * picture is sent through its small C interface as 24-bit BGR, 1920x1080. */
+typedef void *sc_camera;
+static struct {
+	bool tried;
+	HMODULE dll;
+	sc_camera (*create)(int, int, float);
+	void (*destroy)(sc_camera);
+	void (*send)(sc_camera, const void *);
+	sc_camera cam;
+	uint8_t *bgr;
+	struct SwsContext *sws;
+	int src_w, src_h;
+	bool fit;
+} S;
+
+static void own_camera_path(char *out, size_t size)
+{
+	char *base = SDL_GetBasePath();
+	snprintf(out, size, "%ssoftcam.dll", base ? base : "");
+	SDL_free(base);
+}
+
+static void own_camera_close(void)
+{
+	if (S.cam && S.destroy)
+		S.destroy(S.cam);
+	S.cam = NULL;
+	sws_freeContext(S.sws);
+	S.sws = NULL;
+	free(S.bgr);
+	S.bgr = NULL;
+	S.src_w = S.src_h = 0;
+}
+
+/* true: the picture went to our own camera */
+static bool own_camera_write(const AVFrame *f)
+{
+	if (!S.tried) {
+		S.tried = true;
+		char path[2100];
+		own_camera_path(path, sizeof(path));
+		wchar_t *w = to_wide(path);
+		S.dll = w ? LoadLibraryW(w) : NULL;
+		free(w);
+		if (S.dll) {
+			S.create = (sc_camera(*)(int, int, float))(void *)GetProcAddress(S.dll, "scCreateCamera");
+			S.destroy = (void (*)(sc_camera))(void *)GetProcAddress(S.dll, "scDeleteCamera");
+			S.send = (void (*)(sc_camera, const void *))(void *)GetProcAddress(S.dll, "scSendFrame");
+		}
+		app_log("own virtual camera: %s", S.dll && S.create && S.destroy && S.send ? "softcam.dll loaded" : "softcam.dll not usable");
+	}
+	if (!S.dll || !S.create || !S.destroy || !S.send)
+		return false;
+	if (!S.cam) {
+		/* (frame rate 0: each picture is passed on as it comes; if this softcam wants a rate, 60) */
+		S.cam = S.create(VCAM_W, VCAM_H, 0.0f);
+		if (!S.cam)
+			S.cam = S.create(VCAM_W, VCAM_H, 60.0f);
+		if (!S.cam) {
+			app_log("own virtual camera: could not be created (another program is using it?)");
+			S.create = NULL; /* (not tried again) */
+			return false;
+		}
+		S.bgr = calloc(1, VCAM_W * VCAM_H * 3);
+		app_log("own virtual camera: started");
+	}
+	if (!S.bgr)
+		return false;
+	int aw = f->width, ah = f->height;
+	bool fit = SDL_AtomicGet(&A.fit169) && aw > ah;
+	if (fit)
+		aw = 16, ah = 9;
+	int dw = VCAM_W, dh = (int)((int64_t)VCAM_W * ah / aw);
+	if (dh > VCAM_H) {
+		dh = VCAM_H;
+		dw = (int)((int64_t)VCAM_H * aw / ah);
+	}
+	dw &= ~1;
+	dh &= ~1;
+	if (dw < 2 || dh < 2)
+		return true;
+	int dx = (VCAM_W - dw) / 2, dy = (VCAM_H - dh) / 2;
+	if (S.src_w != f->width || S.src_h != f->height || S.fit != fit) {
+		memset(S.bgr, 0, VCAM_W * VCAM_H * 3);
+		S.src_w = f->width;
+		S.src_h = f->height;
+		S.fit = fit;
+	}
+	S.sws = sws_getCachedContext(S.sws, f->width, f->height, (enum AVPixelFormat)f->format, dw, dh, AV_PIX_FMT_BGR24,
+				     SWS_BILINEAR, NULL, NULL, NULL);
+	if (!S.sws)
+		return true;
+	uint8_t *dst[4] = {S.bgr + (dy * VCAM_W + dx) * 3, NULL, NULL, NULL};
+	int stride[4] = {VCAM_W * 3, 0, 0, 0};
+	sws_scale(S.sws, (const uint8_t *const *)f->data, f->linesize, 0, f->height, dst, stride);
+	S.send(S.cam, S.bgr);
+	return true;
+}
+
 struct vcam_header {
 	volatile uint32_t write_idx;
 	volatile uint32_t read_idx;
@@ -1025,6 +1162,7 @@ static struct {
 
 static void vcam_close(void)
 {
+	own_camera_close();
 	if (V.h) {
 		V.h->state = 3;
 		UnmapViewOfFile(V.h);
@@ -1084,9 +1222,12 @@ static bool vcam_open(void)
 /* the picture, fitted into 1920x1080 with black beside it */
 static void vcam_write(const AVFrame *f)
 {
+	if (own_camera_write(f))
+		return;
+	/* (our own camera is not there: OBS's, if OBS is installed) */
 	if (!V.h && !vcam_open()) {
 		SDL_AtomicSet(&A.vcam_on, 0);
-		set_notice("Sanal kamera açılamadı. OBS Studio kurulu, OBS'in kendi sanal kamerası kapalı olmalı", false);
+		set_notice("Sanal kamera açılamadı (kamera kaydı yapılamadı ya da başka bir program kullanıyor)", false);
 		return;
 	}
 	int aw = f->width, ah = f->height;
@@ -1778,9 +1919,9 @@ static void session_start(void)
 
 	char config[512];
 	snprintf(config, sizeof(config),
-		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nhide_connected %d\n",
+		 "name " RECEIVER_NAME "\ndeviceid %s\nkeyfile receiver-key.pem\nsize %dx%d@%d\nh265 %d\nallow_pairing %d\nhide_connected %d\nvisible %d\n",
 		 id, A.res_auto ? 3840 : A.width, A.res_auto ? 2160 : A.height, A.fps, A.h265 ? 1 : 0, allow ? 1 : 0,
-		 A.hide_connected ? 1 : 0);
+		 A.hide_connected ? 1 : 0, (A.visible || allow) ? 1 : 0);
 	proc_write(A.proc, config);
 	for (const char *p = paired; p && *p;) {
 		const char *end = strchr(p, '\n');
@@ -1815,18 +1956,19 @@ static void status_text(char *status, size_t size)
 		snprintf(status, size, "Başlatılıyor…");
 		break;
 	case MIRROR_LISTENING:
-		snprintf(status, size, "Hazır  •  iPad'de Ekran Yansıtma'dan " RECEIVER_NAME "'ı seçin%s",
+		snprintf(status, size, A.visible ? "Hazır  •  Apple cihazında Ekran Yansıtma'dan " RECEIVER_NAME "'ı seçin%s" :
+				     "Hazır  •  Listede gizli (Ayarlar > Cihaz'dan gösterin)%s",
 			 A.pair_requested ? "  •  Yeni cihaz eşleştirme açık" : "");
 		break;
 	case MIRROR_PIN:
-		snprintf(status, size, "Penceredeki kodu iPad'e girin");
+		snprintf(status, size, "Penceredeki kodu Apple cihazına girin");
 		break;
 	case MIRROR_CONNECTED:
 		if (A.format[0])
-			snprintf(status, size, "Bağlı: %s  •  %s, %.0f fps, %.1f Mbit/s", A.client[0] ? A.client : "iPad",
+			snprintf(status, size, "Bağlı: %s  •  %s, %.0f fps, %.1f Mbit/s", A.client[0] ? A.client : "Apple cihazı",
 				 A.format, A.fps_now, A.mbit);
 		else
-			snprintf(status, size, "Bağlı: %s", A.client[0] ? A.client : "iPad");
+			snprintf(status, size, "Bağlı: %s", A.client[0] ? A.client : "Apple cihazı");
 		break;
 	case MIRROR_PAIRING_OFF:
 		snprintf(status, size, "Üç yanlış kod girildi, eşleştirme kapandı (Ayarlar > Cihaz'dan yeniden açın)");
@@ -1968,6 +2110,8 @@ static const char *paired_names(int *count)
 	return names;
 }
 
+static bool autostart_get(void);
+
 /* ---- the interface: a bar at the bottom (shown while the mouse moves over the window, and while nothing is
  * mirrored) with the few things used all the time, and a settings panel for the rest */
 
@@ -1981,7 +2125,7 @@ struct button {
 static struct button buttons[32];
 static int button_count;
 static bool settings_open;
-static int settings_tab; /* 0: picture, 1: recording, 2: device */
+static int settings_tab; /* 0: picture, 1: recording, 2: device, 3: program */
 static bool editing_kbit; /* the recording bit rate is being typed */
 static char kbit_text[8];
 static SDL_Rect panel_rect, bar_rect;
@@ -2099,6 +2243,7 @@ static void draw_bar(int ow, int oh)
 		add_button(CMD_TAB_VIDEO, settings_tab == 0, "", "Görüntü");
 		add_button(CMD_TAB_RECORD, settings_tab == 1, "", "Kayıt");
 		add_button(CMD_TAB_DEVICE, settings_tab == 2, "", "Cihaz");
+		add_button(CMD_TAB_APP, settings_tab == 3, "", "Program");
 		int first = button_count;
 		const char *note = "";
 		SDL_LockMutex(A.mutex);
@@ -2106,7 +2251,7 @@ static void draw_bar(int ow, int oh)
 		SDL_UnlockMutex(A.mutex);
 		if (settings_tab == 0) {
 			if (A.res_auto)
-				add_button(CMD_RES_NEXT, false, "Çözünürlük", "Otomatik (iPad)");
+				add_button(CMD_RES_NEXT, false, "Çözünürlük", "Otomatik (Cihaz)");
 			else
 				add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
 			add_button(CMD_FPS_NEXT, false, "Kare Hızı", "%d fps", A.fps);
@@ -2114,11 +2259,12 @@ static void draw_bar(int ow, int oh)
 			add_button(CMD_HW_DECODE, false, "Görüntü Çözme", A.hw_decode ? "Ekran Kartı" : "İşlemci");
 			bool fit = SDL_AtomicGet(&A.fit169) != 0;
 			add_button(CMD_ASPECT, fit, "Görüntü Oranı", fit ? "16:9 (Yatay)" : "Özgün");
-			note = "İlk dört ayar değişince iPad'den yeniden bağlanın. 16:9 yalnızca yatay görüntüye uygulanır.";
+			note = "İlk dört ayar değişince cihazdan yeniden bağlanın. 16:9 yalnızca yatay görüntüye uygulanır.";
 		} else if (settings_tab == 1) {
 			add_button(CMD_REC_FORMAT, false, "Biçim",
 				   A.rec_format == 0 ? "MP4" : A.rec_format == 1 ? "MOV (Apple)" : "MKV");
 			add_button(CMD_REC_ENCODER, false, "Kodlayıcı", A.rec_gpu ? "Ekran Kartı" : "İşlemci");
+			add_button(CMD_REC_AUDIO, A.rec_audio, "Sesi Kaydet", A.rec_audio ? "Açık" : "Kapalı");
 			add_button(CMD_REC_MODE, false, "Bit Hızı Modu",
 				   A.rec_mode == 0 ? "Otomatik (Kalite)" : A.rec_mode == 1 ? "CBR (Sabit)" : "VBR (Değişken)");
 			if (editing_kbit)
@@ -2130,6 +2276,12 @@ static void draw_bar(int ow, int oh)
 			note = editing_kbit ? "Rakamları yazın, Enter ile onaylayın." :
 			       A.rec_mode != 0 ? "Bit hızını değiştirmek için değerine tıklayıp yazın." :
 						 "Ayarlar bir sonraki kayıtta geçerli olur.";
+		} else if (settings_tab == 3) {
+			bool autostart = autostart_get();
+			add_button(CMD_AUTOSTART, autostart, "Windows İle Başlat", autostart ? "Açık" : "Kapalı");
+			add_button(CMD_TRAY, A.to_tray, "Küçültünce Bildirim Alanına Al", A.to_tray ? "Açık" : "Kapalı");
+			add_button(CMD_ONTOP, A.on_top, "Pencere Her Zaman Üstte", A.on_top ? "Açık" : "Kapalı");
+			note = "Windows ile başlayınca bildirim alanında (saatin yanında) bekler.";
 		} else {
 			add_button(CMD_PAIR, pairing, "Yeni Cihaz Eşleştirme", pairing ? "Açık" : "Kapalı");
 			int paired = 0;
@@ -2146,8 +2298,8 @@ static void draw_bar(int ow, int oh)
 				snprintf(paired_label, sizeof(paired_label), "Eşleşmiş Cihaz Yok");
 			}
 			add_button(CMD_FORGET, false, paired_label, "Unut");
-			add_button(CMD_HIDE, A.hide_connected, "Bağlıyken iPad Listesinde Gizle", A.hide_connected ? "Açık" : "Kapalı");
-			add_button(CMD_ONTOP, A.on_top, "Pencere Her Zaman Üstte", A.on_top ? "Açık" : "Kapalı");
+			add_button(CMD_VISIBLE, A.visible, "Ekran Yansıtma Listesinde Göster", A.visible ? "Açık" : "Kapalı");
+			add_button(CMD_HIDE, A.hide_connected, "Bağlıyken Listede Gizle", A.hide_connected ? "Açık" : "Kapalı");
 			char device[64] = "Varsayılan";
 			if (A.audio_device[0]) {
 				/* (shortened to fit, at a whole letter) */
@@ -2158,13 +2310,13 @@ static void draw_bar(int ow, int oh)
 			}
 			add_button(CMD_AUDIO_DEVICE, false, "Ses Çıkışı", "%s", device);
 			bool vcam = SDL_AtomicGet(&A.vcam_on) != 0;
-			add_button(CMD_VCAM, vcam, "Sanal Kamera (OBS Virtual Camera)", vcam ? "Açık" : "Kapalı");
-			note = "Sanal kamera için OBS Studio kurulu olmalı (açık olması gerekmez).";
+			add_button(CMD_VCAM, vcam, "Sanal Kamera", vcam ? "Açık" : "Kapalı");
+			note = "Sanal kameranın adı: Relios Mirror Camera (Discord vb. programlarda bunu seçin).";
 		}
 		int rows = button_count - first;
 		int row_h = bh + gap, value_w = f * 13;
 		int pw = f * 32 < ow - 2 * gap ? f * 26 : ow - 2 * gap;
-		int ph = f + row_h + f / 2 + 6 * row_h + f * 2;
+		int ph = f + row_h + f / 2 + 7 * row_h + f * 2;
 		int px = ow - pw - gap, py = y0 - ph - gap;
 		if (py < gap)
 			py = gap;
@@ -2202,7 +2354,7 @@ static void draw_idle(int ow, int oh)
 		SDL_RenderCopy(A.ren, A.logo, NULL, &dst);
 	}
 	y += size + A.font_px;
-	static const char *const lines[] = {APP_NAME, "iPad  →  Denetim Merkezi  →  Ekran Yansıtma  →  " RECEIVER_NAME};
+	static const char *const lines[] = {APP_NAME, "iPhone / iPad  →  Denetim Merkezi  →  Ekran Yansıtma  →  " RECEIVER_NAME};
 	for (int i = 0; i < 2; i++) {
 		struct text_entry *t = text_get(lines[i]);
 		if (!t)
@@ -2414,6 +2566,162 @@ static void choose_video_folder(void)
 #endif
 }
 
+#ifdef _WIN32
+#define TRAY_MESSAGE (WM_APP + 1)
+
+static HWND window_handle(void)
+{
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	return SDL_GetWindowWMInfo(A.win, &info) ? info.info.win.window : NULL;
+}
+
+/* Our camera's DLL is made known to Windows (regsvr32, with the user's consent: UAC), once for the folder the
+ * program is in. false: not registered (the DLL is missing, or the user said no). */
+static bool register_camera(void)
+{
+	char path[2100];
+	own_camera_path(path, sizeof(path));
+	if (!file_exists_utf8(path))
+		return false;
+	char *made_for = read_text("kamera.txt");
+	bool same = made_for && !strcmp(made_for, path);
+	free(made_for);
+	if (same)
+		return true;
+	if (strpbrk(path, "%^!\"&"))
+		return false;
+	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
+				 "Sanal kamera (\"Relios Mirror Camera\") Windows'a bir kez tanıtılacak.\n\n"
+				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.\n"
+				 "Kamera, açık olan programlarda (Discord vb.) onlar yeniden başlatılınca görünür.",
+				 A.win);
+	char args[2300];
+	snprintf(args, sizeof(args), "/s \"%s\"", path);
+	wchar_t *w = to_wide(args);
+	if (!w)
+		return false;
+	SHELLEXECUTEINFOW info;
+	memset(&info, 0, sizeof(info));
+	info.cbSize = sizeof(info);
+	info.fMask = SEE_MASK_NOCLOSEPROCESS;
+	info.lpVerb = L"runas";
+	info.lpFile = L"regsvr32.exe";
+	info.lpParameters = w;
+	info.nShow = SW_HIDE;
+	bool ok = false;
+	if (ShellExecuteExW(&info) && info.hProcess) {
+		DWORD code = 1;
+		WaitForSingleObject(info.hProcess, 30000);
+		GetExitCodeProcess(info.hProcess, &code);
+		CloseHandle(info.hProcess);
+		ok = code == 0;
+	}
+	free(w);
+	app_log("own virtual camera: registration %s", ok ? "done" : "failed or refused");
+	if (ok) {
+		FILE *f = fopen("kamera.txt", "w");
+		if (f) {
+			fputs(path, f);
+			fclose(f);
+		}
+	}
+	return ok;
+}
+
+/* "Relios Mirror" under HKCU\...\Run: started with Windows, in the notification area */
+static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static bool autostart_get(void)
+{
+	HKEY key;
+	bool on = false;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, run_key, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+		on = RegQueryValueExW(key, L"Relios Mirror", NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+		RegCloseKey(key);
+	}
+	return on;
+}
+
+static void autostart_set(bool on)
+{
+	HKEY key;
+	if (RegCreateKeyExW(HKEY_CURRENT_USER, run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+		return;
+	if (on) {
+		/* (the one-file program if this was started by it: it finds the newest version's folder) */
+		static wchar_t exe[2048], command[2200];
+		const wchar_t *launcher = _wgetenv(L"RELIOS_LAUNCHER");
+		if (launcher && launcher[0])
+			_snwprintf(exe, 2047, L"%ls", launcher);
+		else
+			GetModuleFileNameW(NULL, exe, 2047);
+		exe[2047] = 0;
+		_snwprintf(command, 2199, L"\"%ls\" --tepsi", exe);
+		command[2199] = 0;
+		RegSetValueExW(key, L"Relios Mirror", 0, REG_SZ, (const BYTE *)command,
+			       (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+	} else {
+		RegDeleteValueW(key, L"Relios Mirror");
+	}
+	RegCloseKey(key);
+}
+
+static void tray_icon(DWORD action)
+{
+	NOTIFYICONDATAW icon;
+	memset(&icon, 0, sizeof(icon));
+	icon.cbSize = sizeof(icon);
+	icon.hWnd = window_handle();
+	icon.uID = 1;
+	icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+	icon.uCallbackMessage = TRAY_MESSAGE;
+	icon.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+	_snwprintf(icon.szTip, 63, L"Relios Mirror");
+	Shell_NotifyIconW(action, &icon);
+}
+
+/* the window to the notification area (mirroring goes on) and back */
+static void tray_hide(void)
+{
+	if (A.in_tray)
+		return;
+	tray_icon(NIM_ADD);
+	SDL_HideWindow(A.win);
+	A.in_tray = true;
+}
+
+static void tray_show(void)
+{
+	if (!A.in_tray)
+		return;
+	tray_icon(NIM_DELETE);
+	SDL_ShowWindow(A.win);
+	SDL_RestoreWindow(A.win);
+	SDL_RaiseWindow(A.win);
+	A.in_tray = false;
+}
+#else
+static bool register_camera(void)
+{
+	return false;
+}
+static bool autostart_get(void)
+{
+	return false;
+}
+static void autostart_set(bool on)
+{
+	(void)on;
+}
+static void tray_hide(void)
+{
+}
+static void tray_show(void)
+{
+}
+#endif
+
 static void run_command(int cmd)
 {
 	bool restart = false;
@@ -2480,8 +2788,15 @@ static void run_command(int cmd)
 		if (!on)
 			A.pin[0] = '\0';
 		SDL_UnlockMutex(A.mutex);
-		if (A.proc)
+		if (on && !A.visible) {
+			/* (a device can only pair with a receiver it sees) */
+			A.visible = true;
+			save_settings();
+		}
+		if (A.proc) {
+			proc_write(A.proc, A.visible ? "visible 1\n" : "visible 0\n");
 			proc_write(A.proc, on ? "allow_pairing 1\n" : "allow_pairing 0\n");
+		}
 		break;
 	}
 	case CMD_SCREENSHOT: {
@@ -2496,7 +2811,7 @@ static void run_command(int cmd)
 		}
 		SDL_UnlockMutex(A.frame_mutex);
 		if (!item.frame)
-			set_notice("Ekran görüntüsü için önce iPad'i yansıtın", false);
+			set_notice("Ekran görüntüsü için önce cihazı yansıtın", false);
 		else if (!rec_push(&item))
 			av_frame_free(&item.frame);
 		break;
@@ -2518,6 +2833,8 @@ static void run_command(int cmd)
 		break;
 	}
 	case CMD_VCAM: {
+		if (!SDL_AtomicGet(&A.vcam_on))
+			register_camera(); /* (without it: OBS's camera, if OBS is installed) */
 		SDL_AtomicSet(&A.vcam_on, !SDL_AtomicGet(&A.vcam_on));
 		struct rec_item item;
 		memset(&item, 0, sizeof(item));
@@ -2530,6 +2847,21 @@ static void run_command(int cmd)
 		SDL_AtomicSet(&A.fit169, !SDL_AtomicGet(&A.fit169));
 		save_settings();
 		break;
+	case CMD_REC_AUDIO:
+		A.rec_audio = !A.rec_audio;
+		save_settings();
+		break;
+	case CMD_AUTOSTART:
+		autostart_set(!autostart_get());
+		break;
+	case CMD_TRAY:
+		A.to_tray = !A.to_tray;
+		save_settings();
+		break;
+	case CMD_TAB_APP:
+		settings_tab = 3;
+		editing_kbit = false;
+		break;
 	case CMD_TAB_VIDEO:
 		settings_tab = 0;
 		editing_kbit = false;
@@ -2540,6 +2872,12 @@ static void run_command(int cmd)
 	case CMD_TAB_DEVICE:
 		settings_tab = 2;
 		editing_kbit = false;
+		break;
+	case CMD_VISIBLE:
+		A.visible = !A.visible;
+		save_settings();
+		if (A.proc)
+			proc_write(A.proc, A.visible ? "visible 1\n" : "visible 0\n");
 		break;
 	case CMD_HIDE:
 		A.hide_connected = !A.hide_connected;
@@ -2659,7 +2997,7 @@ static void ensure_firewall_rule(void)
 		return;
 	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
-				 "iPad'in bağlanabilmesi için Windows Güvenlik Duvarı'nda izin gerekiyor.\n\n"
+				 "Apple cihazının bağlanabilmesi için Windows Güvenlik Duvarı'nda izin gerekiyor.\n\n"
 				 "İzin yalnızca alıcı programa ve yalnızca yerel ağdan gelen bağlantılara verilir.\n"
 				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.",
 				 A.win);
@@ -2698,8 +3036,6 @@ static void ensure_firewall_rule(void)
 
 int main(int argc, char *argv[])
 {
-	(void)argc;
-	(void)argv;
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP_NAME, SDL_GetError(), NULL);
@@ -2746,6 +3082,13 @@ int main(int argc, char *argv[])
 	}
 	if (A.on_top)
 		SDL_SetWindowAlwaysOnTop(A.win, SDL_TRUE);
+#ifdef _WIN32
+	SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE); /* (the notification area icon's clicks) */
+#endif
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--tepsi"))
+			tray_hide(); /* started with Windows */
+	}
 	{
 		char path[2100];
 		char *folder = SDL_GetBasePath();
@@ -2792,9 +3135,20 @@ int main(int argc, char *argv[])
 						A.restart_at = SDL_GetTicks() + (failed ? 5000 : 700);
 						redraw = retitle = true;
 					}
+#ifdef _WIN32
+				} else if (e.type == SDL_SYSWMEVENT) {
+					if (e.syswm.msg && e.syswm.msg->msg.win.msg == TRAY_MESSAGE &&
+					    (LOWORD(e.syswm.msg->msg.win.lParam) == WM_LBUTTONUP ||
+					     LOWORD(e.syswm.msg->msg.win.lParam) == WM_LBUTTONDBLCLK)) {
+						tray_show();
+						redraw = true;
+					}
+#endif
 				} else if (e.type == SDL_WINDOWEVENT) {
 					if (e.window.event == SDL_WINDOWEVENT_LEAVE)
 						A.bar_until = 0;
+					if (e.window.event == SDL_WINDOWEVENT_MINIMIZED && A.to_tray)
+						tray_hide();
 					redraw = true;
 				} else if (e.type == SDL_MOUSEMOTION) {
 					A.bar_until = SDL_GetTicks() + 2500;
@@ -2883,6 +3237,7 @@ int main(int argc, char *argv[])
 	SDL_UnlockMutex(R.mutex);
 	if (A.adev)
 		SDL_CloseAudioDevice(A.adev);
+	tray_show();
 	save_settings();
 	app_log("ended");
 	texts_clear();

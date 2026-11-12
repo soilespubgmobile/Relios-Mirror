@@ -40,7 +40,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR args, int show)
 {
 	(void)instance;
 	(void)previous;
-	(void)args;
 	(void)show;
 	static wchar_t self[PATH_MAX_W], base[PATH_MAX_W], dir[PATH_MAX_W], exe[PATH_MAX_W], tgz[PATH_MAX_W],
 		sys[PATH_MAX_W], cmd[PATH_MAX_W * 3];
@@ -106,7 +105,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR args, int show)
 			fail(L"Program dosyaları çıkarılamadı.");
 	}
 	CloseHandle(in);
-	_snwprintf(cmd, PATH_MAX_W * 3 - 1, L"\"%ls\"", exe);
+	SetEnvironmentVariableW(L"RELIOS_LAUNCHER", self); /* (for "start with Windows") */
+	_snwprintf(cmd, PATH_MAX_W * 3 - 1, L"\"%ls\" %hs", exe, args ? args : "");
 	if (!run(cmd, dir, FALSE))
 		fail(L"Relios Mirror başlatılamadı.");
 	return 0;

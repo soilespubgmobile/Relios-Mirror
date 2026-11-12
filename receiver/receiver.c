@@ -54,6 +54,7 @@ static int registered_count = 0;
 static bool allow_pairing = false;
 static bool hide_when_connected = false; /* Relios Mirror: not in the iPad's list while a paired device is connected */
 static bool trusted_connected = false;
+static bool visible = true; /* Relios Mirror: announced on the network at all */
 static int pairing_failures = 0;
 static int open_connections = 0;
 static bool had_trusted_client = false;
@@ -428,6 +429,10 @@ static void handle_command(char *line)
 		if (registered_count < MAX_REGISTERED && strlen(line + 9) > 0)
 			registered[registered_count++] = strdup(line + 9);
 		pthread_mutex_unlock(&state_mutex);
+	} else if (!strncmp(line, "visible ", 8)) {
+		pthread_mutex_lock(&state_mutex);
+		visible = atoi(line + 8) != 0;
+		pthread_mutex_unlock(&state_mutex);
 	} else if (!strncmp(line, "hide_connected ", 15)) {
 		pthread_mutex_lock(&state_mutex);
 		hide_when_connected = atoi(line + 15) != 0;
@@ -673,7 +678,7 @@ int main(int argc, char **argv)
 			break;
 		pthread_mutex_lock(&state_mutex);
 		uint64_t since = idle_since;
-		bool announce = !(hide_when_connected && trusted_connected && open_connections > 0);
+		bool announce = visible && !(hide_when_connected && trusted_connected && open_connections > 0);
 		pthread_mutex_unlock(&state_mutex);
 		if (announce != announced) {
 			/* (the connection that is open does not depend on the announcement) */
@@ -685,7 +690,7 @@ int main(int argc, char **argv)
 			} else {
 				dnssd_unregister_raop(dnssd);
 				dnssd_unregister_airplay(dnssd);
-				log_line("[info] a paired device is connected: no longer announced on the network");
+				log_line("[info] no longer announced on the network (hidden, or a paired device is connected)");
 			}
 			announced = announce;
 		}
