@@ -435,7 +435,7 @@ static void load_settings(void)
 	A.fps = 60;
 	A.h265 = false;
 	A.on_top = false;
-	A.res_auto = true;
+	A.res_auto = false;
 	A.rec_audio = true;
 	A.to_tray = false;
 	A.hide_connected = true;
@@ -505,8 +505,12 @@ static void load_settings(void)
 		A.rec_gpu = true;
 		A.rec_format = 1;
 	}
-	if (version < 3)
-		A.res_auto = true; /* (the iPad's own size became the default) */
+	if (version < 4) {
+		/* (1920x1080 is the default; "automatic" is gone) */
+		A.width = 1920;
+		A.height = 1080;
+	}
+	A.res_auto = false;
 }
 
 static void save_settings(void)
@@ -517,7 +521,7 @@ static void save_settings(void)
 	fprintf(f, "cozunurluk=%dx%d\nfps=%d\nh265=%d\nses=%d\nsessiz=%d\nustte=%d\nkayit_gpu=%d\ngpu_cozme=%d\nkayit_bicim=%d\nkayit_mod=%d\nkayit_kbit=%d\n", A.width,
 		A.height, A.fps, A.h265 ? 1 : 0, SDL_AtomicGet(&A.volume), SDL_AtomicGet(&A.muted), A.on_top ? 1 : 0,
 		A.rec_gpu ? 1 : 0, A.hw_decode ? 1 : 0, A.rec_format, A.rec_mode, A.rec_kbit);
-	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=3\n", A.audio_device,
+	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=4\n", A.audio_device,
 		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
 		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
 	fclose(f);
@@ -2250,10 +2254,7 @@ static void draw_bar(int ow, int oh)
 		bool pairing = A.pair_requested;
 		SDL_UnlockMutex(A.mutex);
 		if (settings_tab == 0) {
-			if (A.res_auto)
-				add_button(CMD_RES_NEXT, false, "Çözünürlük", "Otomatik (Cihaz)");
-			else
-				add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
+			add_button(CMD_RES_NEXT, false, "Çözünürlük", "%d×%d", A.width, A.height);
 			add_button(CMD_FPS_NEXT, false, "Kare Hızı", "%d fps", A.fps);
 			add_button(CMD_CODEC_NEXT, false, "Kodek", A.h265 ? "H.265" : "H.264");
 			add_button(CMD_HW_DECODE, false, "Görüntü Çözme", A.hw_decode ? "Ekran Kartı" : "İşlemci");
@@ -2889,16 +2890,14 @@ static void run_command(int cmd)
 		choose_video_folder();
 		break;
 	case CMD_RES_NEXT:
-		if (A.res_auto)
-			A.res_auto = false, A.width = 1280, A.height = 720;
-		else if (A.height < 1080)
+		if (A.height < 1080)
 			A.width = 1920, A.height = 1080;
 		else if (A.height < 1440)
 			A.width = 2560, A.height = 1440;
 		else if (A.height < 2160)
 			A.width = 3840, A.height = 2160;
 		else
-			A.res_auto = true;
+			A.width = 1280, A.height = 720;
 		restart = true;
 		break;
 	case CMD_FPS_NEXT:
