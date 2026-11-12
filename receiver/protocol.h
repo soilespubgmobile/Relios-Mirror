@@ -27,7 +27,8 @@ enum ra_message_type {
 };
 
 /* Status events: listening | client name=<..> model=<..> | trusted new=<0|1> | mirroring on|off |
- * pairing_failed count=<n> | pairing_off | ended | integrity level=<low|medium|..> | error text=<..> */
+ * pairing_failed count=<n> | pairing_off | ended | integrity level=<low|medium|..> | error text=<..> |
+ * hidden <0|1> (Relios Mirror: the name was taken off the network while a device mirrors / is announced again) */
 
 #pragma pack(push, 1)
 struct ra_video_format {

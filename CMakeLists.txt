@@ -23,7 +23,7 @@ pkg_check_modules(SDL2TTF REQUIRED IMPORTED_TARGET SDL2_ttf)
 
 if(WIN32)
   enable_language(RC)
-  add_executable(ReliosMirror WIN32 viewer/main.c viewer/proc_win.c viewer/proc.h viewer/app.rc)
+  add_executable(ReliosMirror WIN32 viewer/main.c viewer/proc_win.c viewer/proc.h viewer/version.h viewer/app.rc)
   set_source_files_properties(viewer/app.rc PROPERTIES COMPILE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/viewer")
   target_link_libraries(ReliosMirror PRIVATE bcrypt advapi32 shell32 user32 ole32)
   # the one-file version: carries the whole folder and unpacks it at the first start (see paketle.sh)

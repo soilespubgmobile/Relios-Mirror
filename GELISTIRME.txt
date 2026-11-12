@@ -1,0 +1,158 @@
+RELIOS MIRROR - GELİŞTİRME KILAVUZU
+Programı ileride değiştirmek, yeniden derlemek ve yeni sürüm çıkarmak için gereken her şey burada.
+(Kullanım için: BENIOKU.txt)
+
+
+1. ELİNİZDE NE OLMALI
+Sürüm sayfasındaki (GitHub > Releases) dosyaların hepsini indirip saklayın:
+
+  ReliosMirror.exe                program, tek dosya
+  ReliosMirror-klasor.zip         aynı program klasör hâlinde (bütün DLL'leriyle)
+  Relios-Mirror-kaynak-kod.zip    bu sürümün kaynak kodunun tamamı (bu dosya dahil)
+  softcam-d1acde4-kaynak.zip      sanal kameranın kaynağı (softcam, MIT). Derleme onu GitHub'dan alır; o depo
+                                  bir gün kaybolursa bu yedek kullanılır.
+  derleme-ortami.txt              bu sürümün derlendiği araçların ve kitaplıkların sürümleri
+  SHA256SUMS.txt                  dosyaların SHA-256 özetleri
+
+Kaynak kodun asıl yeri GitHub deposudur: https://github.com/soilespubgmobile/Relios-Mirror
+Bunların dışında, derlemek için internetten alınanlar: MSYS2 paketleri (FFmpeg, SDL2, SDL2_ttf, OpenSSL, GCC,
+CMake) ve Visual Studio derleme araçları (yalnızca sanal kamera için). Program çalışırken hiçbir şey indirmez.
+
+
+2. DERLEMEK
+A) GitHub ile (önerilen; bilgisayara bir şey kurulmaz)
+   Depoya her gönderimde (push) Actions > "Windows exe" çalışır ve şunları üretir:
+   ReliosMirror-tek-exe, ReliosMirror-windows, ReliosMirror-kaynak-kod, ReliosMirror-sanal-kamera-kaynak,
+   ReliosMirror-derleme-ortami. Bu çıktılar 90 gün sonra silinir; kalıcı olan sürüm sayfasıdır (bkz. 3).
+   Tarif: .github/workflows/windows.yml
+
+B) Windows'ta, kendi bilgisayarınızda
+   1. https://www.msys2.org adresinden MSYS2'yi kurun (C:\msys64).
+   2. derle.bat'a çift tıklayın. Gereken paketleri kurar ve paketle.sh'yi çalıştırır:
+        mingw-w64-ucrt-x86_64-gcc  -cmake  -ninja  -pkgconf  -openssl  -ffmpeg  -SDL2  -SDL2_ttf
+      Sonuç: dist\ReliosMirror (klasör) ve dist\tek-exe\ReliosMirror.exe (tek dosya).
+   3. Sanal kamera DLL'i (softcam.dll) yalnızca Visual Studio'nun C++ araçlarıyla derlenir (MSBuild, x64,
+      Windows SDK). Adımlar windows.yml'deki "Build the virtual camera" bölümündedir: kaynağı "softcam"
+      klasörüne açın, oradaki ad / kimlik / çalışma zamanı değişikliklerini uygulayın, MSBuild ile derleyin.
+      softcam\dist\bin\x64\softcam.dll varsa paketle.sh onu pakete koyar; yoksa program kamerasız derlenir.
+      Kolay yol (kamerada değişiklik yoksa): son sürümün klasöründeki softcam.dll'i derlemeden önce
+      softcam\dist\bin\x64\ içine, softcam-LICENSE.txt'yi de softcam\LICENSE adıyla koymak.
+
+C) Linux / WSL'de yalnızca alıcı (sınama için)
+     cmake -S receiver -B build-alici -DCMAKE_BUILD_TYPE=Release
+     cmake --build build-alici
+   (gcc, cmake, pkg-config ve OpenSSL geliştirme paketi gerekir.)
+
+
+3. YENİ SÜRÜM ÇIKARMAK
+   1. viewer\version.h içindeki iki satırı değiştirin (APP_VERSION ve APP_VERSION_NUMBERS).
+   2. Değişiklikleri depoya gönderin.
+   3. Sürüm etiketini gönderin:   git tag v1.0.1   ve   git push origin v1.0.1
+   4. Actions'taki derleme bitince Releases sayfasında TASLAK (Draft) bir sürüm oluşur; içinde 1. maddedeki
+      dosyalar vardır. Taslağı yalnızca depo sahibi görür. "Publish release" derseniz herkese açılır.
+   Sürüm numarası programda Ayarlar > Program'da, log.txt'nin ilk satırında ve exe'nin Özellikler > Ayrıntılar
+   sekmesinde görünür.
+
+
+4. KODUN HARİTASI
+viewer\main.c         Programın tamamı (tek dosya). Bölümler, dosyadaki sırayla:
+                      - struct app (A): programın bütün durumu
+                      - Windows yardımcıları: run_elevated (yönetici onayıyla komut), system_program
+                      - ayarlar: load_settings / save_settings (%APPDATA%\ReliosMirror\ayarlar.txt)
+                      - eşleşmiş cihazlar: add_paired_device, register_line_ok, paired_count
+                      - kayıt: rec_* (rec_open_locked kodlayıcıyı seçer; rec_thread ayrı iş parçacığıdır)
+                      - ekran görüntüsü: save_png
+                      - sanal kamera: camera_start / camera_send / camera_stop; install_camera / remove_camera
+                      - görüntü: open_video_decoder, handle_video, present_frame
+                      - ses: open_audio_decoder, open_audio_output, handle_audio
+                      - alıcıyla konuşma: session_start (başlatır, komutları yazar), out_thread (mesajları
+                        okur), handle_status, handle_pin, hide_check, session_stop
+                      - arayüz: build_settings (Ayarlar'daki satırlar), draw_bar, draw_button, draw,
+                        button_at; run_command (her düğmenin yaptığı iş); key_command (tuşlar)
+                      - Windows: ensure_firewall_rule, autostart_get / autostart_set, other_copies
+                      - main: açılış sırası ve olay döngüsü
+viewer\proc_win.c     Alıcıyı düşük yetkiyle (low integrity) ve bir iş nesnesi içinde başlatır.
+viewer\launcher.c     Tek dosyalık sürümün başlatıcısı. paketle.sh, bu exe'nin sonuna paketi ekler:
+                      payload.tgz + "RLSM" + 16 haneli boyut + 14 haneli tarih damgası.
+viewer\version.h      Sürüm numarası.   viewer\app.rc: simge ve exe'nin sürüm bilgisi.
+receiver\receiver.c   AirPlay alıcısı (ayrı exe: relios-airplay-receiver.exe).
+receiver\protocol.h   Alıcı ile program arasındaki mesajlar.
+receiver\uxplay       UxPlay'in AirPlay kitaplığı (hangi sürüm: UPSTREAM.txt). Yapılan değişiklikler "RELIOS:"
+                      diye işaretlidir:   grep -rn "RELIOS" receiver/uxplay
+receiver\libplist     libplist (olduğu gibi).
+tests\                receiver_test.py: alıcının cihazsız sınaması.
+paketle.sh            Derler, DLL'leri toplar, tek dosyayı yapar.   derle.bat: bunu MSYS2 ile çalıştırır.
+
+
+5. ALICI İLE PROGRAM NASIL KONUŞUR
+Program alıcıyı başlatır ve standart girdisine satır satır komut yazar:
+   name <ad> | deviceid <kimlik> | keyfile <dosya> | register <eşleşmiş cihaz satırı> | size <G>x<Y>@<fps> |
+   h265 <0|1> | allow_pairing <0|1> | visible <0|1> | hide_connected <0|1> | start | quit
+Alıcı standart çıktısına mesaj yazar (8 baytlık başlık: 'R', 'A', tür, 0, uzunluk; sonra veri):
+   STATUS (metin), PIN (4 haneli kod), REGISTER (yeni eşleşen cihaz), VIDEO_FORMAT, VIDEO (H.264 / H.265),
+   AUDIO (AAC)
+STATUS olayları: listening, client, trusted, mirroring on|off, pairing_failed, pairing_off, ended, integrity,
+   error, hidden 0|1
+Alıcının günlük satırları standart hata çıktısına gider; program bunları log.txt'ye "receiver:" diye yazar.
+
+
+6. SIK YAPILACAK DEĞİŞİKLİKLER
+Yeni bir ayar eklemek (hepsi viewer\main.c):
+   1. struct app'e alanı ekleyin.
+   2. load_settings: varsayılan değeri ve dosyadan okunmasını ekleyin.
+   3. save_settings: dosyaya yazılmasını ekleyin.
+   4. enum'a bir CMD_... ekleyin; run_command'a onun "case"ini yazın.
+   5. build_settings: ilgili sekmeye satırı ekleyin (toggle: anahtar, choice: seçenek, action: düğme).
+      Bir sekmede en çok 7 satır sığar.
+   Eski ayar dosyalarındaki bir değeri bir kez değiştirmek gerekiyorsa "surum" numarasını kullanın
+   (load_settings'in sonu; şimdiki değer 5).
+Bir yazıyı değiştirmek: metni main.c içinde arayın. Dosya UTF-8'dir; öyle kaydedin.
+Programın adı: main.c'de APP_NAME ve RECEIVER_NAME (cihazın listesinde görünen ad); app.rc.
+Simge ve logo: viewer\app.ico, assets\logo.bmp.
+Sanal kameranın adı ve sınıf kimliği: windows.yml'deki softcam adımı ile main.c'deki CAMERA_CLASS_KEY (ikisi
+   aynı kimliği taşımalı).
+Güvenlik duvarı kuralları: ensure_firewall_rule. Kuralları değiştirirseniz işaretteki "v2"yi "v3" yapın ki
+   program kuralları yeniden kursun.
+Alıcının davranışı (gizleme süresi, ağ değişimi, yeniden bağlanma süresi): receiver\receiver.c'nin sonundaki
+   döngü ve baştaki sabitler (HIDE_AFTER_NS, RECONNECT_GRACE_NS).
+UxPlay'i yenilemek: receiver\uxplay\lib'i yeni sürümle değiştirin, "RELIOS:" işaretli değişiklikleri yeniden
+   uygulayın, UPSTREAM.txt'yi güncelleyin, sınamayı çalıştırın.
+
+
+7. SINAMA
+Alıcı (cihaz gerekmez; Linux / WSL):
+   python3 tests/receiver_test.py build-alici/relios-airplay-receiver /tmp/alici-sinama
+   Sonunda "0 failure(s)" yazmalı. Kimin bağlanabildiğini ve eşleşmeden önce neyin yanıtlandığını sınar.
+Program (elle; her yeni sürümde):
+   - ilk açılış ve yönetici onayı; kodla eşleştirme; kapatıp açınca kodsuz yeniden bağlanma
+   - kayıt (ekran kartı / işlemci; MOV, MP4, MKV), ekran görüntüsü, ses, ses çıkışı seçimi
+   - sanal kamera (Discord'da görünmesi ve görüntü vermesi)
+   - Bağlıyken Listeden Gizle: 10 sn sonra başka bir cihazın listesinden kaybolması; yansıtmanın sürmesi
+   - bilgisayarı uyutup uyandırdıktan sonra bağlanma; Windows ile başlatma; ikinci kopyayı açma
+   - Varsayılan Ayarlara Dön
+
+
+8. BİLİNEN SINIRLAR VE AÇIK İŞLER
+- Bu sürümün son değişiklikleri (yeni ayar paneli, gizleme seçeneği, ağ / uyku yenilenmesi, ikinci kopya
+  denetimi) yazılırken program Windows'ta ve Apple cihazında denenemedi; derleme ve alıcı sınaması dışındaki
+  doğrulama kullanıcı denemelerine dayanır.
+- Bağlıyken Listeden Gizle cihaza bağlıdır: Apple cihazı, ad ağdan çekilince yansıtmayı kesebilir. Program
+  yalnızca gizlemeden sonraki 20 saniyedeki kesilmeyi yakalayıp seçeneği kapatır.
+- Ağ aniden koparsa alıcı ölü bağlantıyı 60 saniyeye kadar açık sayar (uxplay\lib\httpd.c); bu sürede aynı
+  cihazın yeniden bağlanması reddedilebilir.
+- Ağ duyurusu tek bir ağ bağdaştırıcısının adresini taşır: ağ geçidi olan ilk bağdaştırıcı
+  (uxplay\lib\mdnsd\mdnsd.c, mdns_get_default_ipv4). VPN'li ya da çok bağdaştırıcılı bilgisayarda yanlış adres
+  seçilebilir. Yalnızca IPv4.
+- Windows'ta iki alıcı aynı portu dinleyebilir (uxplay\lib\netutils.c, SO_REUSEADDR). Program bunu açılışta
+  öteki kopyayı kapatarak önler; kökten çözüm o seçeneğin Windows'ta kaldırılmasıdır.
+- Tek dosyalık başlatıcı yarıda kalmış bir açma işlemini fark etmez (çare: %LOCALAPPDATA%\ReliosMirror\app-...
+  klasörünü silip yeniden açmak) ve eski sürümlerin klasörlerini silmez.
+- Otomatik güncelleme yoktur (bilerek: program internete çıkmaz).
+- exe imzalı değildir; Windows SmartScreen ilk açılışta uyarabilir. İmza için kod imzalama sertifikası gerekir.
+- MSYS2 paketleri sürekli yenilenir. İleride FFmpeg ya da SDL değişir ve derleme bozulursa,
+  derleme-ortami.txt çalışan sürümleri gösterir; elinizdeki ReliosMirror-klasor.zip de çalışan DLL'leri içerir.
+
+
+9. DAĞITIRKEN
+Program GPL-3.0 lisanslıdır: exe'yi başkasına verirken kaynak kodunu da verin (sürüm sayfasında ikisi
+birlikte durur). Pakete giren FFmpeg, SDL2, OpenSSL ve softcam kendi lisanslarıyla gelir (BENIOKU.txt, LİSANS).

@@ -50,6 +50,7 @@
 
 #include "protocol.h"
 #include "proc.h"
+#include "version.h"
 
 #define APP_NAME "Relios Mirror"
 #define RECEIVER_NAME "Relios Mirror" /* what the iPad shows in Screen Mirroring */
@@ -2405,7 +2406,7 @@ static const char *build_settings(void)
 		toggle("Windows İle Başlat", CMD_AUTOSTART, autostart_get());
 		toggle("Pencere Her Zaman Üstte", CMD_ONTOP, A.on_top);
 		action("Varsayılan Ayarlara Dön (İlk Açılış Gibi)", CMD_RESET, "Sıfırla");
-		note = "Sıfırlama ayarları ve eşleşmiş cihazları siler; önce onay ister.";
+		note = "Sürüm " APP_VERSION "  •  Sıfırlama, ayarları ve eşleşmiş cihazları siler; önce onay ister.";
 	} else {
 		int paired = 0;
 		const char *names = paired_names(&paired);
@@ -3414,7 +3415,7 @@ int main(int argc, char *argv[])
 	remove("log-onceki.txt"); /* (the log of the run before is kept: what went wrong can be looked up) */
 	rename("log.txt", "log-onceki.txt");
 	log_file = fopen("log.txt", "w");
-	app_log("Relios Mirror started; receiver: %s", A.exe);
+	app_log("Relios Mirror %s started; receiver: %s", APP_VERSION, A.exe);
 	av_log_set_level(AV_LOG_ERROR);
 	load_settings();
 	find_video_folder();

@@ -91,7 +91,8 @@ EXE'Yİ DERLEMEK (kaynak koddan)
 A) GitHub ile (bilgisayara bir şey kurmadan):
    1. github.com'da bir depo açın, bu klasörün tamamını (.github klasörü dahil) yükleyin.
    2. Depoda Actions > "Windows exe" > en son çalışma bitince "ReliosMirror-tek-exe"yi (tek dosya) ya da
-      "ReliosMirror-windows"u (klasör) indirin.
+      "ReliosMirror-windows"u (klasör) indirin. (Bu çıktılar 90 gün sonra silinir; kalıcı dosyalar Releases
+      sayfasındadır.)
 B) Bilgisayarda:
    1. https://www.msys2.org adresinden MSYS2'yi kurun (C:\msys64).
    2. derle.bat'a çift tıklayın. Sonuç: dist\ReliosMirror klasörü ve dist\tek-exe\ReliosMirror.exe.
@@ -102,8 +103,11 @@ KAYNAK KODUN DÜZENİ
 viewer\main.c        pencere: görüntü / ses çözme (FFmpeg), gösterme ve çalma (SDL2), kayıt, ayarlar, sanal kamera
 viewer\proc_win.c    alıcıyı düşük yetkiyle ve iş nesnesi içinde başlatır
 viewer\launcher.c    tek dosyalık sürümün başlatıcısı
+viewer\version.h     sürüm numarası
 receiver\receiver.c  AirPlay alıcısı (ağ tarafı); receiver\uxplay: UxPlay kitaplığı; receiver\libplist
+tests\               alıcının sınaması
 paketle.sh, derle.bat, .github\workflows\windows.yml   derleme
+Programı değiştirmek, derlemek ve yeni sürüm çıkarmak için: GELISTIRME.txt
 
 
 LİSANS
