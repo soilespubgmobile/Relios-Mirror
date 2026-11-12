@@ -31,3 +31,7 @@ jobs:
         with:
           name: ReliosMirror-windows
           path: dist/ReliosMirror
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReliosMirror-tek-exe
+          path: dist/tek-exe

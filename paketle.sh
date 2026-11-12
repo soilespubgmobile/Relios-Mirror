@@ -29,5 +29,13 @@ if [ -f "$prefix/bin/SDL3.dll" ]; then
 fi
 
 cp BENIOKU.txt LICENSE guvenlik-duvari-izni.bat assets/logo.bmp "$out/"
+# the one-file version: the launcher + the folder as .tgz + "RLSM" + size (16 hex digits) + build stamp (14 digits)
+mkdir -p dist/tek-exe
+tar -czf build/payload.tgz -C "$out" .
+single=dist/tek-exe/ReliosMirror.exe
+cat build/bin/launcher.exe build/payload.tgz > "$single"
+printf 'RLSM%016x%s' "$(stat -c %s build/payload.tgz)" "$(date +%Y%m%d%H%M%S)" >> "$single"
+echo "Tek dosya: $single ($(du -sh "$single" | cut -f1))"
+
 echo
 echo "Hazir: $out ($(ls "$out" | wc -l) dosya, $(du -sh "$out" | cut -f1))"
