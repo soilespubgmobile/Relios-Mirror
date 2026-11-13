@@ -27,8 +27,9 @@ if(WIN32)
   add_executable(ReliosMirror WIN32 viewer/main.c viewer/proc_win.c viewer/proc.h viewer/version.h viewer/app.rc
                  viewer/qtproto.c viewer/qtproto.h viewer/usbqt.c viewer/usbqt.h)
   set_source_files_properties(viewer/app.rc PROPERTIES COMPILE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/viewer")
-  # (setupapi, cfgmgr32: the USB driver and the device list for wired mirroring)
-  target_link_libraries(ReliosMirror PRIVATE bcrypt advapi32 shell32 user32 ole32 setupapi cfgmgr32)
+  # (cfgmgr32, setupapi: the device list and the USB driver for wired mirroring; cfgmgr32 first, so that the CM_
+  # functions come from the DLL that documents them)
+  target_link_libraries(ReliosMirror PRIVATE bcrypt advapi32 shell32 user32 ole32 cfgmgr32 setupapi)
   # the one-file version: carries the whole folder and unpacks it at the first start (see paketle.sh)
   add_executable(launcher WIN32 viewer/launcher.c viewer/app.rc)
   target_link_options(launcher PRIVATE -static)
