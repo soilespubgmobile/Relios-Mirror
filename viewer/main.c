@@ -4031,8 +4031,8 @@ int main(int argc, char *argv[])
 				redraw = true;
 			if (A.usb_on && !usbqt_running())
 				usb_start(); /* (switched on while the previous run was still ending) */
-			static unsigned seconds;
-			if (++seconds % 15 == 0)
+			static unsigned network_ticks;
+			if (++network_ticks % 15 == 0)
 				check_network();
 		}
 		if (A.camera_arming) {
