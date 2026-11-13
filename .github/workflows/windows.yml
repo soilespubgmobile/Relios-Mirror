@@ -64,6 +64,50 @@ jobs:
           & $msbuild softcam\src\softcam\softcam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=$root /m /v:minimal /nologo
           if ($LASTEXITCODE -ne 0) { throw 'softcam: the build failed' }
           Get-ChildItem softcam\dist -Recurse -Filter softcam.dll | ForEach-Object { Write-Host "built: $($_.FullName) ($($_.Length) bytes)" }
+      # The USB protocol of wired mirroring, tested with messages captured from real devices (tests/fixtures/qvh).
+      - name: Test the USB protocol
+        run: |
+          gcc -std=c11 -O1 -Wall -Wextra -Iviewer tests/qtproto_test.c viewer/qtproto.c -o qtproto_test.exe
+          ./qtproto_test.exe tests/fixtures/qvh
+      # The USB driver for wired mirroring: libusb-win32 1.2.6.0, its official release on SourceForge. The two files
+      # the program installs must have these SHA-256 fingerprints (the program checks the same ones again before it
+      # installs them), or the build stops. Nothing downloaded here is run.
+      - name: Fetch the USB driver (libusb-win32 1.2.6.0, fixed fingerprints)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://downloads.sourceforge.net/project/libusb-win32/libusb-win32-releases/1.2.6.0'
+          New-Item -ItemType Directory -Force libusb-dl, libusb-dl/bin, usb, dist-usb-kaynak | Out-Null
+          foreach ($name in 'libusb-win32-bin-1.2.6.0.zip', 'libusb-win32-src-1.2.6.0.zip') {
+            & curl.exe -fsSL --retry 6 --retry-delay 10 --retry-all-errors -A 'Wget/1.21' -o "libusb-dl/$name" "$base/$name"
+            if ($LASTEXITCODE -ne 0) { throw "libusb-win32: $name could not be downloaded" }
+            Write-Host "$name : $((Get-FileHash "libusb-dl/$name" -Algorithm SHA256).Hash)"
+          }
+          Expand-Archive libusb-dl/libusb-win32-bin-1.2.6.0.zip -DestinationPath libusb-dl/bin
+          $expected = @{
+            'libusb0.sys' = '8058F2AFE6EF96A7D2DED432997FD8655970C9EA75A938EE4557D6A2CB4CC989'
+            'libusb0.dll' = '4F18B5D2C28AA66B648C8683C6D09B52B92CBBEE85984BBEFAD5F38A64BC2A14'
+          }
+          foreach ($file in $expected.Keys) {
+            $found = @(Get-ChildItem libusb-dl/bin -Recurse -Filter $file | Where-Object { $_.Directory.Name -eq 'amd64' })
+            if ($found.Count -ne 1) { throw "libusb-win32: amd64\$file not found exactly once" }
+            $hash = (Get-FileHash $found[0].FullName -Algorithm SHA256).Hash
+            if ($hash -ne $expected[$file]) { throw "libusb-win32: $file has the fingerprint $hash, not the expected one" }
+            $sig = Get-AuthenticodeSignature $found[0].FullName
+            Write-Host "$file : SHA-256 as expected; signature $($sig.Status), $($sig.SignerCertificate.Subject)"
+            Copy-Item $found[0].FullName usb/
+          }
+          foreach ($doc in 'COPYING_LGPL.txt', 'COPYING_GPL.txt', 'AUTHORS.txt', 'README.txt') {
+            $p = Get-ChildItem libusb-dl/bin -Recurse -Filter $doc | Select-Object -First 1
+            if ($p) { Copy-Item $p.FullName "usb/libusb-win32-$doc" } else { Write-Host "::warning::libusb-win32: $doc not in the archive" }
+          }
+          # (its source, for the release: the library is LGPL and the driver GPL)
+          $src = (Get-FileHash libusb-dl/libusb-win32-src-1.2.6.0.zip -Algorithm SHA256).Hash
+          if ($src -eq 'F3FAF094C9B3415EDE42EEB5032FEDA2E71945F13F0CA3DA58CA10DCB439BFEE') {
+            Copy-Item libusb-dl/libusb-win32-src-1.2.6.0.zip dist-usb-kaynak/
+          } else {
+            Write-Host "::warning::libusb-win32: the source archive's fingerprint $src is not the expected one; it is not attached"
+          }
       - name: Build and gather
         run: bash paketle.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -107,6 +151,12 @@ jobs:
           name: ReliosMirror-sanal-kamera-kaynak
           path: dist/kamera-kaynak
           if-no-files-found: warn
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        continue-on-error: true
+        with:
+          name: ReliosMirror-usb-surucu-kaynak
+          path: dist-usb-kaynak
+          if-no-files-found: warn
       # What this build was made with (the packages are a rolling distribution: a later build gets newer ones).
       - name: Record the build environment
         continue-on-error: true
@@ -117,6 +167,7 @@ jobs:
             echo "commit: $GITHUB_SHA ($GITHUB_REF_NAME)"
             echo "runner: ${ImageOS:-?} ${ImageVersion:-?}"
             echo "softcam: d1acde4617782f87a3929d7a7528fa3e524ec56b (https://github.com/tshino/softcam)"
+            echo "libusb-win32: 1.2.6.0 (SourceForge), libusb0.sys 8058f2af..., libusb0.dll 4f18b5d2..."
             gcc --version | head -1
             cmake --version | head -1
             echo
@@ -172,6 +223,7 @@ jobs:
           cp -r parts/ReliosMirror-kaynak-kod/. pack/Relios-Mirror-kaynak-kod/
           (cd pack && zip -qr ../out/Relios-Mirror-kaynak-kod.zip Relios-Mirror-kaynak-kod)
           if [ -d parts/ReliosMirror-sanal-kamera-kaynak ]; then cp parts/ReliosMirror-sanal-kamera-kaynak/*.zip out/; fi
+          if [ -d parts/ReliosMirror-usb-surucu-kaynak ]; then cp parts/ReliosMirror-usb-surucu-kaynak/*.zip out/ || true; fi
           if [ -d parts/ReliosMirror-derleme-ortami ]; then cp parts/ReliosMirror-derleme-ortami/*.txt out/; fi
           (cd out && sha256sum -- * > ../SHA256SUMS.txt && mv ../SHA256SUMS.txt . && cat SHA256SUMS.txt)
           {
@@ -181,6 +233,7 @@ jobs:
             echo "- **ReliosMirror-klasor.zip**: ayni program, klasor halinde (butun DLL'leriyle)."
             echo "- **Relios-Mirror-kaynak-kod.zip**: bu surumun kaynak kodu (BENIOKU.txt ve GELISTIRME.txt icinde)."
             echo "- **softcam-d1acde4-kaynak.zip**: sanal kameranin kaynagi (softcam, MIT)."
+            echo "- **libusb-win32-src-1.2.6.0.zip**: kablolu yansitmanin USB surucusunun kaynagi (libusb-win32; LGPL / GPL)."
             echo "- **derleme-ortami.txt**: bu surumun derlendigi arac ve kitaplik surumleri."
             echo "- **SHA256SUMS.txt**: dosyalarin SHA-256 ozetleri. Dogrulamak icin (PowerShell): \`Get-FileHash ReliosMirror.exe\`"
           } > notes.md

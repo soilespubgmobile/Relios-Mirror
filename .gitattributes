@@ -4,3 +4,6 @@
 *.bat text eol=crlf
 *.ico binary
 *.bmp binary
+# test messages captured from devices (tests/fixtures): bytes, never changed
+tests/fixtures/** binary
+tests/fixtures/**/*.txt text eol=lf

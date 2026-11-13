@@ -42,6 +42,18 @@ if [ -n "$cam" ]; then
 else
 	echo "Sanal kamera: softcam.dll YOK"
 fi
+# the USB driver for wired mirroring (libusb-win32 1.2.6.0: fetched and checked by the workflow's "USB driver" step).
+# The program only installs it when "Kur" is pressed, after checking the files' SHA-256 fingerprints again; nothing
+# in this folder is ever loaded by the program itself.
+if [ -f usb/libusb0.sys ] && [ -f usb/libusb0.dll ]; then
+	mkdir -p "$out/usb"
+	cp usb/* "$out/usb/"
+	cp assets/usb-BENIOKU.txt "$out/usb/BENIOKU-USB.txt"
+	echo "USB surucusu: $(cd "$out/usb" && ls | tr '\n' ' ')"
+	(cd "$out/usb" && sha256sum libusb0.sys libusb0.dll)
+else
+	echo "USB surucusu: YOK (kablolu yansitmanin surucusu bu derlemede kurulamaz)"
+fi
 # the one-file version: the launcher + the folder as .tgz + "RLSM" + size (16 hex digits) + build stamp (14 digits)
 mkdir -p dist/tek-exe
 tar -czf build/payload.tgz -C "$out" .

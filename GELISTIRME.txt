@@ -11,19 +11,24 @@ Sürüm sayfasındaki (GitHub > Releases) dosyaların hepsini indirip saklayın:
   Relios-Mirror-kaynak-kod.zip    bu sürümün kaynak kodunun tamamı (bu dosya dahil)
   softcam-d1acde4-kaynak.zip      sanal kameranın kaynağı (softcam, MIT). Derleme onu GitHub'dan alır; o depo
                                   bir gün kaybolursa bu yedek kullanılır.
+  libusb-win32-src-1.2.6.0.zip    kablolu yansıtmanın USB sürücüsünün kaynağı (libusb-win32; sürücü GPL,
+                                  kitaplık LGPL). Sürücünün kendisi ReliosMirror-klasor.zip içinde, usb klasöründe.
   derleme-ortami.txt              bu sürümün derlendiği araçların ve kitaplıkların sürümleri
   SHA256SUMS.txt                  dosyaların SHA-256 özetleri
 
 Kaynak kodun asıl yeri GitHub deposudur: https://github.com/soilespubgmobile/Relios-Mirror
 Bunların dışında, derlemek için internetten alınanlar: MSYS2 paketleri (FFmpeg, SDL2, SDL2_ttf, OpenSSL, GCC,
-CMake) ve Visual Studio derleme araçları (yalnızca sanal kamera için). Program çalışırken hiçbir şey indirmez.
+CMake), Visual Studio derleme araçları (yalnızca sanal kamera için) ve libusb-win32 1.2.6.0'ın resmi sürümü
+(SourceForge; yalnızca kablolu yansıtmanın sürücüsü için, sabit SHA-256 parmak izleriyle denetlenir).
+Program çalışırken hiçbir şey indirmez.
 
 
 2. DERLEMEK
 A) GitHub ile (önerilen; bilgisayara bir şey kurulmaz)
    Depoya her gönderimde (push) Actions > "Windows exe" çalışır ve şunları üretir:
    ReliosMirror-tek-exe, ReliosMirror-windows, ReliosMirror-kaynak-kod, ReliosMirror-sanal-kamera-kaynak,
-   ReliosMirror-derleme-ortami. Bu çıktılar 90 gün sonra silinir; kalıcı olan sürüm sayfasıdır (bkz. 3).
+   ReliosMirror-usb-surucu-kaynak, ReliosMirror-derleme-ortami. Bu çıktılar 90 gün sonra silinir; kalıcı olan
+   sürüm sayfasıdır (bkz. 3). USB protokolünün sınaması da her derlemede çalışır; başarısızsa derleme durur.
    Elle başlatmak için: Actions > "Windows exe" > "Run workflow".
    Tarif: .github/workflows/windows.yml
 
@@ -38,6 +43,9 @@ B) Windows'ta, kendi bilgisayarınızda
       softcam\dist\bin\x64\softcam.dll varsa paketle.sh onu pakete koyar; yoksa program kamerasız derlenir.
       Kolay yol (kamerada değişiklik yoksa): son sürümün klasöründeki softcam.dll'i derlemeden önce
       softcam\dist\bin\x64\ içine, softcam-LICENSE.txt'yi de softcam\LICENSE adıyla koymak.
+   4. USB sürücüsü: son sürümün klasöründeki usb klasörünü (libusb0.sys, libusb0.dll ve yanındaki metinler)
+      derlemeden önce depo klasörünün içine "usb" adıyla koyun; paketle.sh onu pakete ekler. Yoksa program
+      sürücüsüz derlenir (kablolu yansıtmanın sürücüsü kurulamaz). Parmak izleri: assets\usb-BENIOKU.txt.
 
 C) Linux / WSL'de yalnızca alıcı (sınama için)
      cmake -S receiver -B build-alici -DCMAKE_BUILD_TYPE=Release
@@ -70,14 +78,24 @@ viewer\main.c         Programın tamamı (tek dosya). Bölümler, dosyadaki sır
                       - kayıt: rec_* (rec_open_locked kodlayıcıyı seçer; rec_thread ayrı iş parçacığıdır)
                       - ekran görüntüsü: save_png
                       - sanal kamera: camera_start / camera_send / camera_stop; install_camera / remove_camera
-                      - görüntü: open_video_decoder, handle_video, present_frame
-                      - ses: open_audio_decoder, open_audio_output, handle_audio
+                      - görüntü: open_video_decoder, decode_video (alıcıdan ve kablodan), handle_video,
+                        present_frame
+                      - ses: open_audio_decoder, open_audio_output, play_audio, handle_audio
+                      - kablolu yansıtma: usb_video, usb_audio (48 kHz → 44,1 kHz), usb_state, usb_start;
+                        usb_driver (sürücüyü kurdurur / kaldırtır)
                       - alıcıyla konuşma: session_start (başlatır, komutları yazar), out_thread (mesajları
                         okur), handle_status, handle_pin, hide_check, session_stop
                       - arayüz: build_settings (Ayarlar'daki satırlar), draw_bar, draw_button, draw,
                         button_at; run_command (her düğmenin yaptığı iş); key_command (tuşlar)
                       - Windows: ensure_firewall_rule, autostart_get / autostart_set, other_copies
                       - main: açılış sırası ve olay döngüsü
+viewer\usbqt.c        Kablolu yansıtma (Windows): iPad'i libusb0 ile bulur, "--usb-switch" yardımcısıyla ekran kaydı
+                      yapılandırmasına geçirir ve geri verir, akışı okuyup qtproto.c'ye verir. Sürücü kurucusu
+                      (usbqt_driver_main, "--usb-driver install|remove <aygıt>", yönetici onayıyla) da buradadır:
+                      parmak izi denetimi, hizmet, iPad'in UpperFilters değeri, yeniden başlatma ve geri alma.
+                      Sıra iPhoneMirror'dan (GPL-3.0-only) uyarlanmıştır; ayrıntılar dosyanın başında.
+viewer\qtproto.c      USB protokolü (QuickTime ekran kaydı: PING / SYNC / ASYN / RPLY, CMSampleBuffer). Platformdan
+                      bağımsızdır; quicktime_video_hack'e (MIT) dayanır.
 viewer\proc_win.c     Alıcıyı düşük yetkiyle (low integrity) ve bir iş nesnesi içinde başlatır.
 viewer\launcher.c     Tek dosyalık sürümün başlatıcısı. paketle.sh, bu exe'nin sonuna paketi ekler:
                       payload.tgz + "RLSM" + 16 haneli boyut + 14 haneli tarih damgası.
@@ -87,7 +105,8 @@ receiver\protocol.h   Alıcı ile program arasındaki mesajlar.
 receiver\uxplay       UxPlay'in AirPlay kitaplığı (hangi sürüm: UPSTREAM.txt). Yapılan değişiklikler "RELIOS:"
                       diye işaretlidir:   grep -rn "RELIOS" receiver/uxplay
 receiver\libplist     libplist (olduğu gibi).
-tests\                receiver_test.py: alıcının cihazsız sınaması.
+tests\                receiver_test.py: alıcının cihazsız sınaması. qtproto_test.c: USB protokolünün sınaması
+                      (tests\fixtures\qvh: quicktime_video_hack'in gerçek cihaz kayıtları, MIT).
 paketle.sh            Derler, DLL'leri toplar, tek dosyayı yapar.   derle.bat: bunu MSYS2 ile çalıştırır.
 
 
@@ -130,6 +149,11 @@ UxPlay'i yenilemek: receiver\uxplay\lib'i yeni sürümle değiştirin, "RELIOS:"
 Alıcı (cihaz gerekmez; Linux / WSL):
    python3 tests/receiver_test.py build-alici/relios-airplay-receiver /tmp/alici-sinama
    Sonunda "0 failure(s)" yazmalı. Kimin bağlanabildiğini ve eşleşmeden önce neyin yanıtlandığını sınar.
+USB protokolü (cihaz gerekmez; Linux / WSL ya da MSYS2):
+   gcc -std=c11 -Wall -Wextra -Iviewer tests/qtproto_test.c viewer/qtproto.c -o qtproto_test
+   ./qtproto_test tests/fixtures/qvh
+   Sonunda "0 failure(s)" yazmalı. Cihazın isteklerine verilen yanıtları bayt bayt, görüntü ve sesin çıkışını
+   ve bozuk girdiye dayanıklılığı sınar.
 Program (elle; her yeni sürümde):
    - ilk açılış ve yönetici onayı; kodla eşleştirme; kapatıp açınca kodsuz yeniden bağlanma
    - kayıt (ekran kartı / işlemci; MOV, MP4, MKV), ekran görüntüsü, ses, ses çıkışı seçimi
@@ -137,6 +161,8 @@ Program (elle; her yeni sürümde):
    - Bağlıyken Listeden Gizle: 10 sn sonra başka bir cihazın listesinden kaybolması; yansıtmanın sürmesi
    - bilgisayarı uyutup uyandırdıktan sonra bağlanma; Windows ile başlatma; ikinci kopyayı açma
    - Varsayılan Ayarlara Dön
+   - kablolu yansıtma: sürücüyü kurma, iPad'i yeniden takınca görüntü ve ses, kayıt, kabloyu çekip takma,
+     programı kapatınca Apple Aygıtları'nın iPad'i yeniden görmesi, sürücüyü kaldırma
 
 
 8. BİLİNEN SINIRLAR VE AÇIK İŞLER
@@ -154,6 +180,13 @@ Program (elle; her yeni sürümde):
   öteki kopyayı kapatarak önler; kökten çözüm o seçeneğin Windows'ta kaldırılmasıdır.
 - Tek dosyalık başlatıcı yarıda kalmış bir açma işlemini fark etmez (çare: %LOCALAPPDATA%\ReliosMirror\app-...
   klasörünü silip yeniden açmak) ve eski sürümlerin klasörlerini silmez.
+- Kablolu yansıtma bu sürümde gerçek bir cihazda denenmeden yazıldı (protokol, gerçek cihaz kayıtlarıyla
+  sınanmıştır). Bilinen riskler: Windows "Bellek bütünlüğü" açıkken eski libusb0 sürücüsünü yüklemeyebilir
+  (kurucu bunu görür ve geri alır); iPad'in kablolu modda ekran boyutu bilinmediği için cihaza 1640x2360
+  bildirilir (qt_options, usbqt.c'deki stream işlevi); iPad'in yönü değişince gelen işaretler yalnızca
+  günlüğe yazılır. Sorunlar log.txt'deki "USB:" satırlarından izlenir.
+- USB sürücüsü kaldırılınca libusb0 hizmeti ve System32'deki iki dosya yerinde kalır (filtresi olan bir cihaz
+  olmadan yüklenmez). Bilerek: başka programlar da kullanıyor olabilir.
 - Otomatik güncelleme yoktur (bilerek: program internete çıkmaz).
 - exe imzalı değildir; Windows SmartScreen ilk açılışta uyarabilir. İmza için kod imzalama sertifikası gerekir.
 - MSYS2 paketleri sürekli yenilenir. İleride FFmpeg ya da SDL değişir ve derleme bozulursa,
@@ -162,4 +195,6 @@ Program (elle; her yeni sürümde):
 
 9. DAĞITIRKEN
 Program GPL-3.0 lisanslıdır: exe'yi başkasına verirken kaynak kodunu da verin (sürüm sayfasında ikisi
-birlikte durur). Pakete giren FFmpeg, SDL2, OpenSSL ve softcam kendi lisanslarıyla gelir (BENIOKU.txt, LİSANS).
+birlikte durur). Pakete giren FFmpeg, SDL2, OpenSSL, softcam ve libusb-win32 kendi lisanslarıyla gelir
+(BENIOKU.txt, LİSANS; usb klasöründeki metinler). viewer\usbqt.c iPhoneMirror'ın (GPL-3.0-only) sırasını
+uyarladığı için programın tamamı GPL-3.0 koşullarıyla dağıtılır.

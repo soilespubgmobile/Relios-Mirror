@@ -50,6 +50,7 @@
 
 #include "protocol.h"
 #include "proc.h"
+#include "usbqt.h"
 #include "version.h"
 
 #define APP_NAME "Relios Mirror"
@@ -110,6 +111,8 @@ enum {
 	CMD_VISIBLE,
 	CMD_RESET,
 	CMD_VCAM_REMOVE,
+	CMD_USB,
+	CMD_USB_DRIVER,
 };
 
 static struct {
@@ -141,6 +144,7 @@ static struct {
 	bool visible;        /* announced on the network (in the Apple device's Screen Mirroring list) */
 	bool hide_connected; /* the name leaves the Screen Mirroring lists while a paired device is mirroring */
 	bool keep_awake;     /* the screen is kept on (while something is mirrored) */
+	bool usb_on;         /* wired (USB) mirroring is switched on (usbqt.c); Wi-Fi stays on as well */
 	char custom_folder[1024]; /* where recordings go, if chosen */
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
 	bool rec_gpu;   /* record with the graphics card's encoder */
@@ -184,9 +188,12 @@ static struct {
 	int generation;    /* of the receiver: an "ended" from an earlier one is ignored */
 	char exe[2048];
 
-	/* audio output (reading thread) */
+	/* audio output (the reading thread's and the USB thread's: under media_mutex, as are their decoders) */
+	SDL_mutex *media_mutex;
 	SDL_AudioDeviceID adev;
 	int arate, ach;
+	SDL_atomic_t usb_state; /* enum usbqt_state */
+	char usb_format[64];    /* the cable's picture, e.g. "1640x2360 H.264" (under mutex) */
 
 	char video_folder[1024];
 
@@ -319,8 +326,9 @@ static void system_program(const char *name, char *out, size_t size)
 	snprintf(out, size, "%s\\%s", dir8, name);
 }
 
-/* runs a program with administrator rights (Windows asks the user: UAC) and waits; its exit code, or -1 */
-static int run_elevated(const char *program_utf8, const char *args_utf8)
+/* runs a program with administrator rights (Windows asks the user: UAC) and waits (at most wait_ms); its exit code,
+ * or -1 (refused, or it did not start) */
+static int run_elevated_wait(const char *program_utf8, const char *args_utf8, DWORD wait_ms)
 {
 	wchar_t *program = to_wide(program_utf8), *args = to_wide(args_utf8);
 	wchar_t dir[MAX_PATH] = L"";
@@ -338,7 +346,7 @@ static int run_elevated(const char *program_utf8, const char *args_utf8)
 		info.nShow = SW_HIDE;
 		if (ShellExecuteExW(&info) && info.hProcess) {
 			DWORD exit_code = 1;
-			WaitForSingleObject(info.hProcess, 30000);
+			WaitForSingleObject(info.hProcess, wait_ms);
 			if (GetExitCodeProcess(info.hProcess, &exit_code))
 				code = (int)exit_code;
 			CloseHandle(info.hProcess);
@@ -347,6 +355,11 @@ static int run_elevated(const char *program_utf8, const char *args_utf8)
 	free(program);
 	free(args);
 	return code;
+}
+
+static int run_elevated(const char *program_utf8, const char *args_utf8)
+{
+	return run_elevated_wait(program_utf8, args_utf8, 30000);
 }
 #endif
 
@@ -509,6 +522,7 @@ static void load_settings(void)
 	A.rec_mode = 0;
 	A.rec_kbit = 15000;
 	A.hw_decode = true;
+	A.usb_on = false;
 	SDL_AtomicSet(&A.volume, 100);
 	SDL_AtomicSet(&A.muted, 0);
 	FILE *f = fopen("ayarlar.txt", "r");
@@ -547,6 +561,8 @@ static void load_settings(void)
 			A.res_auto = a != 0;
 		} else if (sscanf(line, "bagliyken_gizle=%d", &a) == 1) {
 			A.hide_connected = a != 0;
+		} else if (sscanf(line, "usb_kablolu=%d", &a) == 1) {
+			A.usb_on = a != 0;
 		} else if (!strncmp(line, "kayit_klasoru=", 14)) {
 			snprintf(A.custom_folder, sizeof(A.custom_folder), "%s", line + 14);
 			A.custom_folder[strcspn(A.custom_folder, "\r\n")] = '\0';
@@ -603,7 +619,7 @@ static void save_settings(void)
 	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=5\n", A.audio_device,
 		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
 		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
-	fprintf(f, "sanal_kamera=%d\n", A.camera_saved ? 1 : 0);
+	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\n", A.camera_saved ? 1 : 0, A.usb_on ? 1 : 0);
 	fclose(f);
 }
 
@@ -1466,21 +1482,16 @@ static void present_frame(struct decoder *d, const AVFrame *f, bool full, bool b
 		push_event(EV_FRAME);
 }
 
-static void handle_video(struct decoder *d, const uint8_t *payload, size_t len)
+/* one compressed picture (Annex B, followed by AV_INPUT_BUFFER_PADDING_SIZE zero bytes) to the window, the
+ * recording and the virtual camera: from the receiver or from the cable */
+static void decode_video(struct decoder *d, const uint8_t *data, size_t data_len, bool h265)
 {
-	if (len <= sizeof(struct ra_video_header))
-		return;
-	struct ra_video_header h;
-	memcpy(&h, payload, sizeof(h));
-	const uint8_t *data = payload + sizeof(h);
-	size_t data_len = len - sizeof(h);
-
 	SDL_LockMutex(A.mutex);
 	A.win_bytes += data_len;
 	A.win_frames++;
 	SDL_UnlockMutex(A.mutex);
 
-	if (!open_video_decoder(d, h.is_h265 != 0))
+	if (data_len > 0x7fffffff || !open_video_decoder(d, h265))
 		return;
 	d->pkt->data = (uint8_t *)data;
 	d->pkt->size = (int)data_len;
@@ -1513,6 +1524,15 @@ static void handle_video(struct decoder *d, const uint8_t *payload, size_t len)
 		av_frame_unref(d->frame);
 		av_frame_unref(d->sw);
 	}
+}
+
+static void handle_video(struct decoder *d, const uint8_t *payload, size_t len)
+{
+	if (len <= sizeof(struct ra_video_header))
+		return;
+	struct ra_video_header h;
+	memcpy(&h, payload, sizeof(h));
+	decode_video(d, payload + sizeof(h), len - sizeof(h), h.is_h265 != 0);
 }
 
 static bool open_audio_decoder(struct decoder *d, int ct)
@@ -1586,6 +1606,28 @@ static bool open_audio_output(int rate, int channels)
 	return true;
 }
 
+/* interleaved float sound to the recording and to the sound output (the volume is applied to it here) */
+static void play_audio(float *mix, int frames, int rate, int ch)
+{
+	size_t count = (size_t)frames * (size_t)ch;
+	rec_queue_audio(mix, frames, rate, ch);
+
+	float gain = SDL_AtomicGet(&A.muted) ? 0.0f : (float)SDL_AtomicGet(&A.volume) / 100.0f;
+	if (gain != 1.0f) {
+		for (size_t i = 0; i < count; i++) {
+			float v = mix[i] * gain;
+			mix[i] = v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v;
+		}
+	}
+	if (open_audio_output(rate, ch)) {
+		/* never more than ~0.15 s waiting to be played: what piled up is dropped */
+		Uint32 limit = (Uint32)(rate * ch * (int)sizeof(float) * 15 / 100);
+		if (SDL_GetQueuedAudioSize(A.adev) > limit)
+			SDL_ClearQueuedAudio(A.adev);
+		SDL_QueueAudio(A.adev, mix, (Uint32)(count * sizeof(float)));
+	}
+}
+
 static void handle_audio(struct decoder *d, const uint8_t *payload, size_t len)
 {
 	if (len <= sizeof(struct ra_audio_header))
@@ -1624,22 +1666,7 @@ static void handle_audio(struct decoder *d, const uint8_t *payload, size_t len)
 					for (int i = 0; i < n; i++)
 						d->mix[(size_t)i * (size_t)ch + (size_t)c] = src[i];
 				}
-				rec_queue_audio(d->mix, n, f->sample_rate, ch);
-
-				float gain = SDL_AtomicGet(&A.muted) ? 0.0f : (float)SDL_AtomicGet(&A.volume) / 100.0f;
-				if (gain != 1.0f) {
-					for (size_t i = 0; i < count; i++) {
-						float v = d->mix[i] * gain;
-						d->mix[i] = v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v;
-					}
-				}
-				if (open_audio_output(f->sample_rate, ch)) {
-					/* never more than ~0.15 s waiting to be played: what piled up is dropped */
-					Uint32 limit = (Uint32)(f->sample_rate * ch * (int)sizeof(float) * 15 / 100);
-					if (SDL_GetQueuedAudioSize(A.adev) > limit)
-						SDL_ClearQueuedAudio(A.adev);
-					SDL_QueueAudio(A.adev, d->mix, (Uint32)(count * sizeof(float)));
-				}
+				play_audio(d->mix, n, f->sample_rate, ch);
 			}
 		}
 		av_frame_unref(f);
@@ -1842,10 +1869,19 @@ static int out_thread(void *generation)
 			}
 			break;
 		case RA_MSG_VIDEO:
-			handle_video(&d, buf, len);
+			/* (while the cable mirrors, its picture and sound are the ones shown and played) */
+			if (!usbqt_streaming()) {
+				SDL_LockMutex(A.media_mutex);
+				handle_video(&d, buf, len);
+				SDL_UnlockMutex(A.media_mutex);
+			}
 			break;
 		case RA_MSG_AUDIO:
-			handle_audio(&d, buf, len);
+			if (!usbqt_streaming()) {
+				SDL_LockMutex(A.media_mutex);
+				handle_audio(&d, buf, len);
+				SDL_UnlockMutex(A.media_mutex);
+			}
 			break;
 		default:
 			break;
@@ -1861,11 +1897,14 @@ static int out_thread(void *generation)
 	av_frame_free(&d.frame);
 	av_frame_free(&d.sw);
 
-	/* the file ends with the session; recording stays switched on for the next one */
-	rec_queue_close();
+	/* the file ends with the session; recording stays switched on for the next one (unless the cable mirrors: its
+	 * picture and recording go on) */
+	bool wired = usbqt_streaming();
+	if (!wired)
+		rec_queue_close();
 	hide_check();
-
-	clear_picture();
+	if (!wired)
+		clear_picture();
 	SDL_LockMutex(A.mutex);
 	if (A.state != MIRROR_ERROR)
 		A.state = MIRROR_ENDED;
@@ -1901,6 +1940,151 @@ static int err_thread(void *unused)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ wired (USB) mirroring */
+
+/* what usbqt.c delivers, from its own thread */
+static struct {
+	struct decoder dec; /* (under A.media_mutex) */
+	bool dec_hw;
+	SDL_AudioStream *resample; /* the device's sound (16-bit, mostly 48 kHz) to float 44.1 kHz stereo, as AirPlay's */
+	int in_rate, in_ch;
+	float *buf;
+	size_t buf_cap;
+} UV;
+
+static void usb_video(const uint8_t *annexb, size_t len, bool h265, int width, int height)
+{
+	char format[64];
+	if (width > 0 && height > 0)
+		snprintf(format, sizeof(format), "%dx%d %s", width, height, h265 ? "H.265" : "H.264");
+	else
+		snprintf(format, sizeof(format), "%s", h265 ? "H.265" : "H.264");
+	SDL_LockMutex(A.mutex);
+	bool changed = strcmp(format, A.usb_format) != 0;
+	if (changed)
+		snprintf(A.usb_format, sizeof(A.usb_format), "%s", format);
+	SDL_UnlockMutex(A.mutex);
+	if (changed) {
+		app_log("USB video: %s", format);
+		push_event(EV_STATE);
+	}
+	SDL_LockMutex(A.media_mutex);
+	if (!UV.dec.pkt) {
+		UV.dec.pkt = av_packet_alloc();
+		UV.dec.frame = av_frame_alloc();
+		UV.dec.sw = av_frame_alloc();
+	}
+	if (UV.dec.vdec && UV.dec_hw != A.hw_decode)
+		avcodec_free_context(&UV.dec.vdec); /* (decoding was switched between the graphics card and the processor) */
+	UV.dec_hw = A.hw_decode;
+	if (UV.dec.pkt && UV.dec.frame && UV.dec.sw)
+		decode_video(&UV.dec, annexb, len, h265);
+	SDL_UnlockMutex(A.media_mutex);
+}
+
+static void usb_audio(const uint8_t *pcm, int frames, int channels, int rate)
+{
+	if (frames <= 0 || frames > 96000 || channels < 1 || channels > 2 || rate < 8000 || rate > 192000)
+		return;
+	SDL_LockMutex(A.media_mutex);
+	if (!UV.resample || UV.in_rate != rate || UV.in_ch != channels) {
+		if (UV.resample)
+			SDL_FreeAudioStream(UV.resample);
+		UV.resample = SDL_NewAudioStream(AUDIO_S16LSB, (Uint8)channels, rate, AUDIO_F32SYS, 2, 44100);
+		UV.in_rate = rate;
+		UV.in_ch = channels;
+		app_log("USB sound: %d Hz, %d channel(s)%s", rate, channels, UV.resample ? "" : "; it cannot be converted");
+	}
+	if (UV.resample && SDL_AudioStreamPut(UV.resample, pcm, frames * channels * 2) == 0) {
+		int bytes = SDL_AudioStreamAvailable(UV.resample);
+		size_t want = bytes > 0 ? (size_t)bytes / sizeof(float) + 16 : 0;
+		if (want > UV.buf_cap) {
+			float *bigger = realloc(UV.buf, want * sizeof(float));
+			if (bigger) {
+				UV.buf = bigger;
+				UV.buf_cap = want;
+			}
+		}
+		if (bytes > 0 && want <= UV.buf_cap) {
+			int got = SDL_AudioStreamGet(UV.resample, UV.buf, bytes);
+			int out = got > 0 ? got / (int)(2 * sizeof(float)) : 0;
+			if (out > 0)
+				play_audio(UV.buf, out, 44100, 2);
+		}
+	}
+	SDL_UnlockMutex(A.media_mutex);
+}
+
+static void usb_state(enum usbqt_state state)
+{
+	int before = SDL_AtomicSet(&A.usb_state, (int)state);
+	if (before == USBQT_STREAMING && state != USBQT_STREAMING) {
+		/* the cable's mirroring ended: as at the end of a session */
+		SDL_LockMutex(A.media_mutex);
+		rec_queue_close();
+		clear_picture();
+		if (UV.resample)
+			SDL_AudioStreamClear(UV.resample);
+		SDL_UnlockMutex(A.media_mutex);
+		SDL_LockMutex(A.mutex);
+		A.usb_format[0] = '\0';
+		SDL_UnlockMutex(A.mutex);
+	}
+	push_event(EV_STATE);
+}
+
+static void usb_log(const char *text)
+{
+	app_log("USB: %s", text);
+}
+
+/* (also called again while it is switched on and not running: the previous run may still have been ending) */
+static void usb_start(void)
+{
+	static const struct usbqt_callbacks callbacks = {usb_video, usb_audio, usb_state, usb_log};
+	usbqt_start(&callbacks);
+}
+
+static const char *usb_state_text(int state)
+{
+	switch (state) {
+	case USBQT_NO_DEVICE:
+		return "iPad USB'ye takılı değil";
+	case USBQT_NO_DRIVER:
+		return "USB sürücüsü kurulu değil";
+	case USBQT_DRIVER_FAILED:
+		return "Windows sürücüyü yükleyemedi";
+	case USBQT_REPLUG:
+		return "iPad'i çıkarıp yeniden takın";
+	case USBQT_STARTING:
+		return "Bağlanıyor…";
+	case USBQT_LOCKED:
+		return "iPad'in kilidini açın, \"Güven\" deyin";
+	case USBQT_STREAMING:
+		return "Yansıtılıyor";
+	case USBQT_ERROR:
+		return "Hata; yeniden deneniyor";
+	default:
+		return "Kapalı";
+	}
+}
+
+/* (asked while the settings are drawn: looked up every two seconds) */
+static Uint32 usb_device_at;
+
+static bool usb_device_cached(struct usbqt_device *out)
+{
+	static struct usbqt_device device;
+	static bool present;
+	Uint32 now = SDL_GetTicks();
+	if (!usb_device_at || now - usb_device_at > 2000) {
+		present = usbqt_find_device(&device);
+		usb_device_at = now ? now : 1;
+	}
+	*out = device;
+	return present;
+}
+
 /* ------------------------------------------------------------------ start / stop */
 
 static void session_stop(void)
@@ -1918,7 +2102,7 @@ static void session_stop(void)
 	proc_destroy(A.proc);
 	A.proc = NULL;
 	SDL_AtomicSet(&A.stopping, 0);
-	if (A.adev)
+	if (A.adev && !usbqt_streaming())
 		SDL_ClearQueuedAudio(A.adev);
 	app_log("receiver stopped");
 }
@@ -2012,6 +2196,14 @@ static void session_start(void)
 static void status_text(char *status, size_t size)
 {
 	SDL_LockMutex(A.mutex);
+	if (usbqt_streaming()) {
+		if (A.usb_format[0])
+			snprintf(status, size, "Kablolu (USB)  •  %s, %.0f fps, %.1f Mbit/s", A.usb_format, A.fps_now, A.mbit);
+		else
+			snprintf(status, size, "Kablolu (USB)  •  Görüntü bekleniyor");
+		SDL_UnlockMutex(A.mutex);
+		goto rest;
+	}
 	switch (A.state) {
 	case MIRROR_STARTING:
 		snprintf(status, size, "Başlatılıyor…");
@@ -2046,7 +2238,15 @@ static void status_text(char *status, size_t size)
 		break;
 	}
 	SDL_UnlockMutex(A.mutex);
+	if (A.usb_on) {
+		int usb = SDL_AtomicGet(&A.usb_state);
+		if (usb != USBQT_OFF && usb != USBQT_STREAMING) {
+			size_t at = strlen(status);
+			snprintf(status + at, size - at, "  •  USB: %s", usb_state_text(usb));
+		}
+	}
 
+rest:;
 	char rec[160] = "";
 	SDL_LockMutex(R.mutex);
 	if (R.oc && R.header_written) {
@@ -2206,7 +2406,7 @@ struct button {
 static struct button buttons[64];
 static int button_count;
 static bool settings_open;
-static int settings_tab; /* 0: picture, 1: recording, 2: device, 3: program */
+static int settings_tab; /* 0: picture, 1: recording, 2: device, 3: program, 4: USB */
 static bool editing_kbit; /* the recording bit rate is being typed */
 static char kbit_text[8];
 static SDL_Rect panel_rect, bar_rect;
@@ -2402,6 +2602,24 @@ static const char *build_settings(void)
 		note = editing_kbit ? "Rakamları yazın, Enter ile onaylayın." :
 		       A.rec_mode != 0 ? "Bit hızını değiştirmek için değerine tıklayıp yazın." :
 					 "Ayarlar bir sonraki kayıtta geçerli olur.";
+	} else if (settings_tab == 4) {
+		toggle("Kablolu (USB) Yansıtma", CMD_USB, A.usb_on);
+		int usb = SDL_AtomicGet(&A.usb_state);
+		char line[80];
+		snprintf(line, sizeof(line), "Durum: %s", A.usb_on ? usb_state_text(usb) : "Kapalı");
+		row(line);
+		struct usbqt_device device;
+		bool present = usb_device_cached(&device);
+		if (present && device.filtered)
+			action("USB Sürücüsü: Kurulu", CMD_USB_DRIVER, "Kaldır");
+		else if (present)
+			action("USB Sürücüsü: Kurulu Değil", CMD_USB_DRIVER, "Kur");
+		else
+			action("USB Sürücüsü (iPad takılıyken)", CMD_USB_DRIVER, "Kur");
+		row("Gerekli: Apple Aygıtları ya da iTunes");
+		note = A.usb_on && usb == USBQT_DRIVER_FAILED ?
+			       "Windows bu sürücüyü yüklemiyor (Bellek bütünlüğü açık olabilir): kaldırıp Wi-Fi ile yansıtın." :
+			       "iPad'i kabloyla takın, kilidini açın, \"Güven\" deyin. Wi-Fi yansıtma da açık kalır.";
 	} else if (settings_tab == 3) {
 		toggle("Windows İle Başlat", CMD_AUTOSTART, autostart_get());
 		toggle("Pencere Her Zaman Üstte", CMD_ONTOP, A.on_top);
@@ -2492,10 +2710,12 @@ static void draw_bar(int ow, int oh)
 
 	panel_rect = (SDL_Rect){0, 0, 0, 0};
 	if (settings_open) {
-		static const char *const tab_names[] = {"Görüntü", "Kayıt", "Cihaz", "Program"};
+		static const char *const tab_names[] = {"Görüntü", "Kayıt", "Cihaz", "Program", "USB"};
+		static const int tab_order[] = {0, 1, 2, 4, 3};
 		int tabs = button_count;
-		for (int t = 0; t < 4; t++)
-			add_button(CMD_TAB, t, KIND_CHOICE, settings_tab == t, "%s", tab_names[t]);
+		for (int i = 0; i < 5; i++)
+			add_button(CMD_TAB, tab_order[i], KIND_CHOICE, settings_tab == tab_order[i], "%s",
+				   tab_names[tab_order[i]]);
 		int first = button_count;
 		const char *note = build_settings();
 
@@ -2581,8 +2801,9 @@ static void draw_idle(int ow, int oh)
 		SDL_RenderCopy(A.ren, A.logo, NULL, &dst);
 	}
 	y += size + A.font_px;
-	static const char *const lines[] = {APP_NAME, "iPhone / iPad  →  Denetim Merkezi  →  Ekran Yansıtma  →  " RECEIVER_NAME};
-	for (int i = 0; i < 2; i++) {
+	static const char *const lines[] = {APP_NAME, "iPhone / iPad  →  Denetim Merkezi  →  Ekran Yansıtma  →  " RECEIVER_NAME,
+					    "ya da kablolu: iPad'i USB ile takın, kilidini açın"};
+	for (int i = 0; i < (A.usb_on ? 3 : 2); i++) {
 		struct text_entry *t = text_get(lines[i]);
 		if (!t)
 			continue;
@@ -2859,6 +3080,100 @@ static void remove_camera(void)
 	set_notice(gone ? "Sanal kamera Windows'tan kaldırıldı" : "Sanal kamera kaldırılamadı", false);
 }
 
+static bool confirm(const char *text, bool yes_is_default);
+
+/* The USB driver for the iPad that is plugged in: installed or removed by this program started again with
+ * administrator rights (usbqt_driver_main; Windows asks the user). */
+static void usb_driver(void)
+{
+	struct usbqt_device device;
+	usb_device_at = 0;
+	if (!usbqt_find_device(&device)) {
+		set_notice("Önce iPad'i USB kablosuyla takın", false);
+		return;
+	}
+	bool removing = device.filtered;
+	if (removing) {
+		if (!confirm("USB sürücüsü bu iPad'den kaldırılacak; Windows izin isteyecek, \"Evet\" deyin.\n"
+			     "Sonra iPad'i çıkarıp yeniden takın. (Wi-Fi ile yansıtma bundan etkilenmez.)\n\n"
+			     "Devam edilsin mi?",
+			     false))
+			return;
+	} else if (!confirm("Kablolu yansıtma için açık kaynaklı USB sürücüsü (libusb-win32 1.2.6.0) yalnızca bu iPad\n"
+			    "için kurulacak; Apple'ın kendi sürücüsü yerinde kalır.\n\n"
+			    "Kurulumdan önce dosyaların SHA-256 parmak izi denetlenir; tutmazsa hiçbir şey kurulmaz.\n"
+			    "Windows sürücüyü yüklemezse yapılan her şey geri alınır.\n\n"
+			    "Windows izin isteyecek (\"Bilinmeyen yayımcı\" yazabilir); \"Evet\" deyin.\n\n"
+			    "Devam edilsin mi?",
+			    true)) {
+		return;
+	}
+	if (removing && usbqt_running())
+		usbqt_stop(true); /* (the device is given back to its usual state first) */
+
+	wchar_t self[MAX_PATH * 2];
+	char exe[MAX_PATH * 6], args[400];
+	DWORD n = GetModuleFileNameW(NULL, self, MAX_PATH * 2);
+	if (!n || n >= MAX_PATH * 2 || !WideCharToMultiByte(CP_UTF8, 0, self, -1, exe, (int)sizeof(exe), NULL, NULL))
+		return;
+	snprintf(args, sizeof(args), "--usb-driver %s %s", removing ? "remove" : "install", device.instance);
+	app_log("USB driver: %s for %s (%s)", removing ? "removal" : "installation", device.instance, device.name);
+	int code = run_elevated_wait(exe, args, 90000);
+	app_log("USB driver: result %d", code);
+	usb_device_at = 0;
+
+	const char *text = NULL;
+	char other[200];
+	bool ok = code == USBQT_DRIVER_DONE;
+	switch (code) {
+	case USBQT_DRIVER_DONE:
+		text = removing ? "USB sürücüsü bu iPad'den kaldırıldı.\n\niPad'i çıkarıp yeniden takın." :
+				  "USB sürücüsü kuruldu ve kablolu yansıtma açıldı.\n\n"
+				  "iPad'i çıkarıp yeniden takın, kilidini açın ve sorarsa \"Bu Bilgisayara Güven\" deyin.";
+		break;
+	case -1:
+		text = "İşlem yapılmadı (Windows izni verilmedi).";
+		break;
+	case USBQT_DRIVER_NO_DEVICE:
+		text = "iPad bulunamadı. Takılı ve kilidi açık olduğundan emin olun.";
+		break;
+	case USBQT_DRIVER_NO_FILES:
+		text = "Bu sürümde USB sürücü dosyaları yok (programın \"usb\" klasörü eksik).";
+		break;
+	case USBQT_DRIVER_BAD_FILES:
+		text = "Sürücü dosyalarının parmak izi beklenen değil; güvenlik için hiçbir şey kurulmadı.\n\n"
+		       "Programı yeniden indirin.";
+		break;
+	case USBQT_DRIVER_OTHER_VERSION:
+		text = "Bilgisayarda başka bir programın kurduğu farklı bir libusb0 sürümü var.\n"
+		       "Onu bozmamak için ona dokunulmadı ve kurulum yapılmadı.";
+		break;
+	case USBQT_DRIVER_DEVICE_PROBLEM:
+		text = "Windows bu iPad için zaten bir sorun bildiriyor (Aygıt Yöneticisi'nde ünlem).\n"
+		       "Apple Aygıtları (Microsoft Store) ya da iTunes kurulu mu? Kurulum yapılmadı.";
+		break;
+	case USBQT_DRIVER_NOT_LOADED:
+		text = "Windows sürücüyü yüklemedi (\"Bellek bütünlüğü\" açıksa eski sürücüleri engeller).\n"
+		       "Yapılan her şey geri alındı; iPad eskisi gibi çalışır.\n\n"
+		       "Bu bilgisayarda kablolu yansıtma kullanılamıyor; Wi-Fi ile yansıtın.";
+		break;
+	default:
+		snprintf(other, sizeof(other), "USB sürücüsü işlemi tamamlanamadı (kod %d; ayrıntı log.txt'de).", code);
+		text = other;
+		break;
+	}
+	if (ok) {
+		/* installed: wired mirroring on; removed: off (it could not work any more) */
+		A.usb_on = !removing;
+		save_settings();
+		if (A.usb_on)
+			usb_start();
+		else
+			usbqt_stop(false);
+	}
+	SDL_ShowSimpleMessageBox(ok ? SDL_MESSAGEBOX_INFORMATION : SDL_MESSAGEBOX_WARNING, APP_NAME, text, A.win);
+}
+
 /* "Relios Mirror" under HKCU\...\Run: started with Windows (its window minimized) */
 static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
@@ -2901,6 +3216,11 @@ static bool install_camera(void)
 {
 	return false;
 }
+
+static void usb_driver(void)
+{
+	set_notice("Kablolu yansıtma yalnızca Windows'ta var", false);
+}
 static void remove_camera(void)
 {
 }
@@ -2939,9 +3259,10 @@ static bool confirm(const char *text, bool yes_is_default)
 static void reset_everything(void)
 {
 	if (!confirm("Bütün ayarlar ilk açılıştaki haline dönecek ve eşleşmiş cihazlar unutulacak.\n"
-		     "(Güvenlik duvarı izni ve kurulu sanal kamera yerinde kalır.)\n\nDevam edilsin mi?",
+		     "(Güvenlik duvarı izni, kurulu sanal kamera ve USB sürücüsü yerinde kalır.)\n\nDevam edilsin mi?",
 		     false))
 		return;
+	usbqt_stop(false);
 	session_stop();
 	A.restart_at = 0;
 	A.apply_at = 0;
@@ -3043,7 +3364,7 @@ static void run_command(int cmd, int arg)
 		editing_kbit = false;
 		break;
 	case CMD_TAB:
-		settings_tab = arg >= 0 && arg <= 3 ? arg : 0;
+		settings_tab = arg >= 0 && arg <= 4 ? arg : 0;
 		editing_kbit = false;
 		break;
 	case CMD_FORGET:
@@ -3169,6 +3490,19 @@ static void run_command(int cmd, int arg)
 		break;
 	case CMD_RESET:
 		reset_everything();
+		break;
+	case CMD_USB:
+		A.usb_on = !A.usb_on;
+		save_settings();
+		if (A.usb_on) {
+			usb_start();
+			set_notice("Kablolu yansıtma açık: iPad'i USB kablosuyla takın", false);
+		} else {
+			usbqt_stop(false);
+		}
+		break;
+	case CMD_USB_DRIVER:
+		usb_driver();
 		break;
 	case CMD_RES_NEXT: {
 		static const int sizes[4][2] = {{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
@@ -3352,6 +3686,9 @@ static int other_copies(bool end_them)
 			bool receiver = !_wcsicmp(e.szExeFile, L"relios-airplay-receiver.exe");
 			if ((!program && !receiver) || e.th32ProcessID == self || (program && e.th32ProcessID == parent))
 				continue;
+			/* (a short USB helper finishing a switch of the iPad is left alone: see usbqt.c) */
+			if (program && usbqt_is_helper(e.th32ProcessID))
+				continue;
 			found++;
 			if (end_them) {
 				HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, e.th32ProcessID);
@@ -3370,6 +3707,12 @@ static int other_copies(bool end_them)
 
 int main(int argc, char *argv[])
 {
+	/* this program started again for a short USB task (usbqt.c): no window, no settings */
+	if (argc == 5 && !strcmp(argv[1], "--usb-switch"))
+		return usbqt_switch_main(argc, argv);
+	if (argc == 4 && !strcmp(argv[1], "--usb-driver"))
+		return usbqt_driver_main(argc, argv);
+
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 	/* (the program may stay open all day: the screen may switch off and the computer may sleep, except while
 	 * something is mirrored; see the loop) */
@@ -3392,6 +3735,7 @@ int main(int argc, char *argv[])
 #endif
 	A.mutex = SDL_CreateMutex();
 	A.frame_mutex = SDL_CreateMutex();
+	A.media_mutex = SDL_CreateMutex();
 	R.mutex = SDL_CreateMutex();
 	Q.mutex = SDL_CreateMutex();
 	Q.cond = SDL_CreateCond();
@@ -3470,6 +3814,8 @@ int main(int argc, char *argv[])
 	ensure_firewall_rule();
 #endif
 	session_start();
+	if (A.usb_on)
+		usb_start();
 	update_title();
 	draw();
 
@@ -3575,6 +3921,8 @@ int main(int argc, char *argv[])
 			retitle = true;
 			if (A.bar_drawn)
 				redraw = true;
+			if (A.usb_on && !usbqt_running())
+				usb_start(); /* (switched on while the previous run was still ending) */
 		}
 		if (A.camera_arming) {
 			if (SDL_AtomicGet(&A.camera_ok)) {
@@ -3621,6 +3969,11 @@ int main(int argc, char *argv[])
 			draw();
 	}
 
+	/* the cable's device is given back to its usual state (a few seconds): the window goes first */
+	if (usbqt_running()) {
+		SDL_HideWindow(A.win);
+		usbqt_stop(true);
+	}
 	session_stop();
 	SDL_LockMutex(Q.mutex);
 	Q.quit = true;

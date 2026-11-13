@@ -1,0 +1,6 @@
+These are messages captured from real devices by quicktime_video_hack (Daniel Paulus, MIT license, LICENSE.txt):
+https://github.com/danielpaulus/quicktime_video_hack, screencapture/packet/fixtures, commit
+d81396e2e7758d98c2a594853b64f98b54a8a871. They are used only by tests/qtproto_test.c (they are not in the program).
+
+Bu dosyalar, quicktime_video_hack projesinin gercek cihazlardan kaydettigi mesajlardir (MIT lisansi, LICENSE.txt).
+Yalnizca tests/qtproto_test.c sinamasinda kullanilir; programin icinde yer almaz.

@@ -1,5 +1,6 @@
 RELIOS MIRROR
-Apple cihazının (iPad / iPhone) ekranını Wi-Fi üzerinden (AirPlay) bilgisayarda kendi penceresinde gösterir.
+Apple cihazının (iPad / iPhone) ekranını ve sesini Wi-Fi üzerinden (AirPlay) ya da USB kablosuyla bilgisayarda
+kendi penceresinde gösterir.
 OBS gerekmez. Pencereyi Discord'da, OBS'te ya da başka bir programda "pencere" olarak seçip yayınlayabilirsiniz.
 
 
@@ -22,6 +23,7 @@ Ayarlar > Kayıt   : Biçim (MOV / MP4 / MKV), Kodlayıcı (ekran kartı / işle
                     değere tıklayıp yazın, Enter), Sesi Kaydet, Kayıt Klasörü.
 Ayarlar > Cihaz   : Yeni Cihaz Eşleştirme, eşleşmiş cihazlar (Unut), Bağlıyken Listeden Gizle, Ses Çıkışı,
                     Sanal Kamera.
+Ayarlar > USB     : Kablolu (USB) Yansıtma, durum, USB Sürücüsü (Kur / Kaldır). Aşağıya bakın.
 Ayarlar > Program : Windows İle Başlat, Pencere Her Zaman Üstte, Varsayılan Ayarlara Dön (İlk Açılış Gibi).
 
 Tuşlar: R kayıt, S ekran görüntüsü, Yukarı / Aşağı ses, M sessiz, F ya da F11 tam ekran, T üstte, P eşleştirme.
@@ -53,11 +55,29 @@ BAĞLANMAZSA
 - Hâlâ olmuyorsa %APPDATA%\ReliosMirror klasöründeki log.txt ve log-onceki.txt dosyalarını gönderin.
 
 
-KABLOLU BAĞLANTI
-AirPlay ağ üzerinden çalışır; kabloyla kullanmak için cihaz ile bilgisayar arasında kablolu AĞ gerekir:
-- cihaza USB-C Ethernet adaptörü takıp modeme bağlayın, ya da
-- hücresel iPad / iPhone'da Kişisel Erişim Noktası'nı açıp USB kabloyla bilgisayara bağlayın.
-Sonra yine Ekran Yansıtma > Relios Mirror.
+KABLOLU (USB) YANSITMA (Ayarlar > USB; deneme aşamasında)
+iPad / iPhone'u normal USB kablosuyla bilgisayara takınca görüntüsü ve sesi pencereye gelir; ağ gerekmez.
+Mac'teki QuickTime'ın cihaz ekranını kaydettiği USB kanalını kullanır. Wi-Fi yansıtma da açık kalır.
+Gerekenler (bir kez):
+1. Apple'ın Windows sürücüsü: Microsoft Store'dan "Apple Aygıtları" (Apple Devices) ya da iTunes.
+   iPad'i takınca "Bu Bilgisayara Güven" sorusuna "Güven" deyin.
+2. iPad takılıyken Ayarlar > USB > USB Sürücüsü > "Kur". Windows yönetici onayı ister ("Bilinmeyen yayımcı"
+   yazabilir). Kurulan: açık kaynaklı libusb-win32 1.2.6.0 sürücüsü, yalnızca bu iPad için filtre olarak;
+   Apple'ın sürücüsü yerinde kalır. Kurmadan önce dosyaların SHA-256 parmak izi denetlenir (tutmazsa hiçbir şey
+   kurulmaz); bilgisayarda başka bir libusb0 sürümü varsa ona dokunulmaz; Windows sürücüyü yüklemezse yapılan
+   her şey geri alınır.
+3. iPad'i çıkarıp yeniden takın, kilidini açın. Pencerede görüntü belirir; çubukta "Kablolu (USB)" yazar.
+Bilmeniz gerekenler:
+- Kablolu yansıtmada cihazın saat çubuğu 9:41 olarak görünür (Apple'ın ekran kaydı modu; QuickTime'da da öyledir).
+- Program kapanırken ya da kablolu yansıtma kapatılınca cihaz normal haline döndürülür (birkaç saniye sürer).
+  Apple Aygıtları / iTunes iPad'i göremezse kabloyu çıkarıp yeniden takın.
+- "Bellek bütünlüğü" (Windows Güvenliği > Cihaz güvenliği > Çekirdek yalıtımı) açıksa Windows bu eski
+  sürücüyü yüklemeyebilir. Program bunu görür ve kurulumu geri alır; bu durumda Wi-Fi ile yansıtın. Güvenlik için
+  bellek bütünlüğünü kapatmanızı önermeyiz.
+- Sürücüyü kaldırmak: Ayarlar > USB > "Kaldır" (filtre iPad'den kaldırılır; iPad'i yeniden takın).
+- Sorun olursa log.txt ve log-onceki.txt dosyalarını gönderin (satırları "USB:" ile başlar).
+Ağ üzerinden kablolu bağlantı da olur: cihaza USB-C Ethernet adaptörü takıp modeme bağlayın; sonra yine Ekran
+Yansıtma > Relios Mirror.
 
 
 DISCORD VE OBS
@@ -72,7 +92,10 @@ GÜVENLİK VE AĞ
   verilir; alıcının ve programın yerel ağ dışındaki bütün adreslere çıkışı engellenir.
 - Alıcı (relios-airplay-receiver.exe) düşük yetkiyle ve kendi iş nesnesi içinde çalışır; yalnızca yerel ağ
   adreslerinden bağlantı kabul eder; yeni cihaz yalnızca penceredeki kodla eşleşir.
-- Yönetici onayı yalnızca şunlar için istenir: güvenlik duvarı kuralları, sanal kameranın kurulması / kaldırılması.
+- Kablolu yansıtma ağı hiç kullanmaz: cihazla yalnızca USB kablosu üzerinden konuşulur.
+- Yönetici onayı yalnızca şunlar için istenir: güvenlik duvarı kuralları, sanal kameranın ve USB sürücüsünün
+  kurulması / kaldırılması. USB sürücüsünü program kendisi kurar (yönetici onayıyla yeniden başlayarak): önce
+  dosyaların SHA-256 parmak izini denetler, dosyaları denetlediği bellekteki halinden yazar.
 
 
 BİLMENİZ GEREKENLER
@@ -101,11 +124,13 @@ B) Bilgisayarda:
 
 KAYNAK KODUN DÜZENİ
 viewer\main.c        pencere: görüntü / ses çözme (FFmpeg), gösterme ve çalma (SDL2), kayıt, ayarlar, sanal kamera
+viewer\usbqt.c       kablolu yansıtma: iPad'i USB'de ekran kaydı moduna geçirme, akış, sürücü kurma / kaldırma
+viewer\qtproto.c     kablolu yansıtmanın USB protokolü (QuickTime ekran kaydı); sınaması tests\qtproto_test.c
 viewer\proc_win.c    alıcıyı düşük yetkiyle ve iş nesnesi içinde başlatır
 viewer\launcher.c    tek dosyalık sürümün başlatıcısı
 viewer\version.h     sürüm numarası
 receiver\receiver.c  AirPlay alıcısı (ağ tarafı); receiver\uxplay: UxPlay kitaplığı; receiver\libplist
-tests\               alıcının sınaması
+tests\               alıcının ve USB protokolünün sınamaları (tests\fixtures\qvh: gerçek cihaz kayıtları, MIT)
 paketle.sh, derle.bat, .github\workflows\windows.yml   derleme
 Programı değiştirmek, derlemek ve yeni sürüm çıkarmak için: GELISTIRME.txt
 
@@ -117,3 +142,8 @@ kodda "Relios Mirror" ya da "RELIOS:" diye işaretlidir); o da UxPlay'in AirPlay
 Görüntü / ses çözme ve kayıt: FFmpeg. Pencere / ses: SDL2, SDL2_ttf. Sanal kamera: softcam
 (https://github.com/tshino/softcam, MIT; sabit bir sürümü derleme sırasında alınır, adı ve sınıf kimliği
 değiştirilir; lisansı pakette softcam-LICENSE.txt olarak yer alır).
+Kablolu yansıtma: cihazı ekran kaydı moduna geçirme ve geri verme sırası iPhoneMirror'dan uyarlanmıştır
+(https://github.com/RayrenSX/iPhoneMirror, GPL-3.0-only); USB protokolü quicktime_video_hack'e dayanır
+(https://github.com/danielpaulus/quicktime_video_hack, MIT). USB sürücüsü: libusb-win32 1.2.6.0
+(https://sourceforge.net/projects/libusb-win32; sürücü GPL, kitaplık LGPL; dosyaları ve lisansları pakette usb
+klasöründe, kaynağı Releases sayfasında libusb-win32-src-1.2.6.0.zip).

@@ -1,0 +1,21 @@
+RELIOS MIRROR: USB SURUCUSU (kablolu yansitma)
+
+Bu klasordeki dosyalar libusb-win32 1.2.6.0'in resmi surumunden alinmistir (acik kaynak):
+  https://sourceforge.net/projects/libusb-win32/files/libusb-win32-releases/1.2.6.0/
+  https://github.com/mcuee/libusb-win32
+
+  libusb0.sys  surucu (GPL)       SHA-256 8058f2afe6ef96a7d2ded432997fd8655970c9ea75a938ee4557d6a2cb4cc989
+  libusb0.dll  kitaplik (LGPL)    SHA-256 4f18b5d2c28aa66b648c8683c6d09b52b92cbbee85984bbefad5f38a64bc2a14
+  libusb-win32-*.txt              lisanslar ve yazarlar
+
+Relios Mirror bu dosyalari yalnizca Ayarlar > USB > "Kur" dugmesine basildiginda, Windows'un yonetici onayiyla
+ve yalnizca takili olan iPad / iPhone icin kurar:
+  - kurmadan once iki dosyanin SHA-256 parmak izini denetler; tutmazsa hicbir sey kurmaz,
+  - bilgisayarda baska bir programin kurdugu farkli bir libusb0 varsa ona dokunmaz ve kurmaz,
+  - Windows cihazi surucuyle baslatamazsa (orn. "Bellek butunlugu" eski surucuyu engellerse) yaptigini geri alir.
+Kurulunca: C:\Windows\System32\drivers\libusb0.sys, C:\Windows\System32\libusb0.dll, "libusb0" hizmeti ve
+iPad'in aygit kaydinda ust filtre olarak "libusb0". "Kaldir" dugmesi filtreyi iPad'den kaldirir (hizmet ve
+dosyalar yerinde kalir; filtresi olan bir cihaz olmadan surucu hic yuklenmez).
+Program bu klasordeki dosyalari hicbir zaman kendisi calistirmaz ya da yuklemez.
+
+Bu surumun kaynak kodu: Releases sayfasindaki libusb-win32-src-1.2.6.0.zip (ya da yukaridaki adresler).

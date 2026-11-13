@@ -1,6 +1,7 @@
 # Relios Mirror: the iPad's AirPlay screen mirroring in a window of its own (no OBS).
 #
-#   ReliosMirror(.exe)             the window: decodes (FFmpeg), shows and plays (SDL2), records
+#   ReliosMirror(.exe)             the window: decodes (FFmpeg), shows and plays (SDL2), records; wired (USB)
+#                                  mirroring on Windows (viewer/usbqt.c, viewer/qtproto.c)
 #   relios-airplay-receiver(.exe)    ReliosOBS's receiver (receiver/; what Relios Mirror changed is marked): the network side
 #
 # Windows: built in MSYS2's UCRT64 (see paketle.sh, derle.bat and .github/workflows/windows.yml).
@@ -23,14 +24,17 @@ pkg_check_modules(SDL2TTF REQUIRED IMPORTED_TARGET SDL2_ttf)
 
 if(WIN32)
   enable_language(RC)
-  add_executable(ReliosMirror WIN32 viewer/main.c viewer/proc_win.c viewer/proc.h viewer/version.h viewer/app.rc)
+  add_executable(ReliosMirror WIN32 viewer/main.c viewer/proc_win.c viewer/proc.h viewer/version.h viewer/app.rc
+                 viewer/qtproto.c viewer/qtproto.h viewer/usbqt.c viewer/usbqt.h)
   set_source_files_properties(viewer/app.rc PROPERTIES COMPILE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/viewer")
-  target_link_libraries(ReliosMirror PRIVATE bcrypt advapi32 shell32 user32 ole32)
+  # (setupapi, cfgmgr32: the USB driver and the device list for wired mirroring)
+  target_link_libraries(ReliosMirror PRIVATE bcrypt advapi32 shell32 user32 ole32 setupapi cfgmgr32)
   # the one-file version: carries the whole folder and unpacks it at the first start (see paketle.sh)
   add_executable(launcher WIN32 viewer/launcher.c viewer/app.rc)
   target_link_options(launcher PRIVATE -static)
 else()
-  add_executable(ReliosMirror viewer/main.c viewer/proc_posix.c viewer/proc.h)
+  add_executable(ReliosMirror viewer/main.c viewer/proc_posix.c viewer/proc.h viewer/qtproto.c viewer/qtproto.h
+                 viewer/usbqt.c viewer/usbqt.h)
   target_link_libraries(ReliosMirror PRIVATE m)
 endif()
 target_include_directories(ReliosMirror PRIVATE receiver)
