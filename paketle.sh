@@ -20,6 +20,17 @@ if [ -n "$bad" ]; then
 	exit 1
 fi
 echo "relios-usb-kurucu.exe: $(objdump -p "$out/relios-usb-kurucu.exe" | sed -n 's/^[[:space:]]*DLL Name: //p' | tr '\n' ' ')"
+# exploit mitigations: ASLR (also above 4 GB) and DEP on every program, or the build stops
+for exe in ReliosMirror.exe relios-airplay-receiver.exe relios-usb-kurucu.exe; do
+	flags=$(objdump -p "$out/$exe" | grep -A6 '^DllCharacteristics')
+	for want in DYNAMIC_BASE HIGH_ENTROPY_VA NX_COMPAT; do
+		if ! echo "$flags" | grep -q "$want"; then
+			echo "$exe: $want yok"
+			exit 1
+		fi
+	done
+done
+echo "ASLR + DEP: tamam"
 
 prefix="${MINGW_PREFIX:-/ucrt64}"
 copy_dlls() {

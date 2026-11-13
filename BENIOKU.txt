@@ -8,7 +8,9 @@ KULLANIM
 1. ReliosMirror.exe'yi açın. (Tek dosyalık sürüm kendini ilk açılışta
    %LOCALAPPDATA%\ReliosMirror\app-<tarih> klasörüne açar.)
 2. İlk açılışta Windows bir kez yönetici onayı ister: program, güvenlik duvarı kurallarını kendisi ekler.
-3. Apple cihazı ile bilgisayar aynı ağda olsun.
+3. Apple cihazı ile bilgisayar aynı ağda olsun. Bu ağ Windows'ta "Özel ağ" olarak işaretli olmalı (güvenlik için
+   alıcıya yalnızca özel ağlardan bağlanılabilir; "Genel" ağdaysanız program bunu pencerede yazar).
+   Değiştirmek için: Ayarlar > Ağ ve İnternet > Wi-Fi (ya da Ethernet) > ağınız > Ağ profili türü: Özel ağ.
 4. Cihazda Denetim Merkezi > Ekran Yansıtma > "Relios Mirror".
 5. İlk seferde pencerede 4 haneli kod çıkar; cihaza girin. Sonraki bağlanmalarda kod sorulmaz.
 
@@ -74,7 +76,9 @@ Bilmeniz gerekenler:
 - "Bellek bütünlüğü" (Windows Güvenliği > Cihaz güvenliği > Çekirdek yalıtımı) açıksa Windows bu eski
   sürücüyü yüklemeyebilir. Program bunu görür ve kurulumu geri alır; bu durumda Wi-Fi ile yansıtın. Güvenlik için
   bellek bütünlüğünü kapatmanızı önermeyiz.
-- Sürücüyü kaldırmak: Ayarlar > USB > "Kaldır" (filtre iPad'den kaldırılır; iPad'i yeniden takın).
+- Sürücüyü kaldırmak: Ayarlar > USB > "Kaldır". Filtre iPad'den kaldırılır; sürücüyü Relios Mirror kurduysa ve
+  başka bir cihaz kullanmıyorsa sürücü bilgisayardan tamamen silinir. Sonra iPad'i yeniden takın.
+- Bellek bütünlüğü açıksa program kurmadan önce uyarır.
 - iPad kilitliyken program bekler; kilidi açınca görüntü birkaç saniye içinde gelir. Gelmezse kabloyu çıkarıp
   yeniden takın.
 - Sorun olursa log.txt ve log-onceki.txt dosyalarını gönderin (satırları "USB:" ile başlar).
@@ -90,8 +94,11 @@ OBS: Kaynak Ekle > Pencere Yakalama > ReliosMirror.exe. Ses için: Uygulama Ses 
 GÜVENLİK VE AĞ
 - Program internete çıkmaz: güncelleme denetlemez, hiçbir yere veri göndermez, hiçbir şey indirmez. Yalnızca yerel
   ağda AirPlay alıcısı olarak dinler (TCP 7000 ve 7100; UDP 6000, 6001, 7011 ve 5353).
-- Güvenlik duvarı kuralları ("Relios Mirror" adıyla): alıcıya yalnızca yerel ağdan gelen bağlantılara izin
-  verilir; alıcının ve programın yerel ağ dışındaki bütün adreslere çıkışı engellenir.
+- Güvenlik duvarı kuralları ("Relios Mirror" adıyla): alıcıya yalnızca yerel ağdan ve yalnızca Windows'ta "Özel"
+  olarak işaretli ağlarda bağlanılabilir (kafe, okul, otel gibi "Genel" ağlarda ve kurum ağlarında engellenir);
+  programın kendisine hiçbir bağlantı gelemez; alıcının ve programın yerel ağ dışındaki bütün adreslere çıkışı
+  engellenir.
+- Programlar istismara karşı korumalarla derlenir: ASLR, DEP ve yığın koruması (derleme bunları denetler).
 - Alıcı (relios-airplay-receiver.exe) düşük yetkiyle ve kendi iş nesnesi içinde çalışır; yalnızca yerel ağ
   adreslerinden bağlantı kabul eder; yeni cihaz yalnızca penceredeki kodla eşleşir.
 - Kablolu yansıtma ağı hiç kullanmaz: cihazla yalnızca USB kablosu üzerinden konuşulur.
@@ -99,6 +106,16 @@ GÜVENLİK VE AĞ
   kurulması / kaldırılması. USB sürücüsünü küçük, ayrı bir program kurar (relios-usb-kurucu.exe; yönetici onayıyla
   yalnızca o çalışır ve program klasöründen hiçbir DLL yüklemez): önce dosyaların SHA-256 parmak izini denetler,
   dosyaları denetlediği bellekteki halinden yazar.
+
+
+GÜVENLİK ÖNERİLERİ
+- Programı ev ağınızda kullanın; ortak ağlarda (kafe, okul, otel) kapalı tutun.
+- Kullanmadığınızda programı kapatın; "Windows İle Başlat"ı gerekmedikçe açmayın.
+- Windows Update ve Microsoft Defender açık olsun; "Bellek bütünlüğü"nü kapatmayın.
+- Cihazınızı eşleştirdikten sonra "Yeni Cihaz Eşleştirme" kapalı kalsın.
+- USB sürücüsünü gerekmedikçe kurmayın; kurduysanız kullanmadığınızda "Kaldır" ile silin.
+- İndirdiğiniz dosyaları SHA256SUMS.txt ile denetleyin (PowerShell: Get-FileHash ReliosMirror.exe).
+- Windows'un yönetici izni sorusuna yalnızca kendiniz bir şey kurarken (Kur / Kaldır, ilk açılış) "Evet" deyin.
 
 
 BİLMENİZ GEREKENLER

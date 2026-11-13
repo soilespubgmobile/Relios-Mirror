@@ -14,6 +14,11 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if(WIN32)
   set(OPENSSL_USE_STATIC_LIBS TRUE) # the receiver is one .exe without DLLs
+  # Exploit mitigations for every program (the linker already turns on ASLR and DEP; paketle.sh checks both):
+  # stack canaries, and the checked forms of the C library's memory and string functions.
+  add_compile_options(-fstack-protector-strong)
+  add_link_options(-fstack-protector-strong)
+  add_compile_definitions(_FORTIFY_SOURCE=2)
 endif()
 add_subdirectory(receiver)
 

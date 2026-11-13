@@ -15,8 +15,8 @@ ve yalnizca takili olan iPad / iPhone icin kurar. Kurulumu programin yanindaki k
   - bilgisayarda baska bir programin kurdugu farkli bir libusb0 varsa ona dokunmaz ve kurmaz,
   - Windows cihazi surucuyle baslatamazsa (orn. "Bellek butunlugu" eski surucuyu engellerse) yaptigini geri alir.
 Kurulunca: C:\Windows\System32\drivers\libusb0.sys, C:\Windows\System32\libusb0.dll, "libusb0" hizmeti ve
-iPad'in aygit kaydinda ust filtre olarak "libusb0". "Kaldir" dugmesi filtreyi iPad'den kaldirir (hizmet ve
-dosyalar yerinde kalir; filtresi olan bir cihaz olmadan surucu hic yuklenmez).
+iPad'in aygit kaydinda ust filtre olarak "libusb0". "Kaldir" dugmesi filtreyi iPad'den kaldirir; surucuyu
+Relios Mirror kurduysa ve baska bir cihaz kullanmiyorsa hizmeti ve System32'ye koydugu dosyalari da siler.
 Program bu klasordeki dosyalari hicbir zaman kendisi calistirmaz ya da yuklemez.
 
 Bu surumun kaynak kodu: Releases sayfasindaki libusb-win32-src-1.2.6.0.zip (ya da yukaridaki adresler).

@@ -141,8 +141,13 @@ Programın adı: main.c'de APP_NAME ve RECEIVER_NAME (cihazın listesinde görü
 Simge ve logo: viewer\app.ico, assets\logo.bmp.
 Sanal kameranın adı ve sınıf kimliği: windows.yml'deki softcam adımı ile main.c'deki CAMERA_CLASS_KEY (ikisi
    aynı kimliği taşımalı).
-Güvenlik duvarı kuralları: ensure_firewall_rule. Kuralları değiştirirseniz işaretteki "v2"yi "v3" yapın ki
-   program kuralları yeniden kursun.
+Güvenlik duvarı kuralları: ensure_firewall_rule. Kuralları değiştirirseniz işaretteki "v3"ü "v4" yapın ki
+   program kuralları yeniden kursun. Şimdiki kurallar: iki programın da internete çıkışı engelli; programın
+   kendisine gelen her şey engelli; alıcıya gelen yalnızca yerel ağdan ve yalnızca özel ağ profilinde serbest
+   (genel ve kurum profillerinde engel kuralı var; Windows'un sormasını ve orada verilecek izni de önler).
+   network_private / check_network: bağlı ağlardan hiçbiri "Özel" değilse durum satırı bunu söyler.
+İstismara karşı korumalar: CMakeLists.txt'de -fstack-protector-strong ve _FORTIFY_SOURCE=2; ASLR ve DEP
+   bağlayıcının varsayılanı, paketle.sh üç programda da bunları denetler.
 Alıcının davranışı (gizleme süresi, ağ değişimi, yeniden bağlanma süresi): receiver\receiver.c'nin sonundaki
    döngü ve baştaki sabitler (HIDE_AFTER_NS, RECONNECT_GRACE_NS).
 UxPlay'i yenilemek: receiver\uxplay\lib'i yeni sürümle değiştirin, "RELIOS:" işaretli değişiklikleri yeniden
@@ -189,8 +194,13 @@ Program (elle; her yeni sürümde):
   (kurucu bunu görür ve geri alır); iPad'in kablolu modda ekran boyutu bilinmediği için cihaza 1640x2360
   bildirilir (qt_options, usbqt.c'deki stream işlevi); iPad'in yönü değişince gelen işaretler yalnızca
   günlüğe yazılır. Sorunlar log.txt'deki "USB:" satırlarından izlenir.
-- USB sürücüsü kaldırılınca libusb0 hizmeti ve System32'deki iki dosya yerinde kalır (filtresi olan bir cihaz
-  olmadan yüklenmez). Bilerek: başka programlar da kullanıyor olabilir.
+- USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
+  1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
+  yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu
+  libusb0'a hiç dokunulmaz.
+- libusb0.sys 1.2.6.0 Windows'un Bellek bütünlüğü (HVCI) denetiminden geçmez (çalıştırılabilir bellek ayırır;
+  libusb-win32 bunu 1.2.7.1'de düzeltti). Daha yeni bir sürüme geçmek, gerçek Apple cihazlarında denenmemiş bir
+  yol olduğu için bu sürümde yapılmadı.
 - Otomatik güncelleme yoktur (bilerek: program internete çıkmaz).
 - exe imzalı değildir; Windows SmartScreen ilk açılışta uyarabilir. İmza için kod imzalama sertifikası gerekir.
 - MSYS2 paketleri sürekli yenilenir. İleride FFmpeg ya da SDL değişir ve derleme bozulursa,

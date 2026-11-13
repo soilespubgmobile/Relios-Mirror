@@ -65,6 +65,10 @@ enum {
 	USBQT_DRIVER_REGISTRY = 8,
 	USBQT_DRIVER_DEVICE_PROBLEM = 9, /* Windows already reports a problem with the device: nothing was installed */
 	USBQT_DRIVER_NOT_LOADED = 10,   /* Windows did not start the device with the driver: everything was undone */
+	USBQT_DRIVER_KEPT = 11,         /* removed from the device; the driver stays (another device uses it, or it was
+					 * not installed by Relios Mirror) */
+	USBQT_DRIVER_REBOOT = 12,       /* removed; the driver's files go at the next restart of Windows */
+	USBQT_DRIVER_RESTART_FIRST = 13, /* a removal is still waiting for a restart of Windows: nothing was done */
 };
 
 #endif

@@ -14,8 +14,10 @@
  *          is done); the libusb0 kernel service is made (or an existing one checked); "libusb0" is added to the
  *          iPad's upper filters and the iPad is restarted. If Windows does not start it again without a problem
  *          (e.g. Memory Integrity refusing the old driver), everything this run did is undone.
- * remove:  "libusb0" is taken out of the iPad's upper filters and the iPad restarted (the service and the files
- *          stay: without a device that names it the driver is never loaded, and other programs may use them).
+ * remove:  "libusb0" is taken out of the iPad's upper filters and the iPad restarted. Then, if this program
+ *          installed the driver (marked in the service's key) and no device or device class names libusb0 any
+ *          more, the service and the files it put into System32 are deleted too (a file still in use: at the next
+ *          restart of Windows), so that nothing of it is left (it would also keep Memory Integrity off).
  *
  * As libusb-win32's own install-filter does (add the filter, remove the device's SurpriseRemovalOK value, restart
  * the device) and as iPhoneMirror (GPL-3.0-only) does around it (checked files, a health check, undoing).
@@ -165,7 +167,67 @@ static void delete_now_or_later(const wchar_t *path)
 		MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 }
 
+/* a file this program put there, if it is still that file: deleted (true: only at the next restart of Windows) */
+static bool delete_ours(const wchar_t *path, const char *sha)
+{
+	if (file_state(path, sha) != FILE_SAME || DeleteFileW(path))
+		return false;
+	MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+	return true;
+}
+
+/* whether Windows is to delete this file at its next restart (a removal still waiting for it) */
+static bool delete_pending(const wchar_t *path)
+{
+	static const wchar_t key[] = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+	DWORD size = 0;
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"PendingFileRenameOperations", RRF_RT_REG_MULTI_SZ, NULL, NULL,
+			 &size) != ERROR_SUCCESS ||
+	    size == 0 || size > (4u << 20))
+		return false;
+	wchar_t *buf = calloc(size / sizeof(wchar_t) + 4, sizeof(wchar_t));
+	if (!buf)
+		return false;
+	bool found = false;
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"PendingFileRenameOperations", RRF_RT_REG_MULTI_SZ, NULL, buf, &size) ==
+	    ERROR_SUCCESS) {
+		/* pairs of strings: the file (\??\C:\...), then where it goes ("" when it is to be deleted) */
+		const wchar_t *end = buf + size / sizeof(wchar_t);
+		for (const wchar_t *p = buf; p < end && *p;) {
+			const wchar_t *file = p;
+			p += wcslen(p) + 1;
+			if (p >= end)
+				break;
+			const wchar_t *to = p;
+			p += wcslen(p) + 1;
+			if (!wcsncmp(file, L"\\??\\", 4))
+				file += 4;
+			found = found || (!*to && !_wcsicmp(file, path));
+		}
+	}
+	free(buf);
+	return found;
+}
+
 /* ------------------------------------------------------------------ the service */
+
+/* what this program made for the driver, noted in the service's own key (so the note goes with it):
+ * 1 the service, 2 System32\drivers\libusb0.sys, 4 System32\libusb0.dll */
+#define SERVICE_KEY L"SYSTEM\\CurrentControlSet\\Services\\libusb0"
+
+static DWORD read_marks(void)
+{
+	DWORD v = 0, size = sizeof(v);
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, SERVICE_KEY, L"ReliosMirror", RRF_RT_REG_DWORD, NULL, &v, &size) !=
+	    ERROR_SUCCESS)
+		return 0;
+	return v & 7;
+}
+
+static void write_marks(DWORD v)
+{
+	RegSetKeyValueW(HKEY_LOCAL_MACHINE, SERVICE_KEY, L"ReliosMirror", REG_DWORD, &v, sizeof(v));
+}
 
 /* whether a service's binary path is <System32>\drivers\libusb0.sys (as Windows reads it: relative to the Windows
  * folder, \SystemRoot\..., \??\C:\... or C:\...) */
@@ -192,7 +254,8 @@ static bool is_system_driver_path(const wchar_t *path)
 }
 
 /* the libusb0 kernel service: an existing one must be a kernel driver that is not disabled, loaded from
- * <System32>\drivers\libusb0.sys; otherwise it is made (made: whether this call made it). 0 when ready */
+ * <System32>\drivers\libusb0.sys; otherwise it is made (made: whether this call made it). 0 when ready, -2 when
+ * it is still waiting to be deleted (a removal waiting for a restart of Windows) */
 static int ensure_service(bool *made)
 {
 	*made = false;
@@ -200,7 +263,7 @@ static int ensure_service(bool *made)
 	if (!scm)
 		return -1;
 	int result = -1;
-	SC_HANDLE svc = OpenServiceW(scm, L"libusb0", SERVICE_QUERY_CONFIG);
+	SC_HANDLE svc = OpenServiceW(scm, L"libusb0", SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG);
 	if (svc) {
 		DWORD need = 0;
 		QueryServiceConfigW(svc, NULL, 0, &need);
@@ -209,6 +272,12 @@ static int ensure_service(bool *made)
 		    cfg->dwStartType != SERVICE_DISABLED && cfg->lpBinaryPathName && is_system_driver_path(cfg->lpBinaryPathName))
 			result = 0;
 		free(cfg);
+		/* (a change that changes nothing: refused only for a service marked for deletion) */
+		if (result == 0 &&
+		    !ChangeServiceConfigW(svc, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL,
+					  NULL, NULL, NULL) &&
+		    GetLastError() == ERROR_SERVICE_MARKED_FOR_DELETE)
+			result = -2;
 		CloseServiceHandle(svc);
 	} else if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
 		svc = CreateServiceW(scm, L"libusb0", L"libusb-win32 - Kernel Driver, Version 1.2.6.0", SERVICE_QUERY_CONFIG,
@@ -381,6 +450,9 @@ static int install_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *in
 	_snwprintf(dst_dll, MAX_PATH + 39, L"%ls\\libusb0.dll", sysdir);
 	dst_sys[MAX_PATH + 39] = dst_dll[MAX_PATH + 39] = L'\0';
 	bool made_sys = false, made_dll = false, made_service = false;
+	/* (an earlier removal whose files go only at the next restart: installing now would lose them then) */
+	if (result == USBQT_DRIVER_DONE && (delete_pending(dst_sys) || delete_pending(dst_dll)))
+		result = USBQT_DRIVER_RESTART_FIRST;
 	if (result == USBQT_DRIVER_DONE) {
 		/* a libusb0 already installed by another program is left as it is */
 		int sys_state = file_state(dst_sys, sys_sha256), dll_state = file_state(dst_dll, dll_sha256);
@@ -399,8 +471,13 @@ static int install_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *in
 	}
 	free(sys);
 	free(dll);
-	if (result == USBQT_DRIVER_DONE && ensure_service(&made_service) != 0)
-		result = USBQT_DRIVER_SERVICE;
+	if (result == USBQT_DRIVER_DONE) {
+		int service = ensure_service(&made_service);
+		if (service == -2)
+			result = USBQT_DRIVER_RESTART_FIRST;
+		else if (service != 0)
+			result = USBQT_DRIVER_SERVICE;
+	}
 
 	struct filters before;
 	if (result == USBQT_DRIVER_DONE && !read_filters(set, info, &before))
@@ -428,8 +505,91 @@ static int install_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *in
 			delete_now_or_later(dst_sys);
 		if (made_dll)
 			delete_now_or_later(dst_dll);
+	} else {
+		/* (noted for a removal: only what this program made is ever deleted) */
+		DWORD marks = read_marks();
+		if (made_service || (marks & 1))
+			write_marks(marks | (made_service ? 1u : 0u) | (made_sys ? 2u : 0u) | (made_dll ? 4u : 0u));
 	}
 	return result;
+}
+
+/* whether any device (present or not) or any device class still names libusb0, as a filter or as its driver */
+static bool libusb0_in_use(void)
+{
+	bool used = false;
+	HDEVINFO set = SetupDiGetClassDevsW(NULL, NULL, NULL, DIGCF_ALLCLASSES);
+	if (set == INVALID_HANDLE_VALUE)
+		return true; /* (not known: kept) */
+	SP_DEVINFO_DATA info;
+	info.cbSize = sizeof(info);
+	static const DWORD props[] = {SPDRP_UPPERFILTERS, SPDRP_LOWERFILTERS, SPDRP_SERVICE};
+	for (DWORD i = 0; !used && SetupDiEnumDeviceInfo(set, i, &info); i++) {
+		for (int k = 0; k < 3 && !used; k++) {
+			wchar_t buf[1024];
+			DWORD type = 0, size = 0;
+			memset(buf, 0, sizeof(buf));
+			if (!SetupDiGetDeviceRegistryPropertyW(set, &info, props[k], &type, (PBYTE)buf, sizeof(buf) - 4, &size))
+				continue;
+			for (const wchar_t *p = buf; *p && p < buf + 1020; p += wcslen(p) + 1)
+				used = used || !_wcsicmp(p, L"libusb0");
+		}
+	}
+	SetupDiDestroyDeviceInfoList(set);
+	if (used)
+		return true;
+	/* (libusb-win32 can also be installed as a filter of a whole device class) */
+	HKEY classes;
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Class", 0, KEY_READ, &classes) !=
+	    ERROR_SUCCESS)
+		return true;
+	for (DWORD i = 0; !used; i++) {
+		wchar_t name[80];
+		DWORD len = 80;
+		LONG r = RegEnumKeyExW(classes, i, name, &len, NULL, NULL, NULL, NULL);
+		if (r == ERROR_NO_MORE_ITEMS)
+			break;
+		if (r != ERROR_SUCCESS)
+			continue;
+		static const wchar_t *const values[] = {L"UpperFilters", L"LowerFilters"};
+		for (int k = 0; k < 2 && !used; k++) {
+			wchar_t buf[1024];
+			DWORD size = sizeof(buf) - 4;
+			memset(buf, 0, sizeof(buf));
+			if (RegGetValueW(classes, name, values[k], RRF_RT_REG_MULTI_SZ, NULL, buf, &size) != ERROR_SUCCESS)
+				continue;
+			for (const wchar_t *p = buf; *p && p < buf + 1020; p += wcslen(p) + 1)
+				used = used || !_wcsicmp(p, L"libusb0");
+		}
+	}
+	RegCloseKey(classes);
+	return used;
+}
+
+/* the driver itself: deleted if this program installed it and nothing names it any more */
+static int remove_driver(void)
+{
+	DWORD marks = read_marks();
+	if (!(marks & 1) || libusb0_in_use())
+		return USBQT_DRIVER_KEPT;
+	wchar_t sysdir[MAX_PATH], path[MAX_PATH + 40];
+	UINT len = GetSystemDirectoryW(sysdir, MAX_PATH);
+	if (!len || len >= MAX_PATH)
+		return USBQT_DRIVER_KEPT;
+	bool later = false;
+	if (marks & 2) {
+		_snwprintf(path, MAX_PATH + 39, L"%ls\\drivers\\libusb0.sys", sysdir);
+		path[MAX_PATH + 39] = L'\0';
+		later = delete_ours(path, sys_sha256) || later;
+	}
+	if (marks & 4) {
+		_snwprintf(path, MAX_PATH + 39, L"%ls\\libusb0.dll", sysdir);
+		path[MAX_PATH + 39] = L'\0';
+		later = delete_ours(path, dll_sha256) || later;
+	}
+	/* (marked for deletion: gone at once, or when the driver is unloaded) */
+	delete_service();
+	return later ? USBQT_DRIVER_REBOOT : USBQT_DRIVER_DONE;
 }
 
 static int remove_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *instance)
@@ -437,16 +597,16 @@ static int remove_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *ins
 	struct filters before;
 	if (!read_filters(set, info, &before))
 		return USBQT_DRIVER_REGISTRY;
-	if (!has_libusb0(&before))
-		return USBQT_DRIVER_DONE;
-	if (!write_filters(set, info, &before, false))
-		return USBQT_DRIVER_REGISTRY;
-	DEVINST node = 0;
-	if (CM_Locate_DevNodeW(&node, (DEVINSTID_W)instance, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
-		restart_device(set, info);
-		device_healthy(instance, 20000);
+	if (has_libusb0(&before)) {
+		if (!write_filters(set, info, &before, false))
+			return USBQT_DRIVER_REGISTRY;
+		DEVINST node = 0;
+		if (CM_Locate_DevNodeW(&node, (DEVINSTID_W)instance, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
+			restart_device(set, info);
+			device_healthy(instance, 20000);
+		}
 	}
-	return USBQT_DRIVER_DONE;
+	return remove_driver();
 }
 
 static int run(int argc, wchar_t **argv)

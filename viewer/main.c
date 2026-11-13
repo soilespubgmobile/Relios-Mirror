@@ -16,6 +16,7 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <netlistmgr.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
@@ -144,6 +145,8 @@ static struct {
 	bool visible;        /* announced on the network (in the Apple device's Screen Mirroring list) */
 	bool hide_connected; /* the name leaves the Screen Mirroring lists while a paired device is mirroring */
 	bool keep_awake;     /* the screen is kept on (while something is mirrored) */
+	int net_private;     /* 1: a network Windows calls private is connected; 0: only public / domain ones (the
+			      * firewall lets nothing reach the receiver there); -1: not known */
 	bool usb_on;         /* wired (USB) mirroring is switched on (usbqt.c); Wi-Fi stays on as well */
 	char custom_folder[1024]; /* where recordings go, if chosen */
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
@@ -2209,9 +2212,14 @@ static void status_text(char *status, size_t size)
 		snprintf(status, size, "Başlatılıyor…");
 		break;
 	case MIRROR_LISTENING:
-		snprintf(status, size, A.visible ? "Hazır  •  Apple cihazında Ekran Yansıtma'dan " RECEIVER_NAME "'ı seçin%s" :
-				     "Hazır  •  Listede gizli (Ayarlar > Cihaz'dan gösterin)%s",
-			 A.pair_requested ? "  •  Yeni cihaz eşleştirme açık" : "");
+		if (A.net_private == 0)
+			snprintf(status, size, "Bu ağ Windows'ta \"Özel\" değil: güvenlik için iPad bağlanamaz (ev ağınızsa "
+					       "Windows'ta bu ağı \"Özel ağ\" yapın)");
+		else
+			snprintf(status, size,
+				 A.visible ? "Hazır  •  Apple cihazında Ekran Yansıtma'dan " RECEIVER_NAME "'ı seçin%s" :
+					     "Hazır  •  Listede gizli (Ayarlar > Cihaz'dan gösterin)%s",
+				 A.pair_requested ? "  •  Yeni cihaz eşleştirme açık" : "");
 		break;
 	case MIRROR_PIN:
 		snprintf(status, size, "Penceredeki kodu Apple cihazına girin");
@@ -3082,6 +3090,16 @@ static void remove_camera(void)
 
 static bool confirm(const char *text, bool yes_is_default);
 
+/* whether Memory Integrity (Windows Security > Device security > Core isolation) is switched on */
+static bool memory_integrity_on(void)
+{
+	DWORD v = 0, size = sizeof(v);
+	return RegGetValueW(HKEY_LOCAL_MACHINE,
+			    L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+			    L"Enabled", RRF_RT_REG_DWORD, NULL, &v, &size) == ERROR_SUCCESS &&
+	       v == 1;
+}
+
 /* The USB driver for the iPad that is plugged in: installed or removed by relios-usb-kurucu.exe (usbdriver.c), a
  * small program of its own that loads nothing from the program's folder, run with administrator rights (Windows
  * asks the user). */
@@ -3094,6 +3112,13 @@ static void usb_driver(void)
 		return;
 	}
 	bool removing = device.filtered;
+	if (!removing && memory_integrity_on() &&
+	    !confirm("Windows'ta \"Bellek bütünlüğü\" açık. Bu güvenlik özelliği, kablolu yansıtmanın eski USB sürücüsünü\n"
+		     "büyük olasılıkla yüklemeyecek (o zaman program yaptığı her şeyi geri alır).\n\n"
+		     "Güvenliğiniz için Bellek bütünlüğünü kapatmamanızı öneririz; bu bilgisayarda Wi-Fi ile yansıtın.\n\n"
+		     "Yine de denensin mi?",
+		     false))
+		return;
 	if (removing) {
 		if (!confirm("USB sürücüsü bu iPad'den kaldırılacak; Windows izin isteyecek, \"Evet\" deyin.\n"
 			     "Sonra iPad'i çıkarıp yeniden takın. (Wi-Fi ile yansıtma bundan etkilenmez.)\n\n"
@@ -3129,12 +3154,25 @@ static void usb_driver(void)
 
 	const char *text = NULL;
 	char other[200];
-	bool ok = code == USBQT_DRIVER_DONE;
+	bool ok = code == USBQT_DRIVER_DONE ||
+		  (removing && (code == USBQT_DRIVER_KEPT || code == USBQT_DRIVER_REBOOT));
 	switch (code) {
 	case USBQT_DRIVER_DONE:
-		text = removing ? "USB sürücüsü bu iPad'den kaldırıldı.\n\niPad'i çıkarıp yeniden takın." :
+		text = removing ? "USB sürücüsü kaldırıldı ve bilgisayardan tamamen silindi.\n\niPad'i çıkarıp yeniden takın." :
 				  "USB sürücüsü kuruldu ve kablolu yansıtma açıldı.\n\n"
 				  "iPad'i çıkarıp yeniden takın, kilidini açın ve sorarsa \"Bu Bilgisayara Güven\" deyin.";
+		break;
+	case USBQT_DRIVER_KEPT:
+		text = "USB sürücüsü bu iPad'den kaldırıldı. Sürücünün kendisi bilgisayarda bırakıldı: başka bir cihaz\n"
+		       "kullanıyor ya da onu Relios Mirror kurmadı.\n\niPad'i çıkarıp yeniden takın.";
+		break;
+	case USBQT_DRIVER_REBOOT:
+		text = "USB sürücüsü kaldırıldı; dosyaları, Windows'u bir sonraki yeniden başlatışınızda silinecek.\n\n"
+		       "iPad'i çıkarıp yeniden takın.";
+		break;
+	case USBQT_DRIVER_RESTART_FIRST:
+		text = "Önceki kaldırma işlemi, Windows'un yeniden başlatılmasını bekliyor.\n"
+		       "Bilgisayarı yeniden başlatıp tekrar deneyin.";
 		break;
 	case -1:
 		text = "İşlem yapılmadı (Windows izni verilmedi).";
@@ -3606,12 +3644,12 @@ static void ensure_firewall_rule(void)
 	system_program("netsh.exe", netsh, sizeof(netsh));
 	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
 	/* (the rules name the programs: made again if the folder moved; "v2": with the rules that keep both
-	 * programs off the internet) */
+	 * programs off the internet; "v3": the receiver reachable only on networks Windows calls private) */
 	char self[2100], marker[2200];
 	char *folder = SDL_GetBasePath();
 	snprintf(self, sizeof(self), "%sReliosMirror.exe", folder ? folder : "");
 	SDL_free(folder);
-	snprintf(marker, sizeof(marker), "v2|%s", A.exe);
+	snprintf(marker, sizeof(marker), "v3|%s", A.exe);
 	char *made_for = read_text("firewall.txt");
 	bool same = made_for && !strcmp(made_for, marker);
 	free(made_for);
@@ -3623,13 +3661,16 @@ static void ensure_firewall_rule(void)
 	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
 				 "Apple cihazının bağlanabilmesi için Windows Güvenlik Duvarı'nda izin gerekiyor.\n\n"
-				 "İzin yalnızca alıcı programa ve yalnızca yerel ağdan gelen bağlantılara verilir;\n"
-				 "ayrıca programın internete çıkışı Windows Güvenlik Duvarı'nda kapatılır.\n"
+				 "İzin yalnızca alıcı programa, yalnızca yerel ağdan gelen bağlantılara ve yalnızca\n"
+				 "Windows'ta \"Özel\" olarak işaretli ağlarda (ev ağı) verilir: kafe, okul, otel gibi\n"
+				 "\"Genel\" ağlarda alıcıya kimse bağlanamaz. Programın internete çıkışı da kapatılır.\n"
 				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.",
 				 A.win);
 	/* Out: nothing of the two programs leaves for the internet (every address that is not a private, link-local
 	 * or multicast one is blocked; a block rule wins over any allow rule). In: the receiver, from the local
-	 * network only. The rule that mirroring needs comes last: its result is the command's result. */
+	 * network only, and only on networks Windows calls private (on public and domain networks it is blocked:
+	 * a block rule also keeps Windows from asking, and from an "allow" given there later); nothing ever for the
+	 * program itself. The rule that mirroring needs comes last: its result is the command's result. */
 	static const char internet4[] = "0.0.0.0-9.255.255.255,11.0.0.0-100.63.255.255,100.128.0.0-169.253.255.255,"
 					"169.255.0.0-172.15.255.255,172.32.0.0-192.167.255.255,192.169.0.0-223.255.255.255";
 	static const char internet6[] = "2000::/3";
@@ -3637,13 +3678,16 @@ static void ensure_firewall_rule(void)
 	snprintf(cmd, sizeof(cmd),
 		 "/c \"\"%s\" advfirewall firewall delete rule name=\"Relios Mirror\""
 		 " & \"%s\" advfirewall firewall delete rule name=all program=\"%s\""
+		 " & \"%s\" advfirewall firewall delete rule name=all program=\"%s\""
 		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
 		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
 		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
 		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=out action=block program=\"%s\" remoteip=%s enable=yes"
-		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet enable=yes\"",
-		 netsh, netsh, A.exe, netsh, A.exe, internet6, netsh, self, internet6, netsh, A.exe, internet4, netsh, self,
-		 internet4, netsh, A.exe);
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=block program=\"%s\" enable=yes"
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=block program=\"%s\" profile=public,domain enable=yes"
+		 " & \"%s\" advfirewall firewall add rule name=\"Relios Mirror\" dir=in action=allow program=\"%s\" remoteip=localsubnet profile=private enable=yes\"",
+		 netsh, netsh, A.exe, netsh, self, netsh, A.exe, internet6, netsh, self, internet6, netsh, A.exe, internet4, netsh,
+		 self, internet4, netsh, self, netsh, A.exe, netsh, A.exe);
 	if (strlen(cmd) + 1 >= sizeof(cmd)) {
 		app_log("firewall rules not made: the folder names are too long");
 		return;
@@ -3654,10 +3698,71 @@ static void ensure_firewall_rule(void)
 			fputs(marker, f);
 			fclose(f);
 		}
-		app_log("firewall rules made (in: the receiver, local network only; out: no internet for both programs)");
+		app_log("firewall rules made (in: the receiver, local network only, private networks only; out: no internet "
+			"for both programs)");
 	} else {
 		app_log("firewall rule not made (refused, or an error)");
 	}
+}
+#endif
+
+#ifdef _WIN32
+/* Whether a network Windows calls private (home) is connected: only there may the iPad reach the receiver (see the
+ * firewall rules). 1: yes, 0: only public or domain networks, -1: no network or not known */
+static int network_private(void)
+{
+	static const GUID clsid = {0xDCB00C01, 0x570F, 0x4A9B, {0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B}};
+	static const GUID iid = {0xDCB00000, 0x570F, 0x4A9B, {0x8D, 0x69, 0x19, 0x9F, 0xDB, 0xA5, 0x72, 0x3B}};
+	HRESULT init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+	INetworkListManager *nlm = NULL;
+	int result = -1;
+	if (SUCCEEDED(CoCreateInstance(&clsid, NULL, CLSCTX_ALL, &iid, (void **)&nlm)) && nlm) {
+		IEnumNetworks *list = NULL;
+		if (SUCCEEDED(nlm->lpVtbl->GetNetworks(nlm, NLM_ENUM_NETWORK_CONNECTED, &list)) && list) {
+			INetwork *net = NULL;
+			ULONG got = 0;
+			bool any = false, home = false;
+			while (list->lpVtbl->Next(list, 1, &net, &got) == S_OK && got == 1 && net) {
+				NLM_NETWORK_CATEGORY category;
+				if (SUCCEEDED(net->lpVtbl->GetCategory(net, &category))) {
+					any = true;
+					home = home || category == NLM_NETWORK_CATEGORY_PRIVATE;
+				}
+				net->lpVtbl->Release(net);
+				net = NULL;
+			}
+			list->lpVtbl->Release(list);
+			if (any)
+				result = home ? 1 : 0;
+		}
+		nlm->lpVtbl->Release(nlm);
+	}
+	if (SUCCEEDED(init))
+		CoUninitialize();
+	return result;
+}
+
+/* looked at now and then: said once when it changes to "not private" */
+static void check_network(void)
+{
+	int now = network_private();
+	if (now == A.net_private)
+		return;
+	if (now == 0)
+		set_notice("Bu ağ Windows'ta \"Genel\": güvenlik için iPad bu ağdan bağlanamaz. Ev ağınızsa: Ayarlar > Ağ ve "
+			   "İnternet > ağınız > Ağ profili türü: \"Özel ağ\".",
+			   false);
+	if (now == 0 || A.net_private == 0)
+		app_log("network: %s", now == 1 ? "private" : now == 0 ? "public or domain only" : "not known");
+	A.net_private = now;
+	SDL_LockMutex(A.mutex);
+	if (now == 0)
+		A.notice_until = SDL_GetTicks() + 20000;
+	SDL_UnlockMutex(A.mutex);
+}
+#else
+static void check_network(void)
+{
 }
 #endif
 
@@ -3814,6 +3919,8 @@ int main(int argc, char *argv[])
 #ifdef _WIN32
 	ensure_firewall_rule();
 #endif
+	A.net_private = -1;
+	check_network();
 	session_start();
 	if (A.usb_on)
 		usb_start();
@@ -3924,6 +4031,9 @@ int main(int argc, char *argv[])
 				redraw = true;
 			if (A.usb_on && !usbqt_running())
 				usb_start(); /* (switched on while the previous run was still ending) */
+			static unsigned seconds;
+			if (++seconds % 15 == 0)
+				check_network();
 		}
 		if (A.camera_arming) {
 			if (SDL_AtomicGet(&A.camera_ok)) {
