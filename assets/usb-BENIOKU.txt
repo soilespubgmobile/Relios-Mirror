@@ -9,7 +9,8 @@ Bu klasordeki dosyalar libusb-win32 1.2.6.0'in resmi surumunden alinmistir (acik
   libusb-win32-*.txt              lisanslar ve yazarlar
 
 Relios Mirror bu dosyalari yalnizca Ayarlar > USB > "Kur" dugmesine basildiginda, Windows'un yonetici onayiyla
-ve yalnizca takili olan iPad / iPhone icin kurar:
+ve yalnizca takili olan iPad / iPhone icin kurar. Kurulumu programin yanindaki kucuk relios-usb-kurucu.exe yapar
+(yonetici yetkisiyle yalnizca o calisir; program klasorunden hicbir DLL yuklemez):
   - kurmadan once iki dosyanin SHA-256 parmak izini denetler; tutmazsa hicbir sey kurmaz,
   - bilgisayarda baska bir programin kurdugu farkli bir libusb0 varsa ona dokunmaz ve kurmaz,
   - Windows cihazi surucuyle baslatamazsa (orn. "Bellek butunlugu" eski surucuyu engellerse) yaptigini geri alir.

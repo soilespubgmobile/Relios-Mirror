@@ -18,22 +18,20 @@
  * helper process (this program started with --usb-switch), which waits until the device is back and settled and
  * then simply ends. The streaming handle is closed before the device is given back, so it never sends the request.
  *
- * The driver is installed by this program started with --usb-driver and administrator rights (usbqt_driver_main):
- * the two files of libusb-win32 1.2.6.0 are checked against their SHA-256 fingerprints before anything is changed,
- * an installed libusb0 of another version is never replaced, and if Windows does not start the device with the
- * filter (an old driver can be refused, e.g. with Memory Integrity on) everything is undone at once.
+ * The driver is installed by a small program of its own, relios-usb-kurucu.exe (usbdriver.c), with administrator
+ * rights. This file only reads Windows' device list and uses the installed driver.
  */
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
 #endif
 #include <windows.h>
-#include <bcrypt.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #endif
 
 #include "usbqt.h"
+#include "usbids.h"
 #include "qtproto.h"
 
 #include <ctype.h>
@@ -41,20 +39,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* the product IDs of iPhones, iPads and iPods (Apple's driver list; as in iPhoneMirror). Not Apple TV, Watch,
- * HomePod, adapters, nor a device in recovery or DFU mode */
-static bool apple_mobile_product(unsigned pid)
-{
-	static const unsigned short ids[] = {0x1290, 0x1291, 0x1292, 0x1293, 0x1294, 0x1297, 0x1299, 0x129A,
-					     0x129C, 0x129D, 0x129E, 0x129F, 0x12A0, 0x12A1, 0x12A2, 0x12A3,
-					     0x12A4, 0x12A5, 0x12A6, 0x12A8, 0x12A9, 0x12AA, 0x12AB, 0x12AC};
-	for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
-		if (ids[i] == pid)
-			return true;
-	}
-	return false;
-}
 
 #ifdef _WIN32
 
@@ -143,7 +127,9 @@ static struct {
 
 #define APPLE_VID 0x05AC
 #define CAPTURE_SUBCLASS 0x2A
-#define READ_SIZE (1 << 20)
+/* One read is at most 64 KiB: libusb-win32 cuts larger ones into 64 KiB requests, and when a request after the
+ * first runs into the time limit, the bytes the earlier ones brought are lost with the error it returns */
+#define READ_SIZE 65536
 
 /* the library the driver installation put into System32 (it belongs to the installed driver; without the driver it
  * would find nothing anyway). Nothing is loaded from the program's folder; its dependencies come from System32 */
@@ -190,14 +176,20 @@ static const char *lu_error(void)
 
 static struct {
 	HANDLE thread;
-	volatile LONG stop, quick, streaming;
+	/* detached: the program stopped waiting for this thread (it is ending): nothing is called back any more */
+	volatile LONG stop, quick, streaming, detached;
 	struct usbqt_callbacks cb;
 	enum usbqt_state state;
 } U;
 
+static bool detached(void)
+{
+	return InterlockedCompareExchange(&U.detached, 0, 0) != 0;
+}
+
 static void ulog(const char *fmt, ...)
 {
-	if (!U.cb.log)
+	if (!U.cb.log || detached())
 		return;
 	char text[400];
 	va_list args;
@@ -222,7 +214,7 @@ static void set_state(enum usbqt_state s)
 	if (s == U.state)
 		return;
 	U.state = s;
-	if (U.cb.state)
+	if (U.cb.state && !detached())
 		U.cb.state(s);
 }
 
@@ -335,27 +327,6 @@ static void wide_to_utf8(const wchar_t *w, char *out, size_t size)
 	if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)size, NULL, NULL))
 		out[0] = '\0';
 	out[size - 1] = '\0';
-}
-
-/* an iPad's / iPhone's own device instance (upper case ASCII): USB\VID_05AC&PID_xxxx\<serial>, the serial made of
- * letters, digits and dashes (not one of its interfaces: those have &MI_xx) */
-static bool valid_instance(const char *a)
-{
-	size_t n = strlen(a);
-	if (strncmp(a, "USB\\VID_05AC&PID_", 17) || n < 22 + 7 || n > 22 + 40 || a[21] != '\\')
-		return false;
-	for (int i = 17; i < 21; i++) {
-		if (!isxdigit((unsigned char)a[i]))
-			return false;
-	}
-	char hex[5] = {a[17], a[18], a[19], a[20], 0};
-	if (!apple_mobile_product((unsigned)strtoul(hex, NULL, 16)) || !isalnum((unsigned char)a[22]))
-		return false;
-	for (const char *p = a + 22; *p; p++) {
-		if (!isalnum((unsigned char)*p) && *p != '-')
-			return false;
-	}
-	return true;
 }
 
 bool usbqt_find_device(struct usbqt_device *out)
@@ -737,14 +708,14 @@ int usbqt_switch_main(int argc, char **argv)
 static void sink_video(void *ctx, const uint8_t *d, size_t n, bool h265, int w, int h)
 {
 	(void)ctx;
-	if (U.cb.video)
+	if (U.cb.video && !detached())
 		U.cb.video(d, n, h265, w, h);
 }
 
 static void sink_audio(void *ctx, const uint8_t *pcm, int frames, int channels, int rate)
 {
 	(void)ctx;
-	if (U.cb.audio)
+	if (U.cb.audio && !detached())
 		U.cb.audio(pcm, frames, channels, rate);
 }
 
@@ -862,7 +833,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		L.close(h);
 		return END_ERROR;
 	}
-	ULONGLONG start = GetTickCount64(), last_data = start, negotiated = 0;
+	ULONGLONG start = GetTickCount64(), last_data = start, answered = 0;
 	bool nudged = false;
 	for (;;) {
 		if (stopping()) {
@@ -889,8 +860,6 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				break;
 			}
 			enum qt_state st = qt_session_state(s);
-			if (st >= QT_NEGOTIATING && !negotiated)
-				negotiated = now;
 			if (st == QT_STREAMING && !InterlockedCompareExchange(&U.streaming, 0, 0)) {
 				InterlockedExchange(&U.streaming, 1);
 				set_state(USBQT_STREAMING);
@@ -900,12 +869,11 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				why = END_DEVICE_STOPPED;
 				break;
 			}
-			continue;
 		}
-		/* nothing for 250 ms */
+		/* (after every read: a device that keeps sending sound but no picture is not waited for forever) */
 		enum qt_state st = qt_session_state(s);
 		if (st == QT_WAIT_PING) {
-			if (!nudged && now - start > 1000) {
+			if (n <= 0 && !nudged && now - start > 1000) {
 				/* a freshly switched device can open its pipes before it starts; one control nudge, and a
 				 * PING of ours (iPhoneMirror). The nudge is never sent to a session found running */
 				nudged = true;
@@ -921,10 +889,15 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				why = END_LOCKED;
 				break;
 			}
-		} else if (!qt_session_video_frames(s) && negotiated && now - negotiated > 12000) {
+			continue;
+		}
+		if (!answered)
+			answered = now;
+		if (!qt_session_video_frames(s) && now - answered > 12000) {
 			ulog("the device answered but sent no picture in 12 s");
 			break;
-		} else if (now - last_data > 15000) {
+		}
+		if (now - last_data > 15000) {
 			ulog("nothing from the device for 15 s");
 			break;
 		}
@@ -976,7 +949,7 @@ static void give_back(const char *serial, unsigned pid)
 {
 	if (!interface_present(pid, serial))
 		return;
-	int code = run_switch("restore", serial, pid, quick() ? 8000 : 20000);
+	int code = run_switch("restore", serial, pid, quick() ? 6000 : 20000);
 	ulog("device given back to its usual configuration (%d)", code);
 }
 
@@ -1002,11 +975,16 @@ static DWORD WINAPI usb_main(LPVOID unused)
 {
 	(void)unused;
 	wait_for_helpers();
-	unsigned failures = 0;
+	unsigned failures = 0, locked = 0;
+	/* a device left in its capture configuration while it waits to be unlocked (given back when this ends) */
+	char held[80] = "";
+	unsigned held_pid = 0;
 	enum usbqt_state waiting_logged = USBQT_OFF;
 	while (!stopping()) {
 		struct found f;
 		if (!load_libusb() || !find_apple(NULL, 0, &f)) {
+			held[0] = '\0'; /* (unplugged: nothing to give back) */
+			locked = 0;
 			unsigned problem = 0;
 			enum usbqt_state st = waiting_state(&problem);
 			if (st != waiting_logged) {
@@ -1023,9 +1001,10 @@ static DWORD WINAPI usb_main(LPVOID unused)
 			continue;
 		}
 		waiting_logged = USBQT_OFF;
-		ulog("iPad / iPhone on USB (product %04x)", f.pid);
+		if (!held[0])
+			ulog("iPad / iPhone on USB (product %04x)", f.pid);
 
-		/* already in its capture configuration (left so by an earlier run)? */
+		/* already in its capture configuration (left so by an earlier run, or while it was locked)? */
 		bool capturing = false;
 		lu_handle *h = L.open(f.dev);
 		if (h) {
@@ -1035,7 +1014,8 @@ static DWORD WINAPI usb_main(LPVOID unused)
 			L.close(h);
 		}
 		bool newly = false;
-		set_state(USBQT_STARTING);
+		if (U.state != USBQT_LOCKED)
+			set_state(USBQT_STARTING);
 		if (!capturing) {
 			ulog("switching the device to screen capture");
 			int code = run_switch("activate", f.serial, f.pid, 25000);
@@ -1048,30 +1028,51 @@ static DWORD WINAPI usb_main(LPVOID unused)
 			}
 			newly = code != 20;
 		}
-		if (stopping())
+		if (stopping()) {
+			if (newly || capturing)
+				give_back(f.serial, f.pid);
+			held[0] = '\0';
 			break;
+		}
 		struct capture_iface q;
 		lu_handle *stream_h = open_capture(f.serial, f.pid, newly, &q);
 		if (!stream_h) {
 			failures++;
 			give_back(f.serial, f.pid);
+			held[0] = '\0';
 			set_state(USBQT_ERROR);
 			backoff(failures);
 			continue;
 		}
+		ULONGLONG began = GetTickCount64();
 		enum end_reason why = stream(stream_h, &q, newly, f.serial, f.pid);
+		bool short_session = GetTickCount64() - began < 30000;
+		if (why == END_LOCKED && !stopping() && ++locked != 10 && locked != 30) {
+			/* Kept in its capture configuration and tried again in a moment without switching it: every switch
+			 * makes it leave and come back, which Windows sounds each time. (The 10th and the 30th try switch it
+			 * anew; after that only unplugging it, or switching wired mirroring off and on, does.) */
+			snprintf(held, sizeof(held), "%s", f.serial);
+			held_pid = f.pid;
+			set_state(USBQT_LOCKED);
+			wait_ms(5000);
+			continue;
+		}
+		held[0] = '\0';
+		if (why != END_LOCKED)
+			locked = 0;
 		if (why != END_GONE)
 			give_back(f.serial, f.pid);
-		if (why == END_ERROR || why == END_LOCKED) {
+		if (why == END_ERROR || why == END_LOCKED || (why == END_DEVICE_STOPPED && short_session)) {
+			/* (a session the device ends at once counts as a failure too: it is not switched again and again) */
 			failures++;
 			set_state(why == END_LOCKED ? USBQT_LOCKED : USBQT_ERROR);
 			backoff(failures);
 		} else {
 			failures = 0;
-			if (why == END_DEVICE_STOPPED)
-				wait_ms(3000);
 		}
 	}
+	if (held[0])
+		give_back(held, held_pid);
 	set_state(USBQT_OFF);
 	return 0;
 }
@@ -1091,6 +1092,7 @@ bool usbqt_start(const struct usbqt_callbacks *cb)
 	InterlockedExchange(&U.stop, 0);
 	InterlockedExchange(&U.quick, 0);
 	InterlockedExchange(&U.streaming, 0);
+	InterlockedExchange(&U.detached, 0);
 	U.thread = CreateThread(NULL, 0, usb_main, NULL, 0, NULL);
 	return U.thread != NULL;
 }
@@ -1102,9 +1104,12 @@ void usbqt_stop(bool wait)
 	InterlockedExchange(&U.stop, 1);
 	if (wait) {
 		InterlockedExchange(&U.quick, 1);
-		if (WaitForSingleObject(U.thread, 12000) == WAIT_OBJECT_0) {
+		if (WaitForSingleObject(U.thread, 15000) == WAIT_OBJECT_0) {
 			CloseHandle(U.thread);
 			U.thread = NULL;
+		} else {
+			/* (still waiting for a helper: the program goes on ending, so nothing may be called back any more) */
+			InterlockedExchange(&U.detached, 1);
 		}
 	}
 }
@@ -1119,403 +1124,11 @@ bool usbqt_streaming(void)
 	return InterlockedCompareExchange(&U.streaming, 0, 0) != 0;
 }
 
-/* ------------------------------------------------------------------ the driver (with administrator rights) */
-
-/* libusb-win32 1.2.6.0, amd64 (https://sourceforge.net/projects/libusb-win32/files/libusb-win32-releases/1.2.6.0/).
- * The build checks the same fingerprints when it downloads them */
-static const char sys_sha256[] = "8058f2afe6ef96a7d2ded432997fd8655970c9ea75a938ee4557d6a2cb4cc989";
-static const char dll_sha256[] = "4f18b5d2c28aa66b648c8683c6d09b52b92cbbee85984bbefad5f38a64bc2a14";
-
-static bool sha256_hex(const uint8_t *data, size_t n, char out[65])
-{
-	BCRYPT_ALG_HANDLE alg = NULL;
-	BCRYPT_HASH_HANDLE hash = NULL;
-	UCHAR digest[32];
-	bool ok = false;
-	out[0] = '\0';
-	if (n > 0x7FFFFFFF || (LONG)BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) < 0)
-		return false;
-	if ((LONG)BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) >= 0) {
-		ok = (LONG)BCryptHashData(hash, (PUCHAR)data, (ULONG)n, 0) >= 0 &&
-		     (LONG)BCryptFinishHash(hash, digest, (ULONG)sizeof(digest), 0) >= 0;
-		BCryptDestroyHash(hash);
-	}
-	BCryptCloseAlgorithmProvider(alg, 0);
-	if (ok) {
-		for (int i = 0; i < 32; i++)
-			snprintf(out + i * 2, 3, "%02x", digest[i]);
-	}
-	return ok;
-}
-
-/* a whole file (at most max bytes) */
-static uint8_t *read_whole(const wchar_t *path, size_t max, size_t *n)
-{
-	*n = 0;
-	HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (f == INVALID_HANDLE_VALUE)
-		return NULL;
-	uint8_t *buf = NULL;
-	LARGE_INTEGER size;
-	if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && (unsigned long long)size.QuadPart <= max) {
-		DWORD want = (DWORD)size.QuadPart, got = 0;
-		buf = malloc(want);
-		if (buf && ReadFile(f, buf, want, &got, NULL) && got == want) {
-			*n = want;
-		} else {
-			free(buf);
-			buf = NULL;
-		}
-	}
-	CloseHandle(f);
-	return buf;
-}
-
-enum { FILE_MISSING, FILE_SAME, FILE_OTHER };
-
-static int file_state(const wchar_t *path, const char *sha)
-{
-	if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-		DWORD e = GetLastError();
-		return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? FILE_MISSING : FILE_OTHER;
-	}
-	size_t n = 0;
-	uint8_t *data = read_whole(path, 16u << 20, &n);
-	char hex[65];
-	bool same = data && sha256_hex(data, n, hex) && !strcmp(hex, sha);
-	free(data);
-	return same ? FILE_SAME : FILE_OTHER;
-}
-
-/* a file that is not there yet, written from memory (what was checked is what is written), then checked again */
-static bool write_new(const wchar_t *path, const uint8_t *data, size_t n, const char *sha)
-{
-	wchar_t tmp[MAX_PATH + 64];
-	if (wcslen(path) + 16 >= sizeof(tmp) / sizeof(tmp[0]))
-		return false;
-	wcscpy(tmp, path);
-	wcscat(tmp, L".relios-tmp");
-	DeleteFileW(tmp);
-	HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (f == INVALID_HANDLE_VALUE)
-		return false;
-	DWORD put = 0;
-	bool ok = WriteFile(f, data, (DWORD)n, &put, NULL) && put == (DWORD)n && FlushFileBuffers(f);
-	CloseHandle(f);
-	if (!ok || !MoveFileExW(tmp, path, MOVEFILE_WRITE_THROUGH)) {
-		DeleteFileW(tmp);
-		return false;
-	}
-	return file_state(path, sha) == FILE_SAME;
-}
-
-static void delete_now_or_later(const wchar_t *path)
-{
-	if (!DeleteFileW(path))
-		MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-}
-
-/* the libusb0 kernel service: an existing one must be a kernel driver that is not disabled, from
- * ...\drivers\libusb0.sys; otherwise it is made (made: whether this call made it). 0 when ready */
-static int ensure_service(bool *made)
-{
-	*made = false;
-	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
-	if (!scm)
-		return -1;
-	int result = -1;
-	SC_HANDLE svc = OpenServiceW(scm, L"libusb0", SERVICE_QUERY_CONFIG);
-	if (svc) {
-		DWORD need = 0;
-		QueryServiceConfigW(svc, NULL, 0, &need);
-		QUERY_SERVICE_CONFIGW *cfg = need > 0 && need < 65536 ? malloc(need) : NULL;
-		if (cfg && QueryServiceConfigW(svc, cfg, need, &need)) {
-			static const wchar_t tail[] = L"\\drivers\\libusb0.sys";
-			const wchar_t *path = cfg->lpBinaryPathName ? cfg->lpBinaryPathName : L"";
-			size_t len = wcslen(path), tl = wcslen(tail);
-			if (cfg->dwServiceType == SERVICE_KERNEL_DRIVER && cfg->dwStartType != SERVICE_DISABLED && len >= tl &&
-			    !_wcsicmp(path + len - tl, tail))
-				result = 0;
-		}
-		free(cfg);
-		CloseServiceHandle(svc);
-	} else if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
-		svc = CreateServiceW(scm, L"libusb0", L"libusb-win32 - Kernel Driver, Version 1.2.6.0", SERVICE_QUERY_CONFIG,
-				     SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-				     L"System32\\drivers\\libusb0.sys", NULL, NULL, NULL, NULL, NULL);
-		if (svc) {
-			*made = true;
-			result = 0;
-			CloseServiceHandle(svc);
-		}
-	}
-	CloseServiceHandle(scm);
-	return result;
-}
-
-static void delete_service(void)
-{
-	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-	SC_HANDLE svc = scm ? OpenServiceW(scm, L"libusb0", DELETE) : NULL;
-	if (svc) {
-		DeleteService(svc);
-		CloseServiceHandle(svc);
-	}
-	if (scm)
-		CloseServiceHandle(scm);
-}
-
-/* the device's upper filters (REG_MULTI_SZ) */
-struct filters {
-	wchar_t list[1024];
-	bool existed;
-	DWORD bytes;
-};
-
-static bool read_filters(HDEVINFO set, SP_DEVINFO_DATA *info, struct filters *f)
-{
-	DWORD type = 0, size = 0;
-	memset(f, 0, sizeof(*f));
-	if (SetupDiGetDeviceRegistryPropertyW(set, info, SPDRP_UPPERFILTERS, &type, (PBYTE)f->list, sizeof(f->list) - 4,
-					      &size)) {
-		if (type != REG_MULTI_SZ || size > sizeof(f->list) - 4)
-			return false;
-		f->existed = true;
-		f->bytes = size;
-		return true;
-	}
-	return GetLastError() == ERROR_INVALID_DATA; /* (the device has none) */
-}
-
-static bool has_libusb0(const struct filters *f)
-{
-	for (const wchar_t *p = f->list; *p && p < f->list + 1020; p += wcslen(p) + 1) {
-		if (!_wcsicmp(p, L"libusb0"))
-			return true;
-	}
-	return false;
-}
-
-/* the list without libusb0, and with it at the end when add; an empty list removes the value */
-static bool write_filters(HDEVINFO set, SP_DEVINFO_DATA *info, const struct filters *old, bool add)
-{
-	wchar_t list[1100];
-	size_t o = 0;
-	for (const wchar_t *p = old->list; *p && p < old->list + 1020; p += wcslen(p) + 1) {
-		size_t len = wcslen(p);
-		if (!_wcsicmp(p, L"libusb0"))
-			continue;
-		if (o + len + 12 >= sizeof(list) / sizeof(list[0]))
-			return false;
-		memcpy(list + o, p, (len + 1) * sizeof(wchar_t));
-		o += len + 1;
-	}
-	if (add) {
-		memcpy(list + o, L"libusb0", 8 * sizeof(wchar_t));
-		o += 8;
-	}
-	list[o] = L'\0';
-	if (o == 0)
-		return SetupDiSetDeviceRegistryPropertyW(set, info, SPDRP_UPPERFILTERS, NULL, 0) != FALSE;
-	return SetupDiSetDeviceRegistryPropertyW(set, info, SPDRP_UPPERFILTERS, (const BYTE *)list,
-						 (DWORD)((o + 1) * sizeof(wchar_t))) != FALSE;
-}
-
-static bool restore_filters(HDEVINFO set, SP_DEVINFO_DATA *info, const struct filters *old)
-{
-	if (!old->existed)
-		return SetupDiSetDeviceRegistryPropertyW(set, info, SPDRP_UPPERFILTERS, NULL, 0) != FALSE;
-	return SetupDiSetDeviceRegistryPropertyW(set, info, SPDRP_UPPERFILTERS, (const BYTE *)old->list, old->bytes) !=
-	       FALSE;
-}
-
-/* the device is stopped and started again (its drivers loaded anew), as libusb-win32's installer does */
-static void restart_device(HDEVINFO set, SP_DEVINFO_DATA *info)
-{
-	SP_PROPCHANGE_PARAMS p;
-	memset(&p, 0, sizeof(p));
-	p.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
-	p.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-	p.StateChange = DICS_PROPCHANGE;
-	p.Scope = DICS_FLAG_CONFIGSPECIFIC;
-	p.HwProfile = 0;
-	if (SetupDiSetClassInstallParamsW(set, info, &p.ClassInstallHeader, sizeof(p)))
-		SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, info);
-}
-
-/* present, started and without a problem (waits at most timeout_ms for it) */
-static bool device_healthy(const wchar_t *instance, DWORD timeout_ms)
-{
-	ULONGLONG until = GetTickCount64() + timeout_ms;
-	for (;;) {
-		DEVINST node = 0;
-		ULONG status = 0, problem = 0;
-		if (CM_Locate_DevNodeW(&node, (DEVINSTID_W)instance, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
-		    CM_Get_DevNode_Status(&status, &problem, node, 0) == CR_SUCCESS && !(status & DN_HAS_PROBLEM) &&
-		    (status & DN_STARTED))
-			return true;
-		if (GetTickCount64() >= until)
-			return false;
-		Sleep(250);
-	}
-}
-
-/* (libusb-win32's installer removes this value of the device when it adds the filter) */
-static void remove_surprise_value(HDEVINFO set, SP_DEVINFO_DATA *info)
-{
-	HKEY key = SetupDiOpenDevRegKey(set, info, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_SET_VALUE);
-	if (key && key != (HKEY)INVALID_HANDLE_VALUE) {
-		RegDeleteValueW(key, L"SurpriseRemovalOK");
-		RegCloseKey(key);
-	}
-}
-
-static int install_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *instance)
-{
-	if (!device_healthy(instance, 0))
-		return USBQT_DRIVER_DEVICE_PROBLEM;
-
-	/* the files: read once, checked, and written from what was checked */
-	wchar_t folder[MAX_PATH * 2], src_sys[MAX_PATH * 2 + 40], src_dll[MAX_PATH * 2 + 40];
-	DWORD n = GetModuleFileNameW(NULL, folder, MAX_PATH * 2);
-	wchar_t *slash = n && n < MAX_PATH * 2 ? wcsrchr(folder, L'\\') : NULL;
-	if (!slash)
-		return USBQT_DRIVER_NO_FILES;
-	slash[1] = L'\0';
-	_snwprintf(src_sys, MAX_PATH * 2 + 39, L"%lsusb\\libusb0.sys", folder);
-	_snwprintf(src_dll, MAX_PATH * 2 + 39, L"%lsusb\\libusb0.dll", folder);
-	src_sys[MAX_PATH * 2 + 39] = src_dll[MAX_PATH * 2 + 39] = L'\0';
-	size_t sys_n = 0, dll_n = 0;
-	uint8_t *sys = read_whole(src_sys, 4u << 20, &sys_n), *dll = read_whole(src_dll, 4u << 20, &dll_n);
-	char hex[65];
-	int result = USBQT_DRIVER_DONE;
-	if (!sys || !dll)
-		result = USBQT_DRIVER_NO_FILES;
-	else if (!sha256_hex(sys, sys_n, hex) || strcmp(hex, sys_sha256) || !sha256_hex(dll, dll_n, hex) ||
-		 strcmp(hex, dll_sha256))
-		result = USBQT_DRIVER_BAD_FILES;
-
-	wchar_t sysdir[MAX_PATH], dst_sys[MAX_PATH + 40], dst_dll[MAX_PATH + 40];
-	UINT len = GetSystemDirectoryW(sysdir, MAX_PATH);
-	if (len == 0 || len >= MAX_PATH) {
-		if (result == USBQT_DRIVER_DONE)
-			result = USBQT_DRIVER_COPY;
-		sysdir[0] = L'\0';
-	}
-	_snwprintf(dst_sys, MAX_PATH + 39, L"%ls\\drivers\\libusb0.sys", sysdir);
-	_snwprintf(dst_dll, MAX_PATH + 39, L"%ls\\libusb0.dll", sysdir);
-	dst_sys[MAX_PATH + 39] = dst_dll[MAX_PATH + 39] = L'\0';
-	bool made_sys = false, made_dll = false, made_service = false;
-	if (result == USBQT_DRIVER_DONE) {
-		/* a libusb0 already installed by another program is left as it is */
-		int sys_state = file_state(dst_sys, sys_sha256), dll_state = file_state(dst_dll, dll_sha256);
-		if (sys_state == FILE_OTHER || dll_state == FILE_OTHER)
-			result = USBQT_DRIVER_OTHER_VERSION;
-		if (result == USBQT_DRIVER_DONE && sys_state == FILE_MISSING) {
-			made_sys = write_new(dst_sys, sys, sys_n, sys_sha256);
-			if (!made_sys)
-				result = USBQT_DRIVER_COPY;
-		}
-		if (result == USBQT_DRIVER_DONE && dll_state == FILE_MISSING) {
-			made_dll = write_new(dst_dll, dll, dll_n, dll_sha256);
-			if (!made_dll)
-				result = USBQT_DRIVER_COPY;
-		}
-	}
-	free(sys);
-	free(dll);
-	if (result == USBQT_DRIVER_DONE && ensure_service(&made_service) != 0)
-		result = USBQT_DRIVER_SERVICE;
-
-	struct filters before;
-	if (result == USBQT_DRIVER_DONE && !read_filters(set, info, &before))
-		result = USBQT_DRIVER_REGISTRY;
-	if (result == USBQT_DRIVER_DONE && !has_libusb0(&before)) {
-		if (!write_filters(set, info, &before, true)) {
-			result = USBQT_DRIVER_REGISTRY;
-		} else {
-			remove_surprise_value(set, info);
-			restart_device(set, info);
-			if (!device_healthy(instance, 20000)) {
-				/* Windows did not start the device with the filter: back as it was */
-				restore_filters(set, info, &before);
-				restart_device(set, info);
-				device_healthy(instance, 20000);
-				result = USBQT_DRIVER_NOT_LOADED;
-			}
-		}
-	}
-	if (result != USBQT_DRIVER_DONE) {
-		/* (what this run added is taken away again) */
-		if (made_service)
-			delete_service();
-		if (made_sys)
-			delete_now_or_later(dst_sys);
-		if (made_dll)
-			delete_now_or_later(dst_dll);
-	}
-	return result;
-}
-
-/* the filter leaves the device (the service and the files stay: other devices may use them, and without a device
- * that names it the driver is never loaded) */
-static int remove_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *instance)
-{
-	struct filters before;
-	if (!read_filters(set, info, &before))
-		return USBQT_DRIVER_REGISTRY;
-	if (!has_libusb0(&before))
-		return USBQT_DRIVER_DONE;
-	if (!write_filters(set, info, &before, false))
-		return USBQT_DRIVER_REGISTRY;
-	DEVINST node = 0;
-	if (CM_Locate_DevNodeW(&node, (DEVINSTID_W)instance, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
-		restart_device(set, info);
-		device_healthy(instance, 20000);
-	}
-	return USBQT_DRIVER_DONE;
-}
-
-int usbqt_driver_main(int argc, char **argv)
-{
-	if (argc != 4)
-		return USBQT_DRIVER_ARGUMENTS;
-	bool install = !strcmp(argv[2], "install");
-	if (!install && strcmp(argv[2], "remove"))
-		return USBQT_DRIVER_ARGUMENTS;
-	char instance[200];
-	if (strlen(argv[3]) >= sizeof(instance))
-		return USBQT_DRIVER_ARGUMENTS;
-	size_t i = 0;
-	for (; argv[3][i]; i++)
-		instance[i] = (char)toupper((unsigned char)argv[3][i]);
-	instance[i] = '\0';
-	if (!valid_instance(instance))
-		return USBQT_DRIVER_ARGUMENTS;
-	wchar_t winstance[200];
-	for (i = 0; instance[i]; i++)
-		winstance[i] = (wchar_t)(unsigned char)instance[i];
-	winstance[i] = L'\0';
-
-	HDEVINFO set = SetupDiCreateDeviceInfoList(NULL, NULL);
-	if (set == INVALID_HANDLE_VALUE)
-		return USBQT_DRIVER_NO_DEVICE;
-	SP_DEVINFO_DATA info;
-	memset(&info, 0, sizeof(info));
-	info.cbSize = sizeof(info);
-	int result = USBQT_DRIVER_NO_DEVICE;
-	if (SetupDiOpenDeviceInfoW(set, winstance, NULL, 0, &info))
-		result = install ? install_filter(set, &info, winstance) : remove_filter(set, &info, winstance);
-	SetupDiDestroyDeviceInfoList(set);
-	return result;
-}
-
 #else /* not Windows: wired mirroring needs the Windows driver */
 
 bool usbqt_start(const struct usbqt_callbacks *cb)
 {
 	(void)cb;
-	(void)apple_mobile_product;
 	return false;
 }
 
@@ -1551,13 +1164,6 @@ int usbqt_switch_main(int argc, char **argv)
 	(void)argc;
 	(void)argv;
 	return 1;
-}
-
-int usbqt_driver_main(int argc, char **argv)
-{
-	(void)argc;
-	(void)argv;
-	return USBQT_DRIVER_ARGUMENTS;
 }
 
 #endif

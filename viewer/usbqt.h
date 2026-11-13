@@ -52,8 +52,7 @@ bool usbqt_is_helper(unsigned long pid);
 /* the helper: "--usb-switch activate|restore <serial> <product id, hex>"; returns its exit code */
 int usbqt_switch_main(int argc, char **argv);
 
-/* the driver installer, run with administrator rights: "--usb-driver install|remove <device instance>" */
-int usbqt_driver_main(int argc, char **argv);
+/* the exit codes of the driver installer, relios-usb-kurucu.exe (usbdriver.c): "install|remove <device instance>" */
 enum {
 	USBQT_DRIVER_DONE = 0,
 	USBQT_DRIVER_ARGUMENTS = 1,

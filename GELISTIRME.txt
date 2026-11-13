@@ -90,10 +90,14 @@ viewer\main.c         Programın tamamı (tek dosya). Bölümler, dosyadaki sır
                       - Windows: ensure_firewall_rule, autostart_get / autostart_set, other_copies
                       - main: açılış sırası ve olay döngüsü
 viewer\usbqt.c        Kablolu yansıtma (Windows): iPad'i libusb0 ile bulur, "--usb-switch" yardımcısıyla ekran kaydı
-                      yapılandırmasına geçirir ve geri verir, akışı okuyup qtproto.c'ye verir. Sürücü kurucusu
-                      (usbqt_driver_main, "--usb-driver install|remove <aygıt>", yönetici onayıyla) da buradadır:
-                      parmak izi denetimi, hizmet, iPad'in UpperFilters değeri, yeniden başlatma ve geri alma.
+                      yapılandırmasına geçirir ve geri verir, akışı okuyup qtproto.c'ye verir. Kilitli iPad'i
+                      yapılandırmasında bırakıp geçirmeden yeniden dener (her geçişte Windows ses çıkarır).
                       Sıra iPhoneMirror'dan (GPL-3.0-only) uyarlanmıştır; ayrıntılar dosyanın başında.
+viewer\usbdriver.c    Sürücü kurucusu: ayrı, küçük program relios-usb-kurucu.exe ("install|remove <aygıt>",
+                      yönetici onayıyla). Statik bağlanır, yalnızca Windows'un KnownDLL'lerini ister (paketle.sh
+                      bunu denetler; başka DLL isterse derleme durur). Parmak izi denetimi, hizmet, iPad'in
+                      UpperFilters değeri, yeniden başlatma, sağlık denetimi ve geri alma.
+viewer\usbids.h       Dokunulabilecek Apple cihazları (ürün kimlikleri, aygıt örneği biçimi).
 viewer\qtproto.c      USB protokolü (QuickTime ekran kaydı: PING / SYNC / ASYN / RPLY, CMSampleBuffer). Platformdan
                       bağımsızdır; quicktime_video_hack'e (MIT) dayanır.
 viewer\proc_win.c     Alıcıyı düşük yetkiyle (low integrity) ve bir iş nesnesi içinde başlatır.

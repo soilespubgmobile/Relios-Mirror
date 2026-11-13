@@ -33,6 +33,13 @@ if(WIN32)
   # the one-file version: carries the whole folder and unpacks it at the first start (see paketle.sh)
   add_executable(launcher WIN32 viewer/launcher.c viewer/app.rc)
   target_link_options(launcher PRIVATE -static)
+  # the USB driver's installer, run with administrator rights: static, and only Windows' own DLLs (cfgmgr32 and
+  # bcrypt are not linked: the CM_ functions come from setupapi, bcrypt is loaded from System32; paketle.sh checks)
+  add_executable(relios-usb-kurucu WIN32 viewer/usbdriver.c viewer/usbids.h viewer/usbqt.h viewer/usbdriver.rc)
+  set_source_files_properties(viewer/usbdriver.rc PROPERTIES COMPILE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/viewer")
+  target_link_libraries(relios-usb-kurucu PRIVATE setupapi advapi32 shell32)
+  target_link_options(relios-usb-kurucu PRIVATE -static)
+  target_compile_options(relios-usb-kurucu PRIVATE -Wall -Wextra)
 else()
   add_executable(ReliosMirror viewer/main.c viewer/proc_posix.c viewer/proc.h viewer/qtproto.c viewer/qtproto.h
                  viewer/usbqt.c viewer/usbqt.h)

@@ -3082,8 +3082,9 @@ static void remove_camera(void)
 
 static bool confirm(const char *text, bool yes_is_default);
 
-/* The USB driver for the iPad that is plugged in: installed or removed by this program started again with
- * administrator rights (usbqt_driver_main; Windows asks the user). */
+/* The USB driver for the iPad that is plugged in: installed or removed by relios-usb-kurucu.exe (usbdriver.c), a
+ * small program of its own that loads nothing from the program's folder, run with administrator rights (Windows
+ * asks the user). */
 static void usb_driver(void)
 {
 	struct usbqt_device device;
@@ -3108,15 +3109,19 @@ static void usb_driver(void)
 			    true)) {
 		return;
 	}
-	if (removing && usbqt_running())
-		usbqt_stop(true); /* (the device is given back to its usual state first) */
-
-	wchar_t self[MAX_PATH * 2];
-	char exe[MAX_PATH * 6], args[400];
-	DWORD n = GetModuleFileNameW(NULL, self, MAX_PATH * 2);
-	if (!n || n >= MAX_PATH * 2 || !WideCharToMultiByte(CP_UTF8, 0, self, -1, exe, (int)sizeof(exe), NULL, NULL))
+	char exe[2100], args[400];
+	char *base = SDL_GetBasePath();
+	snprintf(exe, sizeof(exe), "%srelios-usb-kurucu.exe", base ? base : "");
+	SDL_free(base);
+	if (!file_exists_utf8(exe)) {
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, APP_NAME,
+					 "Bu sürümde USB sürücüsünün kurucusu yok (relios-usb-kurucu.exe eksik).", A.win);
 		return;
-	snprintf(args, sizeof(args), "--usb-driver %s %s", removing ? "remove" : "install", device.instance);
+	}
+	/* (the wired mirroring pauses meanwhile: the device is given back to its usual state first) */
+	if (usbqt_running())
+		usbqt_stop(true);
+	snprintf(args, sizeof(args), "%s %s", removing ? "remove" : "install", device.instance);
 	app_log("USB driver: %s for %s (%s)", removing ? "removal" : "installation", device.instance, device.name);
 	int code = run_elevated_wait(exe, args, 90000);
 	app_log("USB driver: result %d", code);
@@ -3166,11 +3171,9 @@ static void usb_driver(void)
 		/* installed: wired mirroring on; removed: off (it could not work any more) */
 		A.usb_on = !removing;
 		save_settings();
-		if (A.usb_on)
-			usb_start();
-		else
-			usbqt_stop(false);
 	}
+	if (A.usb_on)
+		usb_start(); /* (or again a moment later, from the main loop) */
 	SDL_ShowSimpleMessageBox(ok ? SDL_MESSAGEBOX_INFORMATION : SDL_MESSAGEBOX_WARNING, APP_NAME, text, A.win);
 }
 
@@ -3710,8 +3713,6 @@ int main(int argc, char *argv[])
 	/* this program started again for a short USB task (usbqt.c): no window, no settings */
 	if (argc == 5 && !strcmp(argv[1], "--usb-switch"))
 		return usbqt_switch_main(argc, argv);
-	if (argc == 4 && !strcmp(argv[1], "--usb-driver"))
-		return usbqt_driver_main(argc, argv);
 
 	SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
 	/* (the program may stay open all day: the screen may switch off and the computer may sleep, except while

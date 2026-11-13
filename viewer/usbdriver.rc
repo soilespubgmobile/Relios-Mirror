@@ -1,0 +1,33 @@
+#include <winver.h>
+#include "version.h"
+
+1 ICON "app.ico"
+
+/* what Windows shows about the file (also in the consent dialog when the USB driver is installed) */
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION APP_VERSION_NUMBERS
+PRODUCTVERSION APP_VERSION_NUMBERS
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Relios Mirror USB Driver Setup"
+            VALUE "ProductName", "Relios Mirror"
+            VALUE "FileVersion", APP_VERSION
+            VALUE "ProductVersion", APP_VERSION
+            VALUE "InternalName", "relios-usb-kurucu"
+            VALUE "OriginalFilename", "relios-usb-kurucu.exe"
+            VALUE "LegalCopyright", "GPL-3.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

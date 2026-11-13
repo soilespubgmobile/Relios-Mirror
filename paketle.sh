@@ -10,7 +10,16 @@ cmake --build build
 out=dist/ReliosMirror
 rm -rf dist
 mkdir -p "$out"
-cp build/bin/ReliosMirror.exe build/bin/relios-airplay-receiver.exe "$out/"
+cp build/bin/ReliosMirror.exe build/bin/relios-airplay-receiver.exe build/bin/relios-usb-kurucu.exe "$out/"
+# The USB driver's installer runs with administrator rights from this folder: it may need nothing from the folder.
+# Only these may be imported (Windows' KnownDLLs and its C runtime); anything else stops the build.
+bad=$(objdump -p "$out/relios-usb-kurucu.exe" | sed -n 's/^[[:space:]]*DLL Name: //p' |
+	grep -viE '^(kernel32|advapi32|setupapi|shell32)\.dll$|^api-ms-win-crt-[a-z0-9-]+\.dll$' || true)
+if [ -n "$bad" ]; then
+	echo "relios-usb-kurucu.exe beklenmeyen DLL istiyor: $bad"
+	exit 1
+fi
+echo "relios-usb-kurucu.exe: $(objdump -p "$out/relios-usb-kurucu.exe" | sed -n 's/^[[:space:]]*DLL Name: //p' | tr '\n' ' ')"
 
 prefix="${MINGW_PREFIX:-/ucrt64}"
 copy_dlls() {
