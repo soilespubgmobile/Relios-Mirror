@@ -122,7 +122,7 @@ static struct {
 	int (*set_altinterface)(lu_handle *, int);
 	int (*bulk_read)(lu_handle *, int, char *, int, int);
 	int (*bulk_write)(lu_handle *, int, char *, int, int);
-	int (*clear_halt)(lu_handle *, unsigned int);
+	int (*release_interface)(lu_handle *, int);
 	char *(*strerror)(void);
 } L;
 
@@ -162,7 +162,7 @@ static bool load_libusb(void)
 		  LOAD(control_msg, "usb_control_msg") && LOAD(set_configuration, "usb_set_configuration") &&
 		  LOAD(claim_interface, "usb_claim_interface") && LOAD(set_altinterface, "usb_set_altinterface") &&
 		  LOAD(bulk_read, "usb_bulk_read") && LOAD(bulk_write, "usb_bulk_write") &&
-		  LOAD(clear_halt, "usb_clear_halt") && LOAD(strerror, "usb_strerror");
+		  LOAD(release_interface, "usb_release_interface") && LOAD(strerror, "usb_strerror");
 #undef LOAD
 	if (!ok) {
 		FreeLibrary(L.dll);
@@ -994,12 +994,7 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 		L.close(h);
 		return NULL;
 	}
-	/* the pipe to the device started afresh on both sides (Windows resets its end and clears the device's: the
-	 * packet counters agree again), as quicktime_video_hack does. Only that pipe: the device may already have put
-	 * its hello into the other one */
-	int c = L.clear_halt(h, (unsigned)q->ep_out);
-	if (c < 0)
-		ulog("resetting the pipe to the device: %d (%s)", c, lu_error());
+	/* (1.3.3 reset the pipe to the device here (usb_clear_halt): after that the device never said hello. Not done) */
 	return h;
 }
 
@@ -1057,6 +1052,23 @@ static int read_some(lu_handle *h, struct reader *r, size_t missing)
 	}
 }
 
+/* The device says hello (PING) right after its capture configuration has been selected, once. A device found
+ * already in that configuration (an earlier session, given back without leaving) may have said it long ago and
+ * says nothing now. Its configuration is then taken away and selected anew (libusb0 skips selecting the one
+ * already active, so first none), and it starts afresh. The interface is claimed again after that */
+static bool select_anew(lu_handle *h, const struct capture_iface *q)
+{
+	int rel = L.release_interface(h, q->iface);
+	int none = L.set_configuration(h, 0);
+	Sleep(200);
+	int set = L.set_configuration(h, q->config);
+	int claim = set >= 0 ? L.claim_interface(h, q->iface) : -1;
+	bool ok = claim >= 0 && (!q->alt || L.set_altinterface(h, q->alt) >= 0);
+	ulog("no hello from the device: configuration %d selected anew (%d %d %d %d%s%s)", q->config, rel, none, set,
+	     claim, ok ? "" : ": ", ok ? "" : lu_error());
+	return ok;
+}
+
 enum end_reason { END_STOP, END_GONE, END_ERROR, END_LOCKED, END_DEVICE_STOPPED };
 
 /* reads until stopped, unplugged or broken; then the release. The handle is closed here */
@@ -1076,7 +1088,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 	}
 	const uint8_t *buf = rd.buf;
 	ULONGLONG start = GetTickCount64(), last_data = start, answered = 0;
-	bool nudged = false, greeted = false, pinged_again = false;
+	bool nudged = false, greeted = false, pinged_again = false, reselected = false, got_any = false;
 	unsigned reads_logged = 0; /* (the first reads in the log: how the device's messages come) */
 	for (;;) {
 		if (stopping()) {
@@ -1098,6 +1110,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		}
 		if (n > 0) {
 			last_data = now;
+			got_any = true;
 			qt_out_clear(&out);
 			if (!qt_session_feed(s, buf, (size_t)n, &out, now_ns())) {
 				ulog("the stream from the device could not be followed");
@@ -1128,7 +1141,15 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		/* (after every read: a device that keeps sending sound but no picture is not waited for forever) */
 		enum qt_state st = qt_session_state(s);
 		if (st == QT_WAIT_PING) {
-			if (n <= 0 && !nudged && now - start > 1000) {
+			if (n <= 0 && !got_any && !reselected && now - start > 1500) {
+				reselected = true;
+				if (!select_anew(h, q)) {
+					why = END_ERROR;
+					break;
+				}
+				continue;
+			}
+			if (n <= 0 && !nudged && now - start > 4000) {
 				/* a freshly switched device can open its pipes before it starts; one control nudge, and a
 				 * PING of ours (iPhoneMirror). The nudge is never sent to a session found running */
 				nudged = true;
@@ -1139,7 +1160,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				write_all(h, q->ep_out, out.p, out.n);
 				ulog("no hello from the device yet: nudged");
 			}
-			if (now - start > 8000) {
+			if (now - start > 9000) {
 				ulog("no answer from the device (it should be unlocked and trust this computer)");
 				why = END_LOCKED;
 				break;

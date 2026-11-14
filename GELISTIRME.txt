@@ -254,6 +254,11 @@ Program (elle; her yeni sürümde):
   edilen okumaya hiç bayt gelmemiştir); mesajın içinde eksik kısım kadar, uzun süre. Akış başında cihaza giden pipe
   sıfırlanır (usb_clear_halt; quicktime_video_hack de yapar), merhabadan 3 sn sonra saat gelmezse PING bir kez daha
   gönderilir. Log'a ilk 40 mesaj (iki yönde) ve ilk 12 okumanın boyu yazılır: başlangıç nerede takılıyor görülür.
+- 1.3.3 denemesinde cihaz hiç merhaba demedi (1.3.2'de yapılandırma seçilir seçilmez demişti). Fark, okumadan önce
+  yapılan pipe sıfırlamasıydı (usb_clear_halt): 1.3.4'te kaldırıldı. Ayrıca cihaz merhabayı yapılandırması
+  seçildiği anda bir kez söylüyor; önceki oturumdan o yapılandırmada kalmış cihaz susuyor (geri verme bu bilgisayarda
+  33 ile bitiyor, cihaz ayrılmıyor). 1.3.4'te 1,5 sn içinde hiç bayt gelmezse yapılandırma kaldırılıp yeniden seçilir
+  (libusb0 etkin olanı yeniden seçmeyi atladığı için önce 0) ve arayüz yeniden alınır (usbqt.c, select_anew).
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu
