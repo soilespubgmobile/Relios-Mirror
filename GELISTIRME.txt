@@ -78,11 +78,13 @@ viewer\main.c         Programın tamamı (tek dosya). Bölümler, dosyadaki sır
                       - kayıt: rec_* (rec_open_locked kodlayıcıyı seçer; rec_thread ayrı iş parçacığıdır)
                       - ekran görüntüsü: save_png
                       - sanal kamera: camera_start / camera_send / camera_stop; install_camera / remove_camera
+                        (kurma / kaldırma relios-usb-kurucu.exe ile: "camera-install" / "camera-remove")
                       - görüntü: open_video_decoder, decode_video (alıcıdan ve kablodan), handle_video,
                         present_frame
                       - ses: open_audio_decoder, open_audio_output, play_audio, handle_audio
                       - kablolu yansıtma: usb_video, usb_audio (48 kHz → 44,1 kHz), usb_state, usb_start;
-                        usb_driver (sürücüyü kurdurur / kaldırtır)
+                        usb_driver (sürücüyü kurdurur / kaldırtır; Apple'ın desteği yoksa kurdurmaz);
+                        usb_state_text (durum yazıları); Ayarlar > USB'deki "Yeniden Dene" (usbqt_retry)
                       - alıcıyla konuşma: session_start (başlatır, komutları yazar), out_thread (mesajları
                         okur), handle_status, handle_pin, hide_check, session_stop
                       - arayüz: build_settings (Ayarlar'daki satırlar), draw_bar, draw_button, draw,
@@ -90,13 +92,24 @@ viewer\main.c         Programın tamamı (tek dosya). Bölümler, dosyadaki sır
                       - Windows: ensure_firewall_rule, autostart_get / autostart_set, other_copies
                       - main: açılış sırası ve olay döngüsü
 viewer\usbqt.c        Kablolu yansıtma (Windows): iPad'i libusb0 ile bulur, "--usb-switch" yardımcısıyla ekran kaydı
-                      yapılandırmasına geçirir ve geri verir, akışı okuyup qtproto.c'ye verir. Kilitli iPad'i
-                      yapılandırmasında bırakıp geçirmeden yeniden dener (her geçişte Windows ses çıkarır).
-                      Sıra iPhoneMirror'dan (GPL-3.0-only) uyarlanmıştır; ayrıntılar dosyanın başında.
+                      yapılandırmasına geçirir ve geri verir, akışı okuyup qtproto.c'ye verir. Önce Apple'ın
+                      desteğine bakar (usbqt_apple_service: "Apple Mobile Device Service"; cihazın etkin
+                      yapılandırmasında Apple'ın kanalı, 0xFF/0xFE): yoksa cihaza dokunmaz, "Apple Aygıtları gerekli"
+                      der. Yeni takılan / geri verilen cihazı 5 sn Apple'ın hizmetine bırakır (SETTLE_MS). Cihaz
+                      8 sn içinde yanıt vermezse (güvenmiyor ya da kilitli) onu hemen normal yapılandırmasına geri
+                      verir ki "Bu Bilgisayara Güven" sorulup yanıtlanabilsin; 15 / 30 / 60 sn sonra yeniden dener,
+                      LOCKED_TRIES denemeden sonra yalnızca "Yeniden Dene" ya da yeniden takınca (başarısız
+                      oturumlar için FAILED_TRIES). Beklerken cihazı açmaz, yalnızca Windows'un aygıt listesine bakar
+                      (wait_quietly). Her yeni cihazı günlüğe ayrıntılı yazar (describe). Sıra iPhoneMirror'dan
+                      (GPL-3.0-only) uyarlanmıştır; ayrıntılar dosyanın başında.
 viewer\usbdriver.c    Sürücü kurucusu: ayrı, küçük program relios-usb-kurucu.exe ("install|remove <aygıt>",
                       yönetici onayıyla). Statik bağlanır, yalnızca Windows'un KnownDLL'lerini ister (paketle.sh
                       bunu denetler; başka DLL isterse derleme durur). Parmak izi denetimi, hizmet, iPad'in
-                      UpperFilters değeri, yeniden başlatma, sağlık denetimi ve geri alma.
+                      UpperFilters değeri, yeniden başlatma, sağlık denetimi ve geri alma. Cihazı Apple'ın sürücüsü
+                      (usbccgp) çalıştırmıyorsa kurmaz. Sanal kamerayı da o kurar / kaldırır ("camera-install" /
+                      "camera-remove"): softcam.dll'i yalnızca derlemenin içine yazdığı SHA-256 parmak iziyle kabul
+                      eder (paketle.sh hesaplar, CMake'e SOFTCAM_SHA256 olarak verir), denetlediği baytları
+                      "Program Files\Relios Mirror"a yazar ve System32'deki regsvr32 ile oradan kaydeder.
 viewer\usbids.h       Dokunulabilecek Apple cihazları (ürün kimlikleri, aygıt örneği biçimi).
 viewer\qtproto.c      USB protokolü (QuickTime ekran kaydı: PING / SYNC / ASYN / RPLY, CMSampleBuffer). Platformdan
                       bağımsızdır; quicktime_video_hack'e (MIT) dayanır.
@@ -116,8 +129,10 @@ receiver\protocol.h   Alıcı ile program arasındaki mesajlar.
 receiver\uxplay       UxPlay'in AirPlay kitaplığı (hangi sürüm: UPSTREAM.txt). Yapılan değişiklikler "RELIOS:"
                       diye işaretlidir:   grep -rn "RELIOS" receiver/uxplay
 receiver\libplist     libplist (olduğu gibi).
-tests\                receiver_test.py: alıcının cihazsız sınaması. qtproto_test.c: USB protokolünün sınaması
-                      (tests\fixtures\qvh: quicktime_video_hack'in gerçek cihaz kayıtları, MIT).
+tests\                receiver_test.py: alıcının cihazsız sınaması. receiver_security_test.py: alıcının saldırılara
+                      karşı sınaması (eşleşme atlatma, PIN'siz eşleşme, bozuk istekler, bellek tüketme, bağlantı
+                      işgali). qtproto_test.c: USB protokolünün sınaması (tests\fixtures\qvh:
+                      quicktime_video_hack'in gerçek cihaz kayıtları, MIT).
 paketle.sh            Derler, DLL'leri toplar, tek dosyayı yapar.   derle.bat: bunu MSYS2 ile çalıştırır.
 
 
@@ -147,7 +162,8 @@ Bir yazıyı değiştirmek: metni main.c içinde arayın. Dosya UTF-8'dir; öyle
 Programın adı: main.c'de APP_NAME ve RECEIVER_NAME (cihazın listesinde görünen ad); app.rc.
 Simge ve logo: viewer\app.ico, assets\logo.bmp.
 Sanal kameranın adı ve sınıf kimliği: windows.yml'deki softcam adımı ile main.c'deki CAMERA_CLASS_KEY (ikisi
-   aynı kimliği taşımalı).
+   aynı kimliği taşımalı). Kameranın DLL'i değişirse parmak izini elle yazmak gerekmez: paketle.sh derlemede
+   hesaplayıp kurucuya yazar (kurucuda yoksa ya da pakettekiyle tutmazsa derleme durur).
 Güvenlik duvarı kuralları: ensure_firewall_rule. Kuralları değiştirirseniz işaretteki "v3"ü "v4" yapın ki
    program kuralları yeniden kursun. Şimdiki kurallar: iki programın da internete çıkışı engelli; programın
    kendisine gelen her şey engelli; alıcıya gelen yalnızca yerel ağdan ve yalnızca özel ağ profilinde serbest
@@ -164,7 +180,15 @@ UxPlay'i yenilemek: receiver\uxplay\lib'i yeni sürümle değiştirin, "RELIOS:"
 7. SINAMA
 Alıcı (cihaz gerekmez; Linux / WSL):
    python3 tests/receiver_test.py build-alici/relios-airplay-receiver /tmp/alici-sinama
-   Sonunda "0 failure(s)" yazmalı. Kimin bağlanabildiğini ve eşleşmeden önce neyin yanıtlandığını sınar.
+   python3 tests/receiver_security_test.py build-alici/relios-airplay-receiver /tmp/alici-guvenlik
+   İkisi de sonunda "0 failure(s)" yazmalı. Birincisi kimin bağlanabildiğini ve eşleşmeden önce neyin
+   yanıtlandığını, ikincisi saldırı denemelerini sınar: eşleşmiş bir cihazın açık anahtarıyla girme, PIN'siz ya da
+   adımları atlayarak eşleşme, sıfır anahtar, 600 eşleşmede tuz hatası, 8 KB'tan uzun adres, 8 MB'tan büyük gövde,
+   bağlantı işgali. Alıcıyı AddressSanitizer ile derlerseniz (-DRELIOS_AIRPLAY_SANITIZE=ON) ikinci sınama bellek
+   hatası satırı görünce de başarısız sayar.
+   Bulanık sınama (fuzzing) bu sürümde GCC'nin -fsanitize-coverage=trace-pc'si ve küçük bir sürücüyle
+   yapıldı (istek ayrıştırıcı, bplist, mDNS, FairPlay, RTSP işleyicileri, USB protokolü); düzeltmelerden sonra
+   çökme kalmadı.
 USB protokolü (cihaz gerekmez; Linux / WSL ya da MSYS2):
    gcc -std=c11 -Wall -Wextra -Iviewer tests/qtproto_test.c viewer/qtproto.c -o qtproto_test
    ./qtproto_test tests/fixtures/qvh
@@ -189,6 +213,11 @@ Program (elle; her yeni sürümde):
   yalnızca gizlemeden sonraki 20 saniyedeki kesilmeyi yakalayıp seçeneği kapatır.
 - Ağ aniden koparsa alıcı ölü bağlantıyı 60 saniyeye kadar açık sayar (uxplay\lib\httpd.c); bu sürede aynı
   cihazın yeniden bağlanması reddedilebilir.
+- Alıcının sınırları (uxplay\lib, "RELIOS:" işaretli): adres 8 KB, başlık adı 1 KB, değeri 8 KB, en çok 64
+  başlık, gövde 8 MB (http_request.c); en çok 12 bağlantı, dolunca en eski eşleşmemiş bağlantı çıkarılır,
+  eşleşmemiş bağlantı en çok 180 sn yaşar, 10 sn sessiz kalan eşleşmemiş cihaz yeni gelene yer verir (httpd.c,
+  raop.c); yansıtma paketi en çok 64 MB (raop_rtp_mirror.c). Alıcının iş nesnesi 1 GB bellekle sınırlıdır
+  (proc_win.c).
 - Ağ duyurusu tek bir ağ bağdaştırıcısının adresini taşır: ağ geçidi olan ilk bağdaştırıcı
   (uxplay\lib\mdnsd\mdnsd.c, mdns_get_default_ipv4). VPN'li ya da çok bağdaştırıcılı bilgisayarda yanlış adres
   seçilebilir. Yalnızca IPv4.
@@ -196,11 +225,16 @@ Program (elle; her yeni sürümde):
   öteki kopyayı kapatarak önler; kökten çözüm o seçeneğin Windows'ta kaldırılmasıdır.
 - Tek dosyalık başlatıcı yarıda kalmış bir açma işlemini fark etmez (çare: %LOCALAPPDATA%\ReliosMirror\app-...
   klasörünü silip yeniden açmak) ve eski sürümlerin klasörlerini silmez.
-- Kablolu yansıtma bu sürümde gerçek bir cihazda denenmeden yazıldı (protokol, gerçek cihaz kayıtlarıyla
-  sınanmıştır). Bilinen riskler: Windows "Bellek bütünlüğü" açıkken eski libusb0 sürücüsünü yüklemeyebilir
-  (kurucu bunu görür ve geri alır); iPad'in kablolu modda ekran boyutu bilinmediği için cihaza 1640x2360
-  bildirilir (qt_options, usbqt.c'deki stream işlevi); iPad'in yönü değişince gelen işaretler yalnızca
-  günlüğe yazılır. Sorunlar log.txt'deki "USB:" satırlarından izlenir.
+- Kablolu yansıtma Apple'ın kendi USB desteğini ister (Apple Aygıtları ya da iTunes): Apple'ın sürücüsü
+  cihazın ekran kaydı yapılandırmasını Windows'a kullandırır, hizmeti cihazla eşleşir ("Bu Bilgisayara Güven").
+  Program bunları indirmez; yoksa söyler. Güvenilmeyen cihaz görüntü göndermez; ekran kaydı yapılandırmasında
+  Apple'ın hizmeti cihaza ulaşamadığından program yanıt vermeyen cihazı hemen geri verir.
+- Kablolu yansıtma ilk denemelerde çalışmadı (1.2.0); 1.3.0'daki düzeltmeler (Apple desteği denetimi, güven
+  akışı) gerçek cihazda henüz denenmedi. Bilinen riskler: Windows "Bellek bütünlüğü" açıkken eski libusb0
+  sürücüsünü yüklemeyebilir (kurucu bunu görür ve geri alır); cihaza ekran boyutu olarak 1640x2360 bildirilir
+  (qt_options, usbqt.c'deki stream işlevi; cihaz kendi boyutunu seçer); iPad'in yönü değişince gelen işaretler
+  yalnızca günlüğe yazılır. Sorunlar log.txt'deki "USB:" satırlarından izlenir (her yeni cihaz için Windows
+  sürücüsü, filtreler, yapılandırmalar ve Apple hizmetinin durumu yazılır).
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

@@ -130,6 +130,9 @@ struct raop_conn_s {
     bool relios_registered;     /* pair-verify step 1: the client's key is in OBS's list of paired devices */
     bool relios_trusted;        /* pair-verify completed after one of the two: everything else may follow */
     unsigned int relios_feedback; /* the client's keep-alive requests so far (for the log) */
+    time_t relios_last_request; /* when the last request arrived */
+    bool relios_pin_waiting;    /* pair-pin-start showed a PIN for this connection (at relios_pin_at) */
+    time_t relios_pin_at;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -213,6 +216,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     raop_t *raop = conn->raop;
     bool hls_request = false;
     logger_log(raop->logger, LOGGER_DEBUG, "conn_request");
+    conn->relios_last_request = time(NULL);
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
     bool logger_debug_data = (logger_get_level(raop->logger) >= LOGGER_DEBUG_DATA);
 
@@ -288,6 +292,28 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq || ble) {
+            /* RELIOS: a device that has not paired, has sent nothing for 10 s and is not waiting for its PIN to be
+             * typed does not keep the receiver for itself: it gives way. (Before, one connection that asked
+             * something and stayed open kept every other device out, with "Conflict".) A paired one keeps it. */
+            int raop_count = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP);
+            if (raop_count) {
+                bool keep = false;
+                time_t now = time(NULL);
+                for (int k = 1; k <= raop_count; k++) {
+                    raop_conn_t *other = (raop_conn_t *) httpd_get_connection_by_type(raop->httpd, CONNECTION_TYPE_RAOP, k);
+                    if (!other || other == conn) {
+                        continue;
+                    }
+                    if (other->relios_trusted || now - other->relios_last_request < 10 ||
+                        (other->relios_pin_waiting && now - other->relios_pin_at <= 125)) {
+                        keep = true;
+                    }
+                }
+                if (!keep) {
+                    logger_log(raop->logger, LOGGER_INFO, "RELIOS: an idle connection that has not paired gives way to a new one");
+                    httpd_remove_connections_by_type(raop->httpd, CONNECTION_TYPE_RAOP);
+                }
+            }
             if (httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP)) {
                 char ipaddr[40] = { '\0' };
                 utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
@@ -610,7 +636,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     if (!logger_debug) {
         char *ptr = strchr(header_str, '\n');
-        *(++ptr) = '\0';
+        if (ptr) {  /* RELIOS: (a header with no line break wrote to address 1) */
+            *(++ptr) = '\0';
+        }
     }
     logger_log(raop->logger, LOGGER_DEBUG, "%s", header_str);
     free(header_str);
@@ -647,6 +675,13 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             free(response_data);
         }
     }
+}
+
+/* RELIOS: for httpd: has this connection's device paired? */
+static bool
+conn_trusted(void *ptr) {
+    raop_conn_t *conn = ptr;
+    return conn && conn->relios_trusted;
 }
 
 static void
@@ -787,6 +822,7 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
     httpd_cbs.conn_init = &conn_init;
     httpd_cbs.conn_request = &conn_request;
     httpd_cbs.conn_destroy = &conn_destroy;
+    httpd_cbs.conn_trusted = &conn_trusted;
 
     /* Initialize the http daemon, (this will take a copy of httpd_cbs) */
     httpd = httpd_init(raop->logger, &httpd_cbs, nohold);

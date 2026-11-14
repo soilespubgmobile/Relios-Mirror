@@ -46,6 +46,7 @@ struct http_connection_s {
     http_request_t *request;
     int pending_remove;
     time_t last_active;
+    time_t accepted_at; /* RELIOS */
 };
 typedef struct http_connection_s http_connection_t;
 
@@ -107,7 +108,8 @@ httpd_count_connection_type (httpd_t *httpd, connection_type_t type) {
     int count = 0;
     for (int i = 0; i < httpd->max_connections; i++) {
         http_connection_t *connection = &httpd->connections[i];
-        if (!connection->connected) {
+        /* RELIOS: one that is being removed no longer counts */
+        if (!connection->connected || connection->pending_remove) {
             continue;
         }
         if (connection->type == type) {
@@ -140,7 +142,8 @@ httpd_get_connection_by_type (httpd_t *httpd, connection_type_t type, int instan
     int count = 0;
     for (int i = 0; i < httpd->max_connections; i++) {
         http_connection_t *connection = &httpd->connections[i];
-        if (!connection->connected) {
+        /* RELIOS: (as httpd_count_connection_type) */
+        if (!connection->connected || connection->pending_remove) {
             continue;
         }
         if (connection->type == type) {
@@ -154,6 +157,16 @@ httpd_get_connection_by_type (httpd_t *httpd, connection_type_t type, int instan
 }
 
 #define MAX_CONNECTIONS 12  /* value used in AppleTV 3*/
+/* RELIOS: a connection whose device has not paired within this time is closed (the PIN, once shown, may be typed
+ * for 120 s) */
+#define RELIOS_UNTRUSTED_LIFETIME 180
+
+static bool
+relios_trusted(httpd_t *httpd, http_connection_t *connection)
+{
+    return !httpd->callbacks.conn_trusted || !connection->user_data ||
+           httpd->callbacks.conn_trusted(connection->user_data);
+}
 httpd_t *
 httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
 {
@@ -279,6 +292,7 @@ httpd_add_connection(httpd_t *httpd, int fd, unsigned char *local, int local_len
     httpd->connections[i].pending_remove = 0;
     httpd->connections[i].type = CONNECTION_TYPE_UNKNOWN;   //should not be necessary ...
     httpd->connections[i].last_active = time(NULL);
+    httpd->connections[i].accepted_at = httpd->connections[i].last_active;
     return 0;
 }
 
@@ -324,6 +338,26 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
         shutdown(fd, SHUT_RDWR);
         CLOSESOCKET(fd);
         return 0;
+    }
+
+    /* RELIOS: with every place taken, the oldest connection whose device has not paired makes room (before, a
+     * dozen connections that sent nothing kept every device out); if all have paired, the new one is closed */
+    if (httpd->open_connections >= httpd->max_connections) {
+        http_connection_t *oldest = NULL;
+        for (int i = 0; i < httpd->max_connections; i++) {
+            http_connection_t *c = &httpd->connections[i];
+            if (c->connected && !relios_trusted(httpd, c) && (!oldest || c->accepted_at < oldest->accepted_at)) {
+                oldest = c;
+            }
+        }
+        if (!oldest) {
+            logger_log(httpd->logger, LOGGER_WARNING, "RELIOS: refused a connection: every place is taken by a paired device");
+            shutdown(fd, SHUT_RDWR);
+            CLOSESOCKET(fd);
+            return 0;
+        }
+        logger_log(httpd->logger, LOGGER_WARNING, "RELIOS: all connections taken: the oldest unpaired one is closed");
+        httpd_remove_connection(httpd, oldest, 0);
     }
 
     // is it correct that ipv6 link-local local and remote zone id should be the same, as asserted below? 
@@ -399,7 +433,8 @@ httpd_thread(void *arg)
 
         /* Get the correct nfds value and set rfds */
         FD_ZERO(&rfds);
-        if (httpd->open_connections < httpd->max_connections) {
+        /* RELIOS: also when every place is taken (see httpd_accept_connection) */
+        {
             if (httpd->server_fd4 != -1) {
                 FD_SET(httpd->server_fd4, &rfds);
                 if (nfds <= httpd->server_fd4) {
@@ -430,6 +465,14 @@ httpd_thread(void *arg)
                 httpd_remove_connection(httpd, connection, 0);
                 continue;
             }
+            /* RELIOS: a device that has not paired within its time is let go (sending a byte now and then no
+             * longer keeps a connection open for ever) */
+            if (now - connection->accepted_at > RELIOS_UNTRUSTED_LIFETIME && !relios_trusted(httpd, connection)) {
+                logger_log(httpd->logger, LOGGER_WARNING, "RELIOS: closing a connection that did not pair within %d s",
+                           RELIOS_UNTRUSTED_LIFETIME);
+                httpd_remove_connection(httpd, connection, 0);
+                continue;
+            }
             socket_fd = connection->socket_fd;
             FD_SET(socket_fd, &rfds);
             if (nfds <= socket_fd) {
@@ -448,8 +491,7 @@ httpd_thread(void *arg)
             break;
         }
 
-        if (httpd->open_connections < httpd->max_connections &&
-            httpd->server_fd4 != -1 && FD_ISSET(httpd->server_fd4, &rfds)) {
+        if (httpd->server_fd4 != -1 && FD_ISSET(httpd->server_fd4, &rfds)) {
             int ret = httpd_accept_connection(httpd, httpd->server_fd4, 0);
             if (ret == -1) {
                 logger_log(httpd->logger, LOGGER_ERR, "httpd error in accept ipv4");
@@ -458,8 +500,7 @@ httpd_thread(void *arg)
                 continue;
             }
         }
-        if (httpd->open_connections < httpd->max_connections &&
-            httpd->server_fd6 != -1 && FD_ISSET(httpd->server_fd6, &rfds)) {
+        if (httpd->server_fd6 != -1 && FD_ISSET(httpd->server_fd6, &rfds)) {
             int ret = httpd_accept_connection(httpd, httpd->server_fd6, 1);
             if (ret == -1) {
                 logger_log(httpd->logger, LOGGER_ERR, "httpd error in accept ipv6");

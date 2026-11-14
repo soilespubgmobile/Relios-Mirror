@@ -387,6 +387,9 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     snprintf(pin, 5, "%04u", pin_4);
     raop->relios_pin_armed = (pin_4 > 0);
     raop->relios_pin_armed_at = time(NULL);
+    /* (this connection waits while the PIN is typed: it keeps its place; see conn_request) */
+    conn->relios_pin_waiting = raop->relios_pin_armed;
+    conn->relios_pin_at = raop->relios_pin_armed_at;
     if (raop->callbacks.display_pin) {
          raop->callbacks.display_pin(raop->callbacks.cls, pin);
     }
@@ -455,6 +458,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             goto authentication_failed;
         }
         raop->relios_pin_armed = false;
+        conn->relios_pin_waiting = false;
         snprintf(pin, 6, "%04u", raop->pin % 10000);
         if (raop->pin < 10000) {
             raop->pin = 0;
@@ -563,6 +567,9 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
         return;
     }
+    /* RELIOS: none of the three steps (no dictionary, or not the items a step needs): the request's plist was
+     * leaked here (found by fuzzing; anyone on the network could make the receiver keep memory) */
+    plist_free(req_root_node);
  authentication_failed:;
     /* RELIOS: counted by OBS (after three failures pairing a new device is turned off) */
     if (raop->callbacks.relios_pairing_failed) {
@@ -614,17 +621,19 @@ raop_handler_pairverify(raop_conn_t *conn,
                         char **response_data, int *response_datalen)
 {
     raop_t *raop = conn->raop;
-    bool register_check = false;  
     if (pairing_session_check_handshake_status(conn->session)) {
         if (raop->use_pin) {
             pairing_session_set_setup_status(conn->session);
-            register_check = true;
         } else {
             return;
         }
     }
-    unsigned char public_key[X25519_KEY_SIZE];
-    unsigned char signature[PAIRING_SIG_SIZE];
+    /* RELIOS: with the PIN required, the key of each step 1 must be a paired device's, unless this connection has
+     * just paired with the PIN. (UxPlay checked it only at the first step 1 of a connection: a second step 1 with
+     * another key kept the first key's result, and that other key's signature then made the client trusted.) */
+    bool register_check = raop->use_pin && !conn->relios_pin_paired;
+    unsigned char public_key[X25519_KEY_SIZE] = { 0 };
+    unsigned char signature[PAIRING_SIG_SIZE] = { 0 };
     const unsigned char *data = NULL;
     int datalen = 0;
 
@@ -639,15 +648,16 @@ raop_handler_pairverify(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Invalid pair-verify data");
             return;
         }
-        /* We can fall through these errors, the result will just be garbage... */
-        if (pairing_session_handshake(conn->session, data + 4, data + 4 + X25519_KEY_SIZE)) {
-            logger_log(raop->logger, LOGGER_ERR, "Error initializing pair-verify handshake");
-        }
-        if (pairing_session_get_public_key(conn->session, public_key)) {
-            logger_log(raop->logger, LOGGER_ERR, "Error getting ECDH public key");
-        }
-        if (pairing_session_get_signature(conn->session, signature)) {
-            logger_log(raop->logger, LOGGER_ERR, "Error getting ED25519 signature");
+        /* RELIOS: decided anew for the key of this step 1 */
+        conn->relios_registered = false;
+        /* RELIOS: a failed handshake is refused (UxPlay went on, answering with whatever was in these buffers) */
+        if (pairing_session_handshake(conn->session, data + 4, data + 4 + X25519_KEY_SIZE) ||
+            pairing_session_get_public_key(conn->session, public_key) ||
+            pairing_session_get_signature(conn->session, signature)) {
+            logger_log(raop->logger, LOGGER_WARNING, "RELIOS: pair-verify handshake failed: refused");
+            http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+            http_response_set_disconnect(response, 1);
+            return;
         }
         if (register_check) {
             bool registered_client = true;
@@ -685,6 +695,8 @@ raop_handler_pairverify(raop_conn_t *conn,
 
         if (pairing_session_finish(conn->session, data + 4)) {
             logger_log(raop->logger, LOGGER_ERR, "Incorrect pair-verify signature");
+            /* RELIOS: said as a refusal (it was answered "200 OK" and only disconnected) */
+            http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
             http_response_set_disconnect(response, 1);
             return;
         }
@@ -1001,7 +1013,9 @@ raop_handler_setup(raop_conn_t *conn,
         free(eiv);	
         free(ekey);
         if (ret < 0) {
-            logger_log(raop->logger, LOGGER_ERR, "SETUP 1: invalid EIV and/or EKEY: sizes (&d,%d) != (16,72)", eiv, ekey);
+            /* RELIOS: the sizes (UxPlay passed the two freed pointers, with a "&d" for the first %d) */
+            logger_log(raop->logger, LOGGER_ERR, "SETUP 1: invalid EIV and/or EKEY: sizes (%d,%d) != (16,72)",
+                       (int) eiv_len, (int) ekey_len);
             http_response_init(response, "RTSP/1.0", 400, "Bad Request");
             return;
         }
@@ -1404,8 +1418,8 @@ raop_handler_set_parameter(raop_conn_t *conn,
             } else {
                 logger_log(raop->logger, LOGGER_WARNING, "RAOP not initialized at SET_PARAMETER");
             }
-            free(datastr);
         }
+        free(datastr);  /* RELIOS: also with no data (it was lost then) */
     } else if (!strcmp(content_type, "image/jpeg") || !strcmp(content_type, "image/png")) {
         logger_log(raop->logger, LOGGER_DEBUG, "Got image data of %d bytes", datalen);
         if (conn->raop_rtp) {

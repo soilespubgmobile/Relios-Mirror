@@ -333,6 +333,11 @@ void decryptMessage(unsigned char* messageIn, unsigned char* decryptedMessage)
    uint32_t key_schedule[11][4];
    int mode = messageIn[12];  // 0,1,2,3
    printf("mode = %02x\n", mode);
+   /* RELIOS: the mode comes from the client's message: anything else read past message_key */
+   if (mode < 0 || mode > 3) {
+      memset(decryptedMessage, 0, 128);
+      return;
+   }
    generate_key_schedule(initial_session_key, key_schedule);
       
    // For M0-M6 we follow the same pattern

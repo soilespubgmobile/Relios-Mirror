@@ -69,7 +69,9 @@ void x25519_key_destroy(x25519_key_t *key);
 int get_random_bytes(unsigned char *buf, int num);
 void pk_to_base64(const unsigned char *pk, int pk_len, char *pk_base64, int len);
   
-void x25519_derive_secret(unsigned char secret[X25519_KEY_SIZE], const x25519_key_t *ours, const x25519_key_t *theirs);
+/* RELIOS: 0, or -1 if no secret can be made (e.g. their key is all zeros: a low-order point); it used to end the
+ * program, for any key a device on the network sent */
+int x25519_derive_secret(unsigned char secret[X25519_KEY_SIZE], const x25519_key_t *ours, const x25519_key_t *theirs);
 
 // GCM AES 128
 

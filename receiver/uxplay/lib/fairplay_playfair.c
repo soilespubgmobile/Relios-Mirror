@@ -56,6 +56,10 @@ fairplay_setup(fairplay_t *fp, const unsigned char req[16], unsigned char res[14
     }
 
     int mode = req[14];
+    /* RELIOS: the client's mode picks one of four replies (UxPlay read past them for any other value) */
+    if (mode < 0 || mode > 3) {
+        return -1;
+    }
     memcpy(res, reply_message[mode], 142);
     fp->keymsglen = 0;
     return 0;
@@ -68,6 +72,10 @@ fairplay_handshake(fairplay_t *fp, const unsigned char req[164], unsigned char r
 
     if (req[4] != 0x03) {
         /* Unsupported fairplay version */
+        return -1;
+    }
+    /* RELIOS: byte 12 is the mode playfair uses as an index (0..3) */
+    if (req[12] > 3) {
         return -1;
     }
 

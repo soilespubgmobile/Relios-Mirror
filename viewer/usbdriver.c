@@ -30,6 +30,7 @@
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #include "usbids.h"
 #include "usbqt.h"
@@ -414,10 +415,26 @@ static void remove_surprise_value(HDEVINFO set, SP_DEVINFO_DATA *info)
 
 /* ------------------------------------------------------------------ install / remove */
 
+/* whether Apple's driver runs the device: Windows' composite driver (under Apple's filters). Otherwise Windows runs
+ * it as a photo camera alone, and the filter would be of no use there */
+static bool apple_runs_it(HDEVINFO set, SP_DEVINFO_DATA *info)
+{
+	wchar_t service[64];
+	DWORD type = 0, got = 0;
+	memset(service, 0, sizeof(service));
+	if (!SetupDiGetDeviceRegistryPropertyW(set, info, SPDRP_SERVICE, &type, (PBYTE)service, sizeof(service) - 4,
+					       &got) ||
+	    type != REG_SZ)
+		return true; /* (not readable: not held against it; the program checked it as well) */
+	return !_wcsicmp(service, L"usbccgp");
+}
+
 static int install_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *instance)
 {
 	if (!device_healthy(instance, 0))
 		return USBQT_DRIVER_DEVICE_PROBLEM;
+	if (!apple_runs_it(set, info))
+		return USBQT_DRIVER_NO_APPLE;
 
 	/* the files: read once, checked, and written from what was checked */
 	wchar_t folder[MAX_PATH * 2], src_sys[MAX_PATH * 2 + 40], src_dll[MAX_PATH * 2 + 40];
@@ -609,8 +626,122 @@ static int remove_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *ins
 	return remove_driver();
 }
 
+/* ------------------------------------------------------------------ the virtual camera */
+
+/* The camera's DLL (softcam.dll, built by the workflow) is accepted only with the SHA-256 fingerprint the build
+ * computed and wrote into this program (paketle.sh, CMakeLists.txt): a file swapped in the program's folder, which
+ * the user can write to, is never registered with administrator rights. What was checked is what is written, to a
+ * folder only administrators can change, and only from there is it made known to Windows. */
+#ifdef SOFTCAM_SHA256
+static const char cam_sha256[] = SOFTCAM_SHA256;
+#else
+static const char cam_sha256[] = ""; /* (a build without the camera: nothing can be installed) */
+#endif
+
+/* "<Program Files>\Relios Mirror" and the DLL there (from Windows' own record of the folder, not from the
+ * environment, which the user can change) */
+static bool camera_paths(wchar_t *dir, wchar_t *dll)
+{
+	wchar_t pf[MAX_PATH];
+	if (SHGetFolderPathW(NULL, CSIDL_PROGRAM_FILES, NULL, SHGFP_TYPE_CURRENT, pf) != S_OK || !pf[0] ||
+	    wcslen(pf) > MAX_PATH - 50)
+		return false;
+	_snwprintf(dir, MAX_PATH, L"%ls\\Relios Mirror", pf);
+	_snwprintf(dll, MAX_PATH, L"%ls\\Relios Mirror\\ReliosMirrorCamera.dll", pf);
+	dir[MAX_PATH - 1] = dll[MAX_PATH - 1] = L'\0';
+	return true;
+}
+
+/* System32's regsvr32 on the DLL (silent; "/u": taken out of Windows); its exit code */
+static DWORD regsvr32(const wchar_t *dll, bool remove)
+{
+	wchar_t exe[MAX_PATH + 20], cmd[MAX_PATH * 2 + 64];
+	UINT len = GetSystemDirectoryW(exe, MAX_PATH);
+	if (!len || len >= MAX_PATH)
+		return 1;
+	wcscat(exe, L"\\regsvr32.exe");
+	_snwprintf(cmd, MAX_PATH * 2 + 63, L"\"%ls\" /s %ls\"%ls\"", exe, remove ? L"/u " : L"", dll);
+	cmd[MAX_PATH * 2 + 63] = L'\0';
+	STARTUPINFOW si;
+	PROCESS_INFORMATION pi;
+	memset(&si, 0, sizeof(si));
+	memset(&pi, 0, sizeof(pi));
+	si.cb = sizeof(si);
+	wchar_t sysdir[MAX_PATH];
+	GetSystemDirectoryW(sysdir, MAX_PATH);
+	if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, sysdir, &si, &pi))
+		return 1;
+	DWORD code = 1;
+	if (WaitForSingleObject(pi.hProcess, 60000) == WAIT_OBJECT_0)
+		GetExitCodeProcess(pi.hProcess, &code);
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return code;
+}
+
+static int camera_install(void)
+{
+	if (strlen(cam_sha256) != 64)
+		return USBQT_DRIVER_NO_FILES;
+	wchar_t folder[MAX_PATH * 2], src[MAX_PATH * 2 + 40], dir[MAX_PATH], dll[MAX_PATH];
+	DWORD n = GetModuleFileNameW(NULL, folder, MAX_PATH * 2);
+	wchar_t *slash = n && n < MAX_PATH * 2 ? wcsrchr(folder, L'\\') : NULL;
+	if (!slash || !camera_paths(dir, dll))
+		return USBQT_DRIVER_NO_FILES;
+	slash[1] = L'\0';
+	_snwprintf(src, MAX_PATH * 2 + 39, L"%lssoftcam.dll", folder);
+	src[MAX_PATH * 2 + 39] = L'\0';
+	size_t size = 0;
+	uint8_t *data = read_whole(src, 16u << 20, &size);
+	char hex[65];
+	if (!data)
+		return USBQT_DRIVER_NO_FILES;
+	if (!sha256_hex(data, size, hex) || strcmp(hex, cam_sha256)) {
+		free(data);
+		return USBQT_DRIVER_BAD_FILES;
+	}
+	/* the folder: made here if missing; one that is a link to somewhere else is not used */
+	CreateDirectoryW(dir, NULL);
+	DWORD attr = GetFileAttributesW(dir);
+	int result = USBQT_DRIVER_DONE;
+	if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) || (attr & FILE_ATTRIBUTE_REPARSE_POINT))
+		result = USBQT_DRIVER_COPY;
+	else if (file_state(dll, cam_sha256) != FILE_SAME) {
+		/* (another file of that name, an older camera say: replaced; in use, it cannot be) */
+		if (GetFileAttributesW(dll) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(dll))
+			result = USBQT_DRIVER_COPY;
+		else if (!write_new(dll, data, size, cam_sha256))
+			result = USBQT_DRIVER_COPY;
+	}
+	free(data);
+	if (result == USBQT_DRIVER_DONE && regsvr32(dll, false) != 0)
+		result = USBQT_DRIVER_REGISTER;
+	return result;
+}
+
+static int camera_remove(void)
+{
+	wchar_t dir[MAX_PATH], dll[MAX_PATH];
+	if (!camera_paths(dir, dll))
+		return USBQT_DRIVER_NO_FILES;
+	if (GetFileAttributesW(dll) != INVALID_FILE_ATTRIBUTES)
+		regsvr32(dll, true);
+	bool later = false;
+	if (GetFileAttributesW(dll) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(dll)) {
+		/* (in use by a program that has the camera open: gone at the next restart of Windows) */
+		MoveFileExW(dll, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+		later = true;
+	}
+	RemoveDirectoryW(dir); /* (only if empty) */
+	return later ? USBQT_DRIVER_REBOOT : USBQT_DRIVER_DONE;
+}
+
 static int run(int argc, wchar_t **argv)
 {
+	if (argc == 2 && !wcscmp(argv[1], L"camera-install"))
+		return camera_install();
+	if (argc == 2 && !wcscmp(argv[1], L"camera-remove"))
+		return camera_remove();
 	if (argc != 3)
 		return USBQT_DRIVER_ARGUMENTS;
 	bool install = !wcscmp(argv[1], L"install");

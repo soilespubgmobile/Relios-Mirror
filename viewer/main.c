@@ -115,6 +115,7 @@ enum {
 	CMD_VCAM_REMOVE,
 	CMD_USB,
 	CMD_USB_DRIVER,
+	CMD_USB_RETRY,
 	CMD_STRICT,
 };
 
@@ -150,7 +151,7 @@ static struct {
 	int net_private;     /* 1: a network Windows calls private is connected; 0: only public / domain ones (the
 			      * firewall lets nothing reach the receiver there); -1: not known */
 	bool usb_on;         /* wired (USB) mirroring is switched on (usbqt.c); Wi-Fi stays on as well */
-	bool strict_on;      /* "Sıkı Koruma": the receiver also in an AppContainer (proc_win.c); off unless switched on */
+	bool strict_on;      /* "Sıkı Koruma": the receiver also in an AppContainer (proc_win.c); on unless switched off */
 	bool strict_broken;  /* it could not be used in this run: the receiver runs as without it until the program
 			      * starts again or the switch is used again */
 	bool strict_now;     /* the running receiver is in the AppContainer */
@@ -534,7 +535,7 @@ static void load_settings(void)
 	A.rec_kbit = 15000;
 	A.hw_decode = true;
 	A.usb_on = false;
-	A.strict_on = false;
+	A.strict_on = true; /* (on unless switched off: if the box cannot be used here, the receiver runs without it) */
 	SDL_AtomicSet(&A.volume, 100);
 	SDL_AtomicSet(&A.muted, 0);
 	FILE *f = fopen("ayarlar.txt", "r");
@@ -2072,14 +2073,20 @@ static const char *usb_state_text(int state)
 		return "Windows sürücüyü yükleyemedi";
 	case USBQT_REPLUG:
 		return "iPad'i çıkarıp yeniden takın";
+	case USBQT_NO_APPLE:
+		return "Apple Aygıtları gerekli";
+	case USBQT_APPLE_STOPPED:
+		return "Apple hizmeti çalışmıyor";
 	case USBQT_STARTING:
 		return "Bağlanıyor…";
 	case USBQT_LOCKED:
-		return "iPad'in kilidini açın, \"Güven\" deyin";
+		return "Cihazda \"Güven\"e dokunun";
 	case USBQT_STREAMING:
 		return "Yansıtılıyor";
 	case USBQT_ERROR:
 		return "Hata; yeniden deneniyor";
+	case USBQT_FAILED:
+		return "Bağlanamadı";
 	default:
 		return "Kapalı";
 	}
@@ -2649,10 +2656,15 @@ static const char *build_settings(void)
 					 "Ayarlar bir sonraki kayıtta geçerli olur.";
 	} else if (settings_tab == 4) {
 		toggle("Kablolu (USB) Yansıtma", CMD_USB, A.usb_on);
-		int usb = SDL_AtomicGet(&A.usb_state);
+		int usb = A.usb_on ? SDL_AtomicGet(&A.usb_state) : USBQT_OFF;
 		char line[80];
 		snprintf(line, sizeof(line), "Durum: %s", A.usb_on ? usb_state_text(usb) : "Kapalı");
-		row(line);
+		/* (while it waits for something the user does: "try again now") */
+		if (usb == USBQT_LOCKED || usb == USBQT_ERROR || usb == USBQT_FAILED || usb == USBQT_NO_APPLE ||
+		    usb == USBQT_APPLE_STOPPED)
+			action(line, CMD_USB_RETRY, "Yeniden Dene");
+		else
+			row(line);
 		struct usbqt_device device;
 		bool present = usb_device_cached(&device);
 		if (present && device.filtered)
@@ -2662,8 +2674,16 @@ static const char *build_settings(void)
 		else
 			action("USB Sürücüsü (iPad takılıyken)", CMD_USB_DRIVER, "Kur");
 		row("Gerekli: Apple Aygıtları ya da iTunes");
-		note = A.usb_on && usb == USBQT_DRIVER_FAILED ?
+		note = usb == USBQT_DRIVER_FAILED ?
 			       "Windows bu sürücüyü yüklemiyor (Bellek bütünlüğü açık olabilir): kaldırıp Wi-Fi ile yansıtın." :
+		       usb == USBQT_NO_APPLE ?
+			       "Microsoft Store'dan \"Apple Aygıtları\"nı (ya da iTunes'u) kurun, sonra cihazı çıkarıp takın." :
+		       usb == USBQT_APPLE_STOPPED ?
+			       "\"Apple Mobile Device Service\" durmuş: bilgisayarı yeniden başlatın." :
+		       usb == USBQT_LOCKED ?
+			       "Kilidi açın; \"Bu Bilgisayara Güven\"e dokunun (çıkmazsa Apple Aygıtları'nı açın)." :
+		       usb == USBQT_FAILED ?
+			       "\"Yeniden Dene\"ye basın ya da cihazı çıkarıp takın; sürerse log.txt'yi gönderin." :
 			       "iPad'i kabloyla takın, kilidini açın, \"Güven\" deyin. Wi-Fi yansıtma da açık kalır.";
 	} else if (settings_tab == 3) {
 		toggle("Windows İle Başlat", CMD_AUTOSTART, autostart_get());
@@ -3066,28 +3086,37 @@ static void choose_video_folder(void)
 }
 
 #ifdef _WIN32
-/* The camera's DLL (next to the program) is copied to "Program Files\Relios Mirror" and made known to Windows there,
- * with the user's consent (Windows asks: UAC), once. false: not installed. */
+/* The camera's installer: relios-usb-kurucu.exe next to the program (see usbdriver.c), run with administrator rights
+ * (Windows asks: UAC). It accepts the camera's DLL only with the fingerprint this build wrote into it, writes what it
+ * checked to "Program Files\Relios Mirror" (only administrators can change files there) and makes it known to
+ * Windows from there: a file swapped in the program's folder is never registered. */
+static int camera_installer(const char *op)
+{
+	char exe[2100];
+	char *base = SDL_GetBasePath();
+	snprintf(exe, sizeof(exe), "%srelios-usb-kurucu.exe", base ? base : "");
+	SDL_free(base);
+	if (!file_exists_utf8(exe)) {
+		app_log("virtual camera: the installer is missing (relios-usb-kurucu.exe)");
+		return -2;
+	}
+	int code = run_elevated_wait(exe, op, 90000);
+	app_log("virtual camera: %s, result %d", op, code);
+	return code;
+}
+
+/* made known to Windows once, with the user's consent. false: not installed */
 static bool install_camera(void)
 {
-	char src[2100], dst[1200], dir[1200], cmd_exe[900], regsvr[900], args[9000];
 	if (camera_installed())
 		return true;
+	char cam[2100];
 	char *base = SDL_GetBasePath();
-	snprintf(src, sizeof(src), "%ssoftcam.dll", base ? base : "");
+	snprintf(cam, sizeof(cam), "%ssoftcam.dll", base ? base : "");
 	SDL_free(base);
-	if (!file_exists_utf8(src) || !camera_installed_path(dst, sizeof(dst))) {
+	if (!file_exists_utf8(cam)) {
 		app_log("virtual camera: this build has no camera file");
-		return false;
-	}
-	snprintf(dir, sizeof(dir), "%s", dst);
-	char *slash = strrchr(dir, '\\');
-	if (slash)
-		*slash = '\0';
-	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
-	system_program("regsvr32.exe", regsvr, sizeof(regsvr));
-	if (strpbrk(src, "%^!\"&") || strpbrk(dst, "%^!\"&") || strpbrk(regsvr, "%^!\"&")) {
-		app_log("virtual camera: not installed (unusual letters in a folder's name)");
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, APP_NAME, "Bu sürümde sanal kamera dosyası yok.", A.win);
 		return false;
 	}
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, APP_NAME,
@@ -3095,40 +3124,30 @@ static bool install_camera(void)
 				 "Tamam'a bastıktan sonra çıkacak Windows sorusunda \"Evet\"i seçin.\n"
 				 "Kamerayı kullanacak program (Discord vb.) açıksa kapatıp yeniden açın.",
 				 A.win);
-	int n = snprintf(args, sizeof(args),
-			 "/c \"mkdir \"%s\" 2>nul & copy /y \"%s\" \"%s\" >nul 2>&1 & \"%s\" /s \"%s\"\"", dir, src, dst,
-			 regsvr, dst);
-	if (n < 0 || n >= (int)sizeof(args))
-		return false;
-	int code = run_elevated(cmd_exe, args);
-	bool ok = code == 0 && camera_installed();
-	app_log("virtual camera: installation %s (code %d)", ok ? "done" : "failed or refused", code);
+	int code = camera_installer("camera-install");
+	bool ok = code == USBQT_DRIVER_DONE && camera_installed();
+	if (!ok && code != -1) {
+		const char *why = code == USBQT_DRIVER_NO_FILES ? "Bu sürümde sanal kamera dosyası yok." :
+				  code == USBQT_DRIVER_BAD_FILES ?
+						  "Kamera dosyasının parmak izi beklenen değil; güvenlik için kurulmadı.\n"
+						  "Programı yeniden indirin." :
+				  code == USBQT_DRIVER_COPY ? "Kamera dosyası yerine yazılamadı (kullanımda olabilir)." :
+				  code == USBQT_DRIVER_REGISTER ? "Windows kamerayı kaydetmedi." :
+								  "Sanal kamera kurulamadı (ayrıntı log.txt'de).";
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, APP_NAME, why, A.win);
+	}
 	return ok;
 }
 
 /* the camera is taken out of Windows again (the user is asked: UAC) */
 static void remove_camera(void)
 {
-	char dst[1200], dir[1200], cmd_exe[900], regsvr[900], args[9000];
-	if (!camera_installed_path(dst, sizeof(dst)))
-		return;
-	snprintf(dir, sizeof(dir), "%s", dst);
-	char *slash = strrchr(dir, '\\');
-	if (slash)
-		*slash = '\0';
-	system_program("cmd.exe", cmd_exe, sizeof(cmd_exe));
-	system_program("regsvr32.exe", regsvr, sizeof(regsvr));
-	if (strpbrk(dst, "%^!\"&") || strpbrk(regsvr, "%^!\"&"))
-		return;
-	int n = snprintf(args, sizeof(args),
-			 "/c \"\"%s\" /u /s \"%s\" & del /f /q \"%s\" >nul 2>&1 & rmdir \"%s\" >nul 2>&1\"", regsvr, dst, dst,
-			 dir);
-	if (n < 0 || n >= (int)sizeof(args))
-		return;
-	run_elevated(cmd_exe, args);
+	int code = camera_installer("camera-remove");
 	bool gone = !camera_installed();
-	app_log("virtual camera: removal %s", gone ? "done" : "failed or refused");
-	set_notice(gone ? "Sanal kamera Windows'tan kaldırıldı" : "Sanal kamera kaldırılamadı", false);
+	set_notice(!gone ? "Sanal kamera kaldırılamadı" :
+		   code == USBQT_DRIVER_REBOOT ? "Sanal kamera kaldırıldı (dosyası Windows yeniden başlayınca silinir)" :
+						 "Sanal kamera Windows'tan kaldırıldı",
+		   false);
 }
 
 static bool confirm(const char *text, bool yes_is_default);
@@ -3155,6 +3174,21 @@ static void usb_driver(void)
 		return;
 	}
 	bool removing = device.filtered;
+	/* (without Apple's own driver and service the switch cannot work: the driver of this program would be of no use) */
+	enum usbqt_apple apple = usbqt_apple_service();
+	if (!removing && (apple == USBQT_APPLE_MISSING || !usbqt_apple_driver(&device))) {
+		app_log("USB driver: not installed, Apple's support is missing (service %s, device driver %s)",
+			apple == USBQT_APPLE_MISSING ? "missing" : "present", device.service[0] ? device.service : "none");
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, APP_NAME,
+					 "Kablolu yansıtma Apple'ın kendi USB sürücüsüyle çalışır; bu bilgisayarda yok ya da\n"
+					 "bu cihazda çalışmıyor.\n\n"
+					 "1. Microsoft Store'dan \"Apple Aygıtları\" uygulamasını (ya da iTunes'u) kurun.\n"
+					 "2. Cihazı çıkarıp yeniden takın, kilidini açın, \"Bu Bilgisayara Güven\"e dokunun.\n"
+					 "3. Sonra buradan USB sürücüsünü kurun.\n\n"
+					 "(Program hiçbir şeyi kendisi indirmez.)",
+					 A.win);
+		return;
+	}
 	if (!removing && memory_integrity_on() &&
 	    !confirm("Windows'ta \"Bellek bütünlüğü\" açık. Bu güvenlik özelliği, kablolu yansıtmanın eski USB sürücüsünü\n"
 		     "büyük olasılıkla yüklemeyecek (o zaman program yaptığı her şeyi geri alır).\n\n"
@@ -3237,6 +3271,11 @@ static void usb_driver(void)
 	case USBQT_DRIVER_DEVICE_PROBLEM:
 		text = "Windows bu iPad için zaten bir sorun bildiriyor (Aygıt Yöneticisi'nde ünlem).\n"
 		       "Apple Aygıtları (Microsoft Store) ya da iTunes kurulu mu? Kurulum yapılmadı.";
+		break;
+	case USBQT_DRIVER_NO_APPLE:
+		text = "Bu cihazı Apple'ın USB sürücüsü çalıştırmıyor; kurulum yapılmadı.\n\n"
+		       "Microsoft Store'dan \"Apple Aygıtları\"nı (ya da iTunes'u) kurun, cihazı çıkarıp yeniden takın,\n"
+		       "sonra yeniden deneyin.";
 		break;
 	case USBQT_DRIVER_NOT_LOADED:
 		text = "Windows sürücüyü yüklemedi (\"Bellek bütünlüğü\" açıksa eski sürücüleri engeller).\n"
@@ -3348,7 +3387,7 @@ static void reset_everything(void)
 		return;
 	usbqt_stop(false);
 	session_stop();
-	proc_strict_remove(); /* (off at a first start: what it was given in Windows is taken back) */
+	proc_strict_remove(); /* (as at a first start: what it was given in Windows is taken back, and made anew) */
 	A.restart_at = 0;
 	A.apply_at = 0;
 	SDL_LockMutex(R.mutex);
@@ -3588,6 +3627,11 @@ static void run_command(int cmd, int arg)
 		break;
 	case CMD_USB_DRIVER:
 		usb_driver();
+		break;
+	case CMD_USB_RETRY:
+		app_log("USB: try again (asked)");
+		usbqt_retry();
+		set_notice("Yeniden deneniyor…", false);
 		break;
 	case CMD_STRICT:
 		A.strict_on = !A.strict_on;

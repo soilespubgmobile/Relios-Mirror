@@ -883,6 +883,8 @@ struct SRPVerifier *  srp_verifier_new( SRP_HashAlgorithm alg, SRP_NGType ng_typ
 
        ver->bytes_B = *bytes_B;
     } else {
+       /* RELIOS: (A % N == 0: the username copy was lost with it) */
+       free( (void*) ver->username );
        free(ver);
        ver = 0;
     }

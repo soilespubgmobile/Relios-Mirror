@@ -102,8 +102,11 @@ static HANDLE make_job(void)
 	memset(&limits, 0, sizeof(limits));
 	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
 						  JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION |
-						  JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+						  JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
 	limits.BasicLimitInformation.ActiveProcessLimit = 1; /* it may not start other programs */
+	/* nor take the computer's memory: it needs a few tens of MB (a fault, or someone on the network, could make it
+	 * ask for more and more: it then fails at 1 GB, and this program starts a new one) */
+	limits.ProcessMemoryLimit = (SIZE_T)1024 * 1024 * 1024;
 	if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
 		log_error("SetInformationJobObject(limits)");
 		CloseHandle(job);
@@ -145,6 +148,16 @@ static bool make_pipe(HANDLE *read_end, HANDLE *write_end, bool child_reads)
 #ifndef PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES
 #define PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES 0x00020009
 #endif
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
+#endif
+
+/* In the box, Windows' exploit mitigations for the receiver as well (as browsers use for their sandboxed parts): a
+ * damaged heap ends it at once; no legacy extension points (AppInit DLLs, Winsock LSPs, global hooks) are loaded into
+ * it; it loads no DLL from a network share or with a low integrity label (one a sandboxed program could have made) */
+#define BOX_MITIGATIONS                                                                                                \
+	((1ULL << 12) /* HEAP_TERMINATE_ALWAYS_ON */ | (1ULL << 32) /* EXTENSION_POINT_DISABLE_ALWAYS_ON */ |       \
+	 (1ULL << 52) /* IMAGE_LOAD_NO_REMOTE_ALWAYS_ON */ | (1ULL << 56) /* IMAGE_LOAD_NO_LOW_LABEL_ALWAYS_ON */)
 
 /* SECURITY_CAPABILITIES, as Windows reads it */
 struct box_capabilities {
@@ -502,7 +515,8 @@ struct proc *proc_start(const char *exe_utf8, const char *args_utf8, enum proc_b
 	STARTUPINFOEXW si;
 	HANDLE inherit[3];
 	SIZE_T attr_size = 0;
-	DWORD flags, attr_count = strict ? 2 : 1;
+	DWORD flags, attr_count = strict ? 3 : 1;
+	DWORD64 mitigations = BOX_MITIGATIONS;
 	BOOL created;
 	bool ok = false;
 	PSID box_id = NULL, network = NULL;
@@ -554,6 +568,11 @@ struct proc *proc_start(const char *exe_utf8, const char *args_utf8, enum proc_b
 	if (strict && !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &caps,
 						 sizeof(caps), NULL, NULL)) {
 		log_error("UpdateProcThreadAttribute(security capabilities)");
+		goto done;
+	}
+	if (strict && !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigations,
+						 sizeof(mitigations), NULL, NULL)) {
+		log_error("UpdateProcThreadAttribute(mitigation policy)");
 		goto done;
 	}
 

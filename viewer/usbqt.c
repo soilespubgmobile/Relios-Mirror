@@ -6,7 +6,12 @@
  * the protocol; pictures and sound go to the program through the callbacks (usbqt.h).
  *
  * USB access: the libusb-win32 filter driver (libusb0), installed for the Apple device alone (Settings > USB).
- * Apple's own driver (from Apple Devices or iTunes) stays in place: it keeps the pairing ("Trust This Computer").
+ * Apple's own driver and service (from Apple Devices or iTunes) stay in place, and they are needed: Apple's driver
+ * makes Windows use the device's capture configuration after the switch (Windows on its own uses only its photo
+ * camera), and Apple's service pairs with the device ("Trust This Computer"). A device that does not trust this
+ * computer sends nothing, and in its capture configuration Apple's service cannot reach it to be trusted; so a device
+ * is left to Apple's service for a moment before it is switched, and given back at once when it does not answer.
+ * Without Apple's support nothing is switched at all (the program says what is missing).
  *
  * The sequence (activation request, the device leaving and coming back, claiming its capture interface, giving it
  * back afterwards) follows iPhoneMirror by RayrenSX (GPL-3.0-only, https://github.com/RayrenSX/iPhoneMirror), which
@@ -176,8 +181,9 @@ static const char *lu_error(void)
 
 static struct {
 	HANDLE thread;
-	/* detached: the program stopped waiting for this thread (it is ending): nothing is called back any more */
-	volatile LONG stop, quick, streaming, detached;
+	/* detached: the program stopped waiting for this thread (it is ending): nothing is called back any more.
+	 * retry: "try again now" (usbqt_retry) */
+	volatile LONG stop, quick, streaming, detached, retry;
 	struct usbqt_callbacks cb;
 	enum usbqt_state state;
 } U;
@@ -218,9 +224,21 @@ static void set_state(enum usbqt_state s)
 		U.cb.state(s);
 }
 
-static void wait_ms(DWORD ms)
+static bool retry_asked(void)
 {
-	for (DWORD t = 0; t < ms && !stopping(); t += 50)
+	return InterlockedCompareExchange(&U.retry, 0, 0) != 0;
+}
+
+/* "try again now" asked (and taken) */
+static bool take_retry(void)
+{
+	return InterlockedExchange(&U.retry, 0) != 0;
+}
+
+/* a wait between attempts: also ends when "try again now" is asked */
+static void pause_ms(DWORD ms)
+{
+	for (DWORD t = 0; t < ms && !stopping() && !retry_asked(); t += 50)
 		Sleep(50);
 }
 
@@ -329,7 +347,30 @@ static void wide_to_utf8(const wchar_t *w, char *out, size_t size)
 	out[size - 1] = '\0';
 }
 
-bool usbqt_find_device(struct usbqt_device *out)
+/* a REG_MULTI_SZ property of a device, its strings joined with ", " (ASCII; anything else makes it "?") */
+static void multi_sz(HDEVINFO set, SP_DEVINFO_DATA *info, DWORD property, char *out, size_t size)
+{
+	wchar_t buf[256];
+	DWORD type = 0, got = 0;
+	out[0] = '\0';
+	memset(buf, 0, sizeof(buf));
+	if (!SetupDiGetDeviceRegistryPropertyW(set, info, property, &type, (PBYTE)buf, sizeof(buf) - 4, &got) ||
+	    type != REG_MULTI_SZ)
+		return;
+	size_t o = 0;
+	for (const wchar_t *p = buf; p < buf + 254 && *p; p += wcslen(p) + 1) {
+		for (const wchar_t *c = p; *c && o + 3 < size; c++)
+			out[o++] = *c > 0x20 && *c < 0x7f ? (char)*c : '?';
+		if (o + 3 < size && p[wcslen(p) + 1]) {
+			out[o++] = ',';
+			out[o++] = ' ';
+		}
+	}
+	out[o] = '\0';
+}
+
+/* the iPad / iPhone with that serial (NULL: the first) in Windows' device list */
+static bool find_entry(const char *serial, struct usbqt_device *out)
 {
 	memset(out, 0, sizeof(*out));
 	HDEVINFO set = SetupDiGetClassDevsW(NULL, L"USB", NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
@@ -340,12 +381,15 @@ bool usbqt_find_device(struct usbqt_device *out)
 	bool found = false;
 	for (DWORD i = 0; !found && SetupDiEnumDeviceInfo(set, i, &info); i++) {
 		wchar_t id[400];
-		char a[400];
+		char a[400], norm[128];
 		bool ok;
 		if (!SetupDiGetDeviceInstanceIdW(set, &info, id, 400, NULL))
 			continue;
 		ascii_upper(id, a, sizeof(a), &ok);
 		if (!ok || !valid_instance(a))
+			continue;
+		/* (USB\VID_05AC&PID_xxxx\<serial>: the serial after the second backslash) */
+		if (serial && (!path_serial(a + 22, '\\', norm, sizeof(norm)) || strcmp(norm, serial)))
 			continue;
 		snprintf(out->instance, sizeof(out->instance), "%s", a);
 		ULONG status = 0, problem = 0;
@@ -368,10 +412,91 @@ bool usbqt_find_device(struct usbqt_device *out)
 		    SetupDiGetDeviceRegistryPropertyW(set, &info, SPDRP_DEVICEDESC, &type, (PBYTE)buf, sizeof(buf) - 4,
 						      &size))
 			wide_to_utf8(buf, out->name, sizeof(out->name));
+		memset(buf, 0, sizeof(buf));
+		if (SetupDiGetDeviceRegistryPropertyW(set, &info, SPDRP_SERVICE, &type, (PBYTE)buf, sizeof(buf) - 4,
+						      &size) &&
+		    type == REG_SZ) {
+			bool plain;
+			ascii_upper(buf, out->service, sizeof(out->service), &plain);
+			if (!plain)
+				out->service[0] = '\0';
+		}
+		multi_sz(set, &info, SPDRP_LOWERFILTERS, out->lower, sizeof(out->lower));
 		found = true;
 	}
 	SetupDiDestroyDeviceInfoList(set);
 	return found;
+}
+
+bool usbqt_find_device(struct usbqt_device *out)
+{
+	return find_entry(NULL, out);
+}
+
+bool usbqt_apple_driver(const struct usbqt_device *d)
+{
+	/* (no driver at all is not Apple's either; one that could not be read is not held against it) */
+	return d->service[0] ? !strcmp(d->service, "USBCCGP") : d->problem != 28;
+}
+
+/* ------------------------------------------------------------------ Apple's own support (no USB traffic) */
+
+/* the Microsoft Store packages that bring Apple's service (Apple Devices, iTunes): installed for anyone? */
+static bool apple_package_installed(void)
+{
+	typedef LONG(WINAPI * by_family_fn)(PCWSTR, UINT32 *, PWSTR *, UINT32 *, WCHAR *);
+	HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+	by_family_fn by_family =
+		kernel ? (by_family_fn)(void (*)(void))GetProcAddress(kernel, "GetPackagesByPackageFamily") : NULL;
+	if (!by_family)
+		return false;
+	static const wchar_t *const families[] = {L"AppleInc.AppleDevices_nzyj5cx40ttqa", L"AppleInc.iTunes_nzyj5cx40ttqa"};
+	for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); i++) {
+		UINT32 count = 0, length = 0;
+		LONG r = by_family(families[i], &count, NULL, &length, NULL);
+		if (count > 0 || r == ERROR_INSUFFICIENT_BUFFER)
+			return true;
+	}
+	return false;
+}
+
+enum usbqt_apple usbqt_apple_service(void)
+{
+	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+	if (!scm)
+		return USBQT_APPLE_OK; /* (cannot be asked: not held against it) */
+	enum usbqt_apple result = USBQT_APPLE_MISSING;
+	/* (iTunes names it so; some packages by its internal name) */
+	static const wchar_t *const names[] = {L"Apple Mobile Device Service", L"AppleMobileDeviceService"};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && result == USBQT_APPLE_MISSING; i++) {
+		SC_HANDLE s = OpenServiceW(scm, names[i], SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG);
+		if (!s) {
+			if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST)
+				result = USBQT_APPLE_OK; /* (there, but not ours to look at) */
+			continue;
+		}
+		result = USBQT_APPLE_OK;
+		SERVICE_STATUS_PROCESS st;
+		DWORD need = 0;
+		memset(&st, 0, sizeof(st));
+		if (QueryServiceStatusEx(s, SC_STATUS_PROCESS_INFO, (BYTE *)&st, sizeof(st), &need) &&
+		    st.dwCurrentState == SERVICE_STOPPED) {
+			/* stopped: wrong if it should run with Windows (or is switched off); one started on demand may
+			 * simply not be needed yet */
+			union {
+				QUERY_SERVICE_CONFIGW c;
+				BYTE space[8192];
+			} cfg;
+			if (QueryServiceConfigW(s, &cfg.c, sizeof(cfg), &need) &&
+			    (cfg.c.dwStartType == SERVICE_AUTO_START || cfg.c.dwStartType == SERVICE_DISABLED))
+				result = USBQT_APPLE_NOT_RUNNING;
+		}
+		CloseServiceHandle(s);
+	}
+	CloseServiceHandle(scm);
+	if (result == USBQT_APPLE_MISSING && apple_package_installed())
+		result = USBQT_APPLE_OK;
+	return result;
 }
 
 /* ------------------------------------------------------------------ the helpers' marks */
@@ -542,6 +667,43 @@ static bool capture_in_descriptors(const struct lu_device *d, int config, struct
 					q->ep_out = out;
 					return true;
 				}
+			}
+		}
+	}
+	return false;
+}
+
+/* whether a configuration (its value) offers an interface of Apple's own class with this subclass: 0xFE is the
+ * channel Apple's service talks to the device through (and pairs over); Apple's driver makes Windows use a
+ * configuration with it. Windows on its own picks the first, the camera for photos only */
+#define MUX_SUBCLASS 0xFE
+
+/* whether libusb0's copy of the device's descriptors has this configuration at all (else nothing is concluded) */
+static bool config_listed(const struct lu_device *d, int config)
+{
+	int configs = d->descriptor.bNumConfigurations > 8 ? 8 : d->descriptor.bNumConfigurations;
+	for (int c = 0; d->config && c < configs; c++) {
+		if (d->config[c].bConfigurationValue == config && d->config[c].interfaces)
+			return true;
+	}
+	return false;
+}
+
+static bool config_has(const struct lu_device *d, int config, int subclass)
+{
+	if (!d->config)
+		return false;
+	int configs = d->descriptor.bNumConfigurations > 8 ? 8 : d->descriptor.bNumConfigurations;
+	for (int c = 0; c < configs; c++) {
+		const struct lu_config *cfg = &d->config[c];
+		if (cfg->bConfigurationValue != config || !cfg->interfaces)
+			continue;
+		for (int i = 0; i < cfg->bNumInterfaces && i < 32; i++) {
+			const struct lu_interface *itf = &cfg->interfaces[i];
+			for (int a = 0; itf->altsetting && a < itf->num_altsetting && a < 16; a++) {
+				if (itf->altsetting[a].bInterfaceClass == 0xFF &&
+				    itf->altsetting[a].bInterfaceSubClass == subclass)
+					return true;
 			}
 		}
 	}
@@ -727,12 +889,13 @@ static void sink_log(void *ctx, const char *text)
 
 /* the device in its capture configuration: found again by its serial, its capture interface claimed.
  * newly: this program has just switched it (only then may libusb0's view of it be initialized) */
-static lu_handle *open_capture(const char *serial, unsigned pid, bool newly, struct capture_iface *q)
+static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, struct capture_iface *q)
 {
 	struct found f;
 	bool got = false;
 	for (int i = 0; i < 40 && !stopping(); i++) {
-		if (find_apple(serial, pid, &f)) {
+		/* (by its serial; its product ID is expected to stay, but is not relied on) */
+		if (find_apple(serial, *pid, &f) || find_apple(serial, 0, &f)) {
 			got = true;
 			break;
 		}
@@ -741,6 +904,10 @@ static lu_handle *open_capture(const char *serial, unsigned pid, bool newly, str
 	if (!got) {
 		ulog("the device was not found again after the switch");
 		return NULL;
+	}
+	if (f.pid != *pid) {
+		ulog("after the switch the device shows product %04x", f.pid);
+		*pid = f.pid;
 	}
 	lu_handle *h = L.open(f.dev);
 	if (!h) {
@@ -834,7 +1001,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		return END_ERROR;
 	}
 	ULONGLONG start = GetTickCount64(), last_data = start, answered = 0;
-	bool nudged = false;
+	bool nudged = false, greeted = false;
 	for (;;) {
 		if (stopping()) {
 			why = END_STOP;
@@ -860,6 +1027,11 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				break;
 			}
 			enum qt_state st = qt_session_state(s);
+			if (st != QT_WAIT_PING && !greeted) {
+				greeted = true;
+				ulog("the device answered (it trusts this computer) after %llu ms",
+				     (unsigned long long)(now - start));
+			}
 			if (st == QT_STREAMING && !InterlockedCompareExchange(&U.streaming, 0, 0)) {
 				InterlockedExchange(&U.streaming, 1);
 				set_state(USBQT_STREAMING);
@@ -953,11 +1125,6 @@ static void give_back(const char *serial, unsigned pid)
 	ulog("device given back to its usual configuration (%d)", code);
 }
 
-static void backoff(unsigned failures)
-{
-	wait_ms(failures > 3 ? 15000 : 4000);
-}
-
 /* why libusb0 does not show an iPad / iPhone: the state to show */
 static enum usbqt_state waiting_state(unsigned *problem)
 {
@@ -965,10 +1132,73 @@ static enum usbqt_state waiting_state(unsigned *problem)
 	*problem = 0;
 	if (!usbqt_find_device(&d))
 		return USBQT_NO_DEVICE;
+	*problem = d.problem;
+	if (d.filtered && d.problem)
+		return USBQT_DRIVER_FAILED;
+	/* (Apple's support first: the USB driver of this program is of no use without it) */
+	enum usbqt_apple apple = usbqt_apple_service();
+	if (apple == USBQT_APPLE_MISSING || !usbqt_apple_driver(&d))
+		return USBQT_NO_APPLE;
+	if (apple == USBQT_APPLE_NOT_RUNNING)
+		return USBQT_APPLE_STOPPED;
 	if (!d.filtered)
 		return USBQT_NO_DRIVER;
-	*problem = d.problem;
-	return d.problem ? USBQT_DRIVER_FAILED : USBQT_REPLUG;
+	return USBQT_REPLUG;
+}
+
+/* what the log needs to tell why a device does not mirror: its driver in Windows, Apple's service, its configuration */
+static void describe(const struct found *f, int active, bool capturing, bool mux, enum usbqt_apple apple)
+{
+	struct usbqt_device d;
+	bool listed = find_entry(f->serial, &d);
+	ulog("iPad / iPhone on USB (product %04x): %d configurations, active %d (%s); Windows driver %s, lower filters "
+	     "[%s]; Apple Mobile Device Service %s",
+	     f->pid, f->dev->descriptor.bNumConfigurations, active,
+	     capturing ? "screen capture" : mux ? "usual, with Apple's channel" :
+	     active > 0 ? "without Apple's channel" : "unknown",
+	     listed && d.service[0] ? d.service : "?", listed ? d.lower : "?",
+	     apple == USBQT_APPLE_OK ? "present" : apple == USBQT_APPLE_NOT_RUNNING ? "stopped" : "missing");
+}
+
+/* A wait in which the device is not touched: only Windows' device list is looked at (each second), and the wait ends
+ * when the device leaves it (unplugged, or coming back anew), when "try again now" is asked, or when stopping.
+ * (Opening the device again and again is avoided on purpose: with Apple's filters under libusb0, frequent opening has
+ * been seen to make a race in the drivers more likely; iPhoneMirror 1.5.10) */
+static void wait_quietly(ULONGLONG ms, unsigned pid, const char *serial)
+{
+	ULONGLONG until = GetTickCount64() + ms, check = GetTickCount64() + 1000;
+	while (GetTickCount64() < until && !stopping() && !retry_asked()) {
+		if (GetTickCount64() >= check) {
+			if (!interface_present(pid, serial))
+				return;
+			check = GetTickCount64() + 1000;
+		}
+		Sleep(50);
+	}
+}
+
+/* How long a device in its usual configuration is left to Apple's service before it is switched (freshly plugged in,
+ * or given back): the service greets it first. Only a device that trusts this computer sends its screen, and in the
+ * capture configuration Apple's service cannot reach it: "Trust This Computer" can neither be asked nor answered */
+#define SETTLE_MS 5000
+/* "Trust" not answered: tried again this many times on its own (each a little later), then only when asked
+ * ("Yeniden Dene") or when the device is plugged in anew; every try makes it leave and come back twice. The same,
+ * after more tries, for sessions that fail */
+#define LOCKED_TRIES 4
+#define FAILED_TRIES 6
+
+/* after a failure: the next try (or none on its own any more) */
+static ULONGLONG after_failure(unsigned failures, enum usbqt_state *shown)
+{
+	if (failures >= FAILED_TRIES) {
+		*shown = USBQT_FAILED;
+		set_state(USBQT_FAILED);
+		ulog("failed %u times: waiting for \"Yeniden Dene\" or for the device to be plugged in anew", failures);
+		return ~0ull;
+	}
+	*shown = USBQT_ERROR;
+	set_state(USBQT_ERROR);
+	return GetTickCount64() + (failures > 3 ? 15000 : SETTLE_MS);
 }
 
 static DWORD WINAPI usb_main(LPVOID unused)
@@ -976,15 +1206,15 @@ static DWORD WINAPI usb_main(LPVOID unused)
 	(void)unused;
 	wait_for_helpers();
 	unsigned failures = 0, locked = 0;
-	/* a device left in its capture configuration while it waits to be unlocked (given back when this ends) */
-	char held[80] = "";
-	unsigned held_pid = 0;
+	char seen[80] = "";                       /* the device on USB (its serial): new ones are described in the log */
+	ULONGLONG not_before = 0;                 /* no switch before then */
+	enum usbqt_state shown = USBQT_STARTING;  /* shown while waiting for that */
 	enum usbqt_state waiting_logged = USBQT_OFF;
 	while (!stopping()) {
 		struct found f;
 		if (!load_libusb() || !find_apple(NULL, 0, &f)) {
-			held[0] = '\0'; /* (unplugged: nothing to give back) */
-			locked = 0;
+			seen[0] = '\0'; /* (unplugged: everything starts anew when it is back) */
+			locked = failures = 0;
 			unsigned problem = 0;
 			enum usbqt_state st = waiting_state(&problem);
 			if (st != waiting_logged) {
@@ -992,38 +1222,84 @@ static DWORD WINAPI usb_main(LPVOID unused)
 					ulog("the USB driver is installed, but Windows reports problem %u with the device", problem);
 				else
 					ulog("%s", st == USBQT_NO_DEVICE ? "no iPad / iPhone on USB" :
+						   st == USBQT_NO_APPLE ? "an iPad / iPhone is on USB, but Apple's own support "
+									  "(Apple Devices / iTunes) is missing or does not run it" :
+						   st == USBQT_APPLE_STOPPED ? "an iPad / iPhone is on USB, but Apple Mobile Device "
+									       "Service is stopped" :
 						   st == USBQT_NO_DRIVER ? "an iPad / iPhone is on USB without the USB driver" :
 									   "the USB driver is installed, not in use yet: unplug and plug the device");
 				waiting_logged = st;
 			}
 			set_state(st);
-			wait_ms(2000);
+			pause_ms(2000);
+			take_retry();
 			continue;
 		}
 		waiting_logged = USBQT_OFF;
-		if (!held[0])
-			ulog("iPad / iPhone on USB (product %04x)", f.pid);
+		ULONGLONG now = GetTickCount64();
+		bool fresh = strcmp(seen, f.serial) != 0;
+		if (fresh) {
+			snprintf(seen, sizeof(seen), "%s", f.serial);
+			locked = failures = 0;
+			not_before = now + SETTLE_MS;
+			shown = USBQT_STARTING;
+		}
 
-		/* already in its capture configuration (left so by an earlier run, or while it was locked)? */
-		bool capturing = false;
+		/* its configuration now (a standard request) and what that configuration offers */
+		int active = -1;
 		lu_handle *h = L.open(f.dev);
 		if (h) {
-			int active = active_config(h);
-			struct capture_iface q;
-			capturing = active > 0 && capture_in_descriptors(f.dev, active, &q);
+			active = active_config(h);
 			L.close(h);
 		}
+		struct capture_iface q;
+		memset(&q, 0, sizeof(q));
+		bool capturing = active > 0 && capture_in_descriptors(f.dev, active, &q);
+		bool known = active > 0 && config_listed(f.dev, active);
+		bool mux = known && config_has(f.dev, active, MUX_SUBCLASS);
+		enum usbqt_apple apple = usbqt_apple_service();
+		if (fresh)
+			describe(&f, active, capturing, mux, apple);
+
+		/* Apple's own support: its driver makes Windows use the capture configuration after the switch, its
+		 * service pairs with the device. Without them a switch can only fail, and the device would leave and come
+		 * back again and again; so it is not touched */
+		if (!capturing && (apple != USBQT_APPLE_OK || (known && !mux))) {
+			enum usbqt_state st = apple == USBQT_APPLE_NOT_RUNNING ? USBQT_APPLE_STOPPED : USBQT_NO_APPLE;
+			if (U.state != st)
+				ulog("%s", apple == USBQT_APPLE_MISSING ?
+						   "Apple's service (Apple Devices / iTunes) is not installed: not switched" :
+					   apple == USBQT_APPLE_NOT_RUNNING ?
+						   "Apple Mobile Device Service is stopped: not switched" :
+						   "Apple's driver does not run the device (Windows uses its photo-only configuration): "
+						   "not switched");
+			set_state(st);
+			/* (looked at again in 10 s, or when the device comes back anew: installing Apple's driver does that) */
+			wait_quietly(10000, f.pid, f.serial);
+			take_retry();
+			continue;
+		}
+
+		/* a wait planned (settling, trying again later), without touching the device; "try again now" ends it */
+		if (!capturing && now < not_before) {
+			if (!take_retry()) {
+				set_state(shown);
+				wait_quietly(not_before - now, f.pid, f.serial);
+				continue;
+			}
+			ulog("trying again now (asked)");
+		}
+		take_retry(); /* (asked meanwhile: this is the try) */
+		/* (while "Trust" is awaited, that stays on screen through the tries) */
+		set_state(shown == USBQT_LOCKED ? USBQT_LOCKED : USBQT_STARTING);
+
 		bool newly = false;
-		if (U.state != USBQT_LOCKED)
-			set_state(USBQT_STARTING);
 		if (!capturing) {
 			ulog("switching the device to screen capture");
 			int code = run_switch("activate", f.serial, f.pid, 25000);
 			ulog("switch: %d", code);
 			if (code != 0 && code != 20 && code != 32 && code != 33) {
-				failures++;
-				set_state(USBQT_ERROR);
-				backoff(failures);
+				not_before = after_failure(++failures, &shown);
 				continue;
 			}
 			newly = code != 20;
@@ -1031,48 +1307,51 @@ static DWORD WINAPI usb_main(LPVOID unused)
 		if (stopping()) {
 			if (newly || capturing)
 				give_back(f.serial, f.pid);
-			held[0] = '\0';
 			break;
 		}
-		struct capture_iface q;
-		lu_handle *stream_h = open_capture(f.serial, f.pid, newly, &q);
+		unsigned pid = f.pid; /* (as it shows itself now) */
+		lu_handle *stream_h = open_capture(f.serial, &pid, newly, &q);
 		if (!stream_h) {
-			failures++;
-			give_back(f.serial, f.pid);
-			held[0] = '\0';
-			set_state(USBQT_ERROR);
-			backoff(failures);
+			give_back(f.serial, pid);
+			not_before = after_failure(++failures, &shown);
 			continue;
 		}
 		ULONGLONG began = GetTickCount64();
-		enum end_reason why = stream(stream_h, &q, newly, f.serial, f.pid);
+		enum end_reason why = stream(stream_h, &q, newly, f.serial, pid);
 		bool short_session = GetTickCount64() - began < 30000;
-		if (why == END_LOCKED && !stopping() && ++locked != 10 && locked != 30) {
-			/* Kept in its capture configuration and tried again in a moment without switching it: every switch
-			 * makes it leave and come back, which Windows sounds each time. (The 10th and the 30th try switch it
-			 * anew; after that only unplugging it, or switching wired mirroring off and on, does.) */
-			snprintf(held, sizeof(held), "%s", f.serial);
-			held_pid = f.pid;
+		if (why != END_GONE)
+			give_back(f.serial, pid);
+		if (stopping())
+			break;
+		now = GetTickCount64();
+		if (why == END_LOCKED) {
+			/* No answer: it does not trust this computer (yet), or it is locked. Given back at once (above): in its
+			 * usual configuration Apple's service reaches it again, "Trust This Computer" can be asked and
+			 * answered. Tried again later, each time a little later; then only when asked */
+			locked++;
+			shown = USBQT_LOCKED;
 			set_state(USBQT_LOCKED);
-			wait_ms(5000);
+			if (locked >= LOCKED_TRIES) {
+				not_before = ~0ull;
+				ulog("no answer %u times: waiting for \"Yeniden Dene\" or for the device to be plugged in anew",
+				     locked);
+			} else {
+				DWORD wait = locked == 1 ? 15000 : locked == 2 ? 30000 : 60000;
+				not_before = now + wait;
+				ulog("tried again in %lu s (at once with \"Yeniden Dene\")", (unsigned long)(wait / 1000));
+			}
 			continue;
 		}
-		held[0] = '\0';
-		if (why != END_LOCKED)
-			locked = 0;
-		if (why != END_GONE)
-			give_back(f.serial, f.pid);
-		if (why == END_ERROR || why == END_LOCKED || (why == END_DEVICE_STOPPED && short_session)) {
+		locked = 0;
+		if (why == END_ERROR || (why == END_DEVICE_STOPPED && short_session)) {
 			/* (a session the device ends at once counts as a failure too: it is not switched again and again) */
-			failures++;
-			set_state(why == END_LOCKED ? USBQT_LOCKED : USBQT_ERROR);
-			backoff(failures);
+			not_before = after_failure(++failures, &shown);
 		} else {
 			failures = 0;
+			shown = USBQT_STARTING;
+			not_before = now + SETTLE_MS;
 		}
 	}
-	if (held[0])
-		give_back(held, held_pid);
 	set_state(USBQT_OFF);
 	return 0;
 }
@@ -1093,8 +1372,14 @@ bool usbqt_start(const struct usbqt_callbacks *cb)
 	InterlockedExchange(&U.quick, 0);
 	InterlockedExchange(&U.streaming, 0);
 	InterlockedExchange(&U.detached, 0);
+	InterlockedExchange(&U.retry, 0);
 	U.thread = CreateThread(NULL, 0, usb_main, NULL, 0, NULL);
 	return U.thread != NULL;
+}
+
+void usbqt_retry(void)
+{
+	InterlockedExchange(&U.retry, 1);
 }
 
 void usbqt_stop(bool wait)
@@ -1147,9 +1432,24 @@ bool usbqt_streaming(void)
 	return false;
 }
 
+void usbqt_retry(void)
+{
+}
+
 bool usbqt_find_device(struct usbqt_device *out)
 {
 	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+enum usbqt_apple usbqt_apple_service(void)
+{
+	return USBQT_APPLE_MISSING;
+}
+
+bool usbqt_apple_driver(const struct usbqt_device *d)
+{
+	(void)d;
 	return false;
 }
 

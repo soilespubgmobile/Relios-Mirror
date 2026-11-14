@@ -34,6 +34,9 @@ typedef struct srp_s {
     unsigned char verifier[SRP_VERIFIER_SIZE];
     unsigned char session_key[SRP_SESSION_KEY_SIZE];
     unsigned char private_key[SRP_PRIVATE_KEY_SIZE];
+    /* RELIOS: the client proved the PIN (srp_validate_proof); only then has session_key a value, and only then
+     * may srp_confirm_pair_setup pair it (before, session_key was all zeros: anyone could "decrypt" with it) */
+    bool proven;
 } srp_t;
 
 struct pairing_s {
@@ -168,12 +171,20 @@ pairing_session_handshake(pairing_session_t *session, const unsigned char ecdh_k
         return -1;
     }
 
+    /* RELIOS: the keys of an earlier handshake on this connection are freed, not leaked */
+    x25519_key_destroy(session->ecdh_theirs);
+    ed25519_key_destroy(session->ed_theirs);
+    x25519_key_destroy(session->ecdh_ours);
     session->ecdh_theirs = x25519_key_from_raw(ecdh_key);
     session->ed_theirs = ed25519_key_from_raw(ed_key);
 
     session->ecdh_ours = x25519_key_generate();
 
-    x25519_derive_secret(session->ecdh_secret, session->ecdh_ours, session->ecdh_theirs);
+    if (x25519_derive_secret(session->ecdh_secret, session->ecdh_ours, session->ecdh_theirs)) {
+        /* RELIOS: no secret with their key (all zeros, a low-order point): no handshake */
+        session->status = STATUS_SETUP;
+        return -1;
+    }
 
     session->status = STATUS_HANDSHAKE;
     return 0;
@@ -550,7 +561,9 @@ srp_new_user(pairing_session_t *session, pairing_t *pairing, const char *device_
         memset(session->srp->verifier, 0, v_offset);
     }
 
-    *salt = (char *) session->srp->salt;
+    /* RELIOS: the salt as the verifier was made with it (srp_s): it sits at the end of the array. (UxPlay sent the
+     * array's first len_s bytes: when the salt had a leading zero byte, about one PIN pairing in 256 failed.) */
+    *salt = (char *) session->srp->salt + s_offset;
     *len_salt = len_s;
 
     srp_create_server_ephemeral_key(SRP_SHA, SRP_NG,
@@ -573,13 +586,18 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
                    int len_A, unsigned char *proof, int proof_len) {
     int authenticated  = 0;
     const unsigned char *B =  NULL;
-    const unsigned char *b = session->srp->private_key;
+    const unsigned char *b = NULL;
     int len_b = SRP_PRIVATE_KEY_SIZE;
     int len_B = 0;
     int len_K = 0;
     const unsigned char *session_key  = NULL;
     const unsigned char *M2 = NULL;
 
+    /* RELIOS: only after srp_new_user (the first step, with the PIN shown); a proof is checked once */
+    if (!session->srp || session->srp->proven) {
+        return -1;
+    }
+    b = session->srp->private_key;
     struct SRPVerifier *verifier = srp_verifier_new(SRP_SHA, SRP_NG, (const char *) session->username,
                                                     (const unsigned char *) session->srp->salt, SRP_SALT_SIZE,
                                                     (const unsigned char *) session->srp->verifier, SRP_VERIFIER_SIZE,
@@ -587,20 +605,29 @@ srp_validate_proof(pairing_session_t *session, pairing_t *pairing, const unsigne
                                                     b, len_b,
                                                     &B, &len_B, NULL, NULL, 1);
 
-    srp_verifier_verify_session(verifier, proof, &M2);
-    authenticated = srp_verifier_is_authenticated(verifier);
-    if (authenticated == 0) {
+    /* RELIOS: no verifier (the client's A was 0 mod N: the SRP-6a safety check) is a failure, not a crash */
+    if (verifier) {
+        srp_verifier_verify_session(verifier, proof, &M2);
+        authenticated = srp_verifier_is_authenticated(verifier);
+    }
+    if (authenticated == 0 || !M2) {
         /* HTTP 470 should be sent to client if not verified.*/
-        srp_verifier_delete(verifier);
+        if (verifier) {
+            srp_verifier_delete(verifier);
+        }
         free (session->srp);
         session->srp = NULL;
         return -1;
     }
     session_key = srp_verifier_get_session_key(verifier, &len_K);
-    if (len_K != SRP_SESSION_KEY_SIZE) {
+    if (len_K != SRP_SESSION_KEY_SIZE || proof_len > SRP_PROOF_SIZE) {
+        srp_verifier_delete(verifier);
+        free (session->srp);
+        session->srp = NULL;
         return -2;
     }
     memcpy(session->srp->session_key, session_key, len_K);
+    session->srp->proven = true;
     memcpy(proof, M2, proof_len);
     srp_verifier_delete(verifier);
     return 0;
@@ -611,6 +638,14 @@ srp_confirm_pair_setup(pairing_session_t *session, pairing_t *pairing,
     unsigned char aesKey[16] = {0}, aesIV[16] = {0};
     unsigned char hash[SHA512_DIGEST_LENGTH] = {0};
     unsigned char pk[ED25519_KEY_SIZE] = {0};
+    /* RELIOS: only after the client proved the PIN (srp_validate_proof) in this session */
+    if (!session->srp || !session->srp->proven) {
+        if (session->srp) {
+            free(session->srp);
+            session->srp = NULL;
+        }
+        return -1;
+    }
     /* decrypt client epk to get client pk, authenticate with auth_tag*/ 
 
     const char *salt = "Pair-Setup-AES-Key";

@@ -62,8 +62,11 @@ KABLOLU (USB) YANSITMA (Ayarlar > USB; deneme aşamasında)
 iPad / iPhone'u normal USB kablosuyla bilgisayara takınca görüntüsü ve sesi pencereye gelir; ağ gerekmez.
 Mac'teki QuickTime'ın cihaz ekranını kaydettiği USB kanalını kullanır. Wi-Fi yansıtma da açık kalır.
 Gerekenler (bir kez):
-1. Apple'ın Windows sürücüsü: Microsoft Store'dan "Apple Aygıtları" (Apple Devices) ya da iTunes.
-   iPad'i takınca "Bu Bilgisayara Güven" sorusuna "Güven" deyin.
+1. Apple'ın Windows sürücüsü ve hizmeti: Microsoft Store'dan "Apple Aygıtları" (Apple Devices) ya da iTunes.
+   Bu şarttır: Apple'ın sürücüsü olmadan Windows cihazı yalnızca fotoğraf aktarımı için tanır ve ekran kaydı
+   kanalı açılamaz. Program bunları indirmez; yoksa Ayarlar > USB'de "Apple Aygıtları gerekli" yazar.
+   Kurduktan sonra cihazı takın, kilidini açın, "Bu Bilgisayara Güven" sorusunda "Güven"e dokunup parolanızı
+   girin. Soru çıkmazsa Apple Aygıtları uygulamasını bir kez açın (soruyu o sorar).
 2. iPad takılıyken Ayarlar > USB > USB Sürücüsü > "Kur". Windows yönetici onayı ister ("Bilinmeyen yayımcı"
    yazabilir). Kurulan: açık kaynaklı libusb-win32 1.2.6.0 sürücüsü, yalnızca bu iPad için filtre olarak;
    Apple'ın sürücüsü yerinde kalır. Kurmadan önce dosyaların SHA-256 parmak izi denetlenir (tutmazsa hiçbir şey
@@ -80,8 +83,13 @@ Bilmeniz gerekenler:
 - Sürücüyü kaldırmak: Ayarlar > USB > "Kaldır". Filtre iPad'den kaldırılır; sürücüyü Relios Mirror kurduysa ve
   başka bir cihaz kullanmıyorsa sürücü bilgisayardan tamamen silinir. Sonra iPad'i yeniden takın.
 - Bellek bütünlüğü açıksa program kurmadan önce uyarır.
-- iPad kilitliyken program bekler; kilidi açınca görüntü birkaç saniye içinde gelir. Gelmezse kabloyu çıkarıp
-  yeniden takın.
+- Cihaz bu bilgisayara güvenmiyorsa (ya da kilitliyse) görüntü göndermez. Program bunu görünce cihazı hemen
+  normal haline geri verir ki "Bu Bilgisayara Güven" sorusu çıkabilsin; durum "Cihazda "Güven"e dokunun" olur.
+  Güven'e dokunup parolanızı girin, sonra Ayarlar > USB > "Yeniden Dene" (ya da biraz bekleyin: program 15, 30,
+  60 sn sonra kendisi dener; birkaç denemeden sonra yalnızca "Yeniden Dene" ile ya da kabloyu yeniden takınca).
+- Durumlar: "Apple Aygıtları gerekli" (Apple'ın desteği yok ya da cihazı çalıştırmıyor: kurun, cihazı çıkarıp
+  takın); "Apple hizmeti çalışmıyor" (bilgisayarı yeniden başlatın); "Bağlanamadı" (birçok deneme başarısız:
+  "Yeniden Dene" ya da kabloyu yeniden takın; sürerse log.txt'yi gönderin).
 - Sorun olursa log.txt ve log-onceki.txt dosyalarını gönderin (satırları "USB:" ile başlar).
 Ağ üzerinden kablolu bağlantı da olur: cihaza USB-C Ethernet adaptörü takıp modeme bağlayın; sonra yine Ekran
 Yansıtma > Relios Mirror.
@@ -106,12 +114,16 @@ GÜVENLİK VE AĞ
   başlatamaz; ama okuyabilir. "Sıkı Koruma" bunu da kapatır (aşağıya bakın).
 - Kablolu yansıtma ağı hiç kullanmaz: cihazla yalnızca USB kablosu üzerinden konuşulur.
 - Yönetici onayı yalnızca şunlar için istenir: güvenlik duvarı kuralları, sanal kameranın ve USB sürücüsünün
-  kurulması / kaldırılması. USB sürücüsünü küçük, ayrı bir program kurar (relios-usb-kurucu.exe; yönetici onayıyla
-  yalnızca o çalışır ve program klasöründen hiçbir DLL yüklemez): önce dosyaların SHA-256 parmak izini denetler,
-  dosyaları denetlediği bellekteki halinden yazar.
+  kurulması / kaldırılması. USB sürücüsünü ve sanal kamerayı küçük, ayrı bir program kurar (relios-usb-kurucu.exe;
+  yönetici onayıyla yalnızca o çalışır ve program klasöründen hiçbir DLL yüklemez): önce dosyaların SHA-256 parmak
+  izini denetler (kameranınki derleme sırasında programa yazılır), dosyaları denetlediği bellekteki halinden
+  yalnızca yöneticilerin değiştirebildiği klasörlere yazar ve yalnızca oradan Windows'a tanıtır. Program
+  klasöründe değiştirilmiş bir dosya yönetici yetkisiyle hiç çalıştırılmaz.
+- Alıcı bozuk ya da aşırı büyük isteklere karşı sınırlıdır (adres 8 KB, gövde 8 MB, en çok 12 bağlantı; bellek
+  1 GB). Eşleşmeyi atlatma, PIN'siz eşleşme ve bağlantı işgali denemelerine karşı sınanmıştır.
 
 
-SIKI KORUMA (Ayarlar > Program; varsayılan: kapalı)
+SIKI KORUMA (Ayarlar > Program; varsayılan: açık)
 Açıkken Wi-Fi alıcısı, Windows'un Store uygulamalarını kapattığı "kafes"te (AppContainer) de çalışır:
 - Kişisel dosyalarınızı göremez: Belgeler, Masaüstü, Resimler, İndirilenler, tarayıcı verileri ve diğer
   programların klasörleri ona kapalıdır. Okuyabildikleri yalnızca kendi program dosyası, anahtarı ve Windows'un
@@ -121,9 +133,11 @@ Açıkken Wi-Fi alıcısı, Windows'un Store uygulamalarını kapattığı "kafe
 - Alıcıda bilinmeyen bir açık olsa bile dosyalarınıza ulaşmak için ikinci, ayrı bir açık daha gerekir.
 Windows bunun için %LOCALAPPDATA%\Packages\ReliosMirror.Receiver klasörünü ve bir kayıt girdisini oluşturur;
 alıcı dosyasına, ayar klasörüne (yalnızca içinden geçmek için) ve anahtar dosyasına bu kafes için okuma izni
-eklenir. Verilenlerin listesi ayar klasöründeki siki-koruma.txt dosyasındadır. Sıkı Koruma kapatılınca (ya da
-"Varsayılan Ayarlara Dön" ile) hepsi geri alınır ve silinir. Programı silmeden önce Sıkı Koruma'yı kapatırsanız
-Windows'ta hiçbir izi kalmaz.
+eklenir. Verilenlerin listesi ayar klasöründeki siki-koruma.txt dosyasındadır. Sıkı Koruma kapatılınca hepsi geri
+alınır ve silinir. Programı silmeden önce Sıkı Koruma'yı kapatırsanız Windows'ta hiçbir izi kalmaz.
+Kafeste alıcı için Windows'un istismar korumaları da açıktır: bellek yığını bozulursa hemen kapanır; eski eklenti
+noktaları (AppInit DLL'leri, Winsock LSP'leri, genel kancalar) ona yüklenmez; ağ paylaşımından ya da düşük
+etiketli DLL yüklemez.
 Kafes bu bilgisayarda kurulamaz ya da alıcı kafeste başlayamazsa program bunu anlar, alıcıyı normal korumayla
 (düşük yetki) çalıştırır ve bunu pencerede yazar. Alıcı kafeste başladığı halde iPad "Relios Mirror"ı listede
 görmez ya da bağlanamazsa Sıkı Koruma'yı kapatın ve log.txt'yi gönderin. Görüntü ve ses kalitesi, gecikme

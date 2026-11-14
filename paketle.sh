@@ -4,7 +4,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+# our own virtual camera (built by the workflow's "softcam" step; without it the program has no virtual camera). Its
+# fingerprint goes into the installer, which installs nothing else under that name
+cam=$(find softcam -name softcam.dll -path '*x64*' 2>/dev/null | head -1 || true)
+cam_sha=""
+if [ -n "$cam" ]; then
+	cam_sha=$(sha256sum "$cam" | cut -d' ' -f1)
+fi
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSOFTCAM_SHA256="$cam_sha"
 cmake --build build
 
 out=dist/ReliosMirror
@@ -49,10 +56,18 @@ if [ -f "$prefix/bin/SDL3.dll" ]; then
 fi
 
 cp BENIOKU.txt LICENSE assets/logo.bmp "$out/"
-# our own virtual camera (built by the workflow's "softcam" step; without it the program has no virtual camera)
-cam=$(find softcam -name softcam.dll -path '*x64*' 2>/dev/null | head -1 || true)
 if [ -n "$cam" ]; then
 	cp "$cam" "$out/softcam.dll"
+	# (the copy must be the very file whose fingerprint the installer carries)
+	if [ "$(sha256sum "$out/softcam.dll" | cut -d' ' -f1)" != "$cam_sha" ]; then
+		echo "softcam.dll: parmak izi degisti"
+		exit 1
+	fi
+	if ! grep -q "$cam_sha" build/bin/relios-usb-kurucu.exe; then
+		echo "relios-usb-kurucu.exe: kameranin parmak izi icinde yok"
+		exit 1
+	fi
+	echo "Sanal kamera parmak izi (kurucuda): $cam_sha"
 	# (MIT: the notice goes with the DLL)
 	if [ -f softcam/LICENSE ]; then cp softcam/LICENSE "$out/softcam-LICENSE.txt"; fi
 	echo "Sanal kamera: $cam ($(stat -c %s "$cam") bayt)"

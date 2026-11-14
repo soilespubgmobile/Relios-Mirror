@@ -56,6 +56,9 @@ else()
 endif()
 
 target_compile_options(relios-airplay-receiver PRIVATE -Wall -Wno-unused-variable -Wno-unused-but-set-variable)
+# (FairPlay's obfuscated code counts on signed numbers wrapping around: so they do, as the code expects, instead of
+# leaving it to the compiler's assumptions)
+set_source_files_properties(${UX_PLAYFAIR} PROPERTIES COMPILE_OPTIONS "-fwrapv")
 if(RELIOS_AIRPLAY_SANITIZE)
   foreach(t relios-airplay-receiver relios_plist)
     target_compile_options(${t} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g)

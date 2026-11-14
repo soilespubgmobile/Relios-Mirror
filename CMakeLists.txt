@@ -45,6 +45,14 @@ if(WIN32)
   target_link_libraries(relios-usb-kurucu PRIVATE setupapi advapi32 shell32)
   target_link_options(relios-usb-kurucu PRIVATE -static)
   target_compile_options(relios-usb-kurucu PRIVATE -Wall -Wextra)
+  # it also installs the virtual camera, and accepts its DLL only with the fingerprint of the one this build made
+  # (paketle.sh passes it: -DSOFTCAM_SHA256=...). Without it the camera cannot be installed.
+  if(SOFTCAM_SHA256 MATCHES "^[0-9a-f]+$")
+    string(LENGTH "${SOFTCAM_SHA256}" softcam_sha_len)
+    if(softcam_sha_len EQUAL 64)
+      target_compile_definitions(relios-usb-kurucu PRIVATE SOFTCAM_SHA256="${SOFTCAM_SHA256}")
+    endif()
+  endif()
 else()
   add_executable(ReliosMirror viewer/main.c viewer/proc_posix.c viewer/proc.h viewer/qtproto.c viewer/qtproto.h
                  viewer/usbqt.c viewer/usbqt.h)

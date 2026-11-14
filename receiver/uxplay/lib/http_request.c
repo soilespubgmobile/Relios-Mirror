@@ -25,6 +25,15 @@
 
 #define MAX_EVENT_DATA 4096
 
+/* RELIOS: how much of a request is kept while it arrives. Anyone on the network can send one, and UxPlay kept all
+ * of it (an endless address, header or body grew the memory until the computer had none left). The largest real
+ * requests are a few kB (cover art, for music, a few hundred kB). */
+#define RELIOS_MAX_URL (8 * 1024)
+#define RELIOS_MAX_HEADER_NAME 1024
+#define RELIOS_MAX_HEADER_VALUE (8 * 1024)
+#define RELIOS_MAX_HEADERS 64
+#define RELIOS_MAX_BODY (8 * 1024 * 1024)
+
 struct http_request_s {
     llhttp_t parser;
     llhttp_settings_t parser_settings;
@@ -49,6 +58,9 @@ on_url(llhttp_t *parser, const char *at, size_t length)
 {
     http_request_t *request = parser->data;
 
+    if (request->url_len + length > RELIOS_MAX_URL) {
+        return HPE_USER;
+    }
     char *new_url = realloc(request->url, request->url_len + length + 1); 
     if (!new_url) {
         return HPE_USER; 
@@ -106,6 +118,9 @@ on_header_field(llhttp_t *parser, const char *at, size_t length)
     /* Allocate space for new field-value pair */
     if (request->headers_index == request->headers_size) {
         int new_size = request->headers_size + 2;
+        if (new_size > 2 * RELIOS_MAX_HEADERS) {
+            return HPE_USER;
+        }
 
         char **new_headers = realloc(request->headers, new_size * sizeof(char*));
         if (!new_headers) {
@@ -122,12 +137,18 @@ on_header_field(llhttp_t *parser, const char *at, size_t length)
     
     /* Allocate space in the current header string */
     if (request->headers[request->headers_index] == NULL) {
+        if (length > RELIOS_MAX_HEADER_NAME) {
+            return HPE_USER;
+        }
         request->headers[request->headers_index] = calloc(1, length + 1);
         if (!request->headers[request->headers_index]) {
             return HPE_USER;
         }
     } else {
         orig_len = strlen(request->headers[request->headers_index]);
+        if (orig_len + length > RELIOS_MAX_HEADER_NAME) {
+            return HPE_USER;
+        }
         char *new_buf =  realloc( request->headers[request->headers_index], orig_len + length + 1);
         if (!new_buf) {
             return HPE_USER;
@@ -158,12 +179,18 @@ on_header_value(llhttp_t *parser, const char *at, size_t length)
     
     /* Allocate space in the current header string */
     if (request->headers[request->headers_index] == NULL) {
+        if (length > RELIOS_MAX_HEADER_VALUE) {
+            return HPE_USER;
+        }
         request->headers[request->headers_index] = calloc(1, length + 1);
         if (!request->headers[request->headers_index]) {
             return HPE_USER;
         }
     } else {
         orig_len =  strlen(request->headers[request->headers_index]);
+        if (orig_len + length > RELIOS_MAX_HEADER_VALUE) {
+            return HPE_USER;
+        }
 
         char *new_buf = realloc(request->headers[request->headers_index], orig_len + length + 1);
         if (!new_buf) {
@@ -183,6 +210,9 @@ on_body(llhttp_t *parser, const char *at, size_t length)
 {
     http_request_t *request = parser->data;
 
+    if (request->datalen + length > RELIOS_MAX_BODY) {
+        return HPE_USER;
+    }
     size_t new_size = request->datalen + length + 1;
     char *new_data = realloc(request->data, new_size);
     if (!new_data) {

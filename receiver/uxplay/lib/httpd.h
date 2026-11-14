@@ -35,6 +35,9 @@ struct httpd_callbacks_s {
                        int remotelen, unsigned int zone_id);
     void  (*conn_request)(void *ptr, http_request_t *request, http_response_t **response);
     void  (*conn_destroy)(void *ptr);
+    /* RELIOS: has the device on this connection paired (or proved it paired before)? (NULL: every one counts as
+     * trusted) */
+    bool  (*conn_trusted)(void *ptr);
 };
 typedef struct httpd_callbacks_s httpd_callbacks_t;
 bool httpd_nohold(httpd_t *httpd);
