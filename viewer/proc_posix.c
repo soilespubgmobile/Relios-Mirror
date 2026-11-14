@@ -29,9 +29,21 @@ static void split_args(const char *exe, const char *args, char *copy, char **arg
 	(void)args;
 }
 
-struct proc *proc_start(const char *exe, const char *args, bool low_integrity)
+bool proc_strict_prepare(const char *exe, const char *key)
 {
-	(void)low_integrity;
+	(void)exe;
+	(void)key;
+	return false; /* (Windows only) */
+}
+
+bool proc_strict_remove(void)
+{
+	return true;
+}
+
+struct proc *proc_start(const char *exe, const char *args, enum proc_box box)
+{
+	(void)box;
 	int in[2], out[2], err[2];
 	if (pipe(in) || pipe(out) || pipe(err))
 		return NULL;
@@ -86,6 +98,26 @@ int proc_run(const char *exe, const char *args, unsigned timeout_ms)
 	if (waitpid(pid, &status, 0) < 0)
 		return -1;
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+bool proc_alive(struct proc *p, unsigned wait_ms, unsigned long *code)
+{
+	int status = 0;
+	unsigned waited = 0;
+	for (;;) {
+		pid_t r = waitpid(p->pid, &status, WNOHANG);
+		if (r == p->pid) {
+			if (code)
+				*code = WIFEXITED(status) ? (unsigned long)WEXITSTATUS(status) : 1;
+			p->pid = 0; /* (reaped: proc_stop has nothing left to wait for) */
+			return false;
+		}
+		if (r < 0 || waited >= wait_ms)
+			return true;
+		struct timespec ts = {0, 20 * 1000000};
+		nanosleep(&ts, NULL);
+		waited += 20;
+	}
 }
 
 size_t proc_read_out(struct proc *p, void *buf, size_t size)

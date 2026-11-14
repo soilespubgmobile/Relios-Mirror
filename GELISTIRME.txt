@@ -100,7 +100,14 @@ viewer\usbdriver.c    Sürücü kurucusu: ayrı, küçük program relios-usb-kur
 viewer\usbids.h       Dokunulabilecek Apple cihazları (ürün kimlikleri, aygıt örneği biçimi).
 viewer\qtproto.c      USB protokolü (QuickTime ekran kaydı: PING / SYNC / ASYN / RPLY, CMSampleBuffer). Platformdan
                       bağımsızdır; quicktime_video_hack'e (MIT) dayanır.
-viewer\proc_win.c     Alıcıyı düşük yetkiyle (low integrity) ve bir iş nesnesi içinde başlatır.
+viewer\proc_win.c     Alıcıyı düşük yetkiyle (low integrity) ve bir iş nesnesi içinde başlatır. "Sıkı Koruma"
+                      açıksa AppContainer'da da ("ReliosMirror.Receiver"; tek yetenek privateNetworkClientServer,
+                      S-1-15-3-3; konsolsuz, DETACHED_PROCESS). Kafese yalnızca alıcı exe'sinde okuma+çalıştırma,
+                      ayar klasöründe geçiş (FILE_TRAVERSE) ve receiver-key.pem'de okuma izni verilir; her biri
+                      önce siki-koruma.txt'ye yazılır, sonra verilir. Kapatılınca (ya da sıfırlamada, ya da ayar
+                      kapalıyken açılışta) proc_strict_remove hepsini geri alır ve profili siler. Hazırlık, başlatma
+                      ya da ilk saniye içinde biterse / "listening" demeden durursa main.c alıcıyı o çalıştırmada
+                      düşük yetkiyle başlatır.
 viewer\launcher.c     Tek dosyalık sürümün başlatıcısı. paketle.sh, bu exe'nin sonuna paketi ekler:
                       payload.tgz + "RLSM" + 16 haneli boyut + 14 haneli tarih damgası.
 viewer\version.h      Sürüm numarası.   viewer\app.rc: simge ve exe'nin sürüm bilgisi.

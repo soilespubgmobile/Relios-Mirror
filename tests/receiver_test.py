@@ -150,6 +150,21 @@ check(os.path.exists(KEY) and b'PRIVATE KEY' in open(KEY, 'rb').read(), '--make-
 
 base = ['name ReliosOBS-test', 'deviceid 02:11:22:33:44:55', f'keyfile {KEY}', 'allow_pairing 0']
 
+# 1b. a key file that cannot be read: an error, not a key that lasts only until the receiver ends
+missing = os.path.join(WORK, 'no-such-key.pem')
+if os.path.exists(missing):
+    os.remove(missing)
+r = Receiver([], ['name ReliosOBS-test', 'deviceid 02:11:22:33:44:55', f'keyfile {missing}', 'allow_pairing 0'])
+try:
+    r.proc.wait(10)
+except subprocess.TimeoutExpired:
+    r.proc.kill()
+time.sleep(0.3)
+check(r.proc.returncode not in (None, 0) and any('could not read the key file' in s for s in r.status()),
+      'an unreadable key file is an error (the receiver ends)')
+check(not os.path.exists(missing), 'and no key file is written in its place')
+check(not any(s.startswith('listening') for s in r.status()), 'nothing listens then')
+
 # 2. without the test switch, a connection from 127.0.0.1 (not the local network) is closed at once
 r = Receiver([], base)
 check(r.wait_status('listening'), 'the receiver listens and announces itself')

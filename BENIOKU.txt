@@ -26,7 +26,8 @@ Ayarlar > Kayıt   : Biçim (MOV / MP4 / MKV), Kodlayıcı (ekran kartı / işle
 Ayarlar > Cihaz   : Yeni Cihaz Eşleştirme, eşleşmiş cihazlar (Unut), Bağlıyken Listeden Gizle, Ses Çıkışı,
                     Sanal Kamera.
 Ayarlar > USB     : Kablolu (USB) Yansıtma, durum, USB Sürücüsü (Kur / Kaldır). Aşağıya bakın.
-Ayarlar > Program : Windows İle Başlat, Pencere Her Zaman Üstte, Varsayılan Ayarlara Dön (İlk Açılış Gibi).
+Ayarlar > Program : Windows İle Başlat, Pencere Her Zaman Üstte, Sıkı Koruma (Wi-Fi Alıcısı; aşağıya bakın),
+                    Varsayılan Ayarlara Dön (İlk Açılış Gibi).
 
 Tuşlar: R kayıt, S ekran görüntüsü, Yukarı / Aşağı ses, M sessiz, F ya da F11 tam ekran, T üstte, P eşleştirme.
 
@@ -100,12 +101,33 @@ GÜVENLİK VE AĞ
   engellenir.
 - Programlar istismara karşı korumalarla derlenir: ASLR, DEP ve yığın koruması (derleme bunları denetler).
 - Alıcı (relios-airplay-receiver.exe) düşük yetkiyle ve kendi iş nesnesi içinde çalışır; yalnızca yerel ağ
-  adreslerinden bağlantı kabul eder; yeni cihaz yalnızca penceredeki kodla eşleşir.
+  adreslerinden bağlantı kabul eder; yeni cihaz yalnızca penceredeki kodla eşleşir. Eşleşmemiş bir cihaz yalnızca
+  eşleşme isteklerine yanıt alır. Düşük yetkili alıcı dosyalarınızı değiştiremez, silemez, başka program
+  başlatamaz; ama okuyabilir. "Sıkı Koruma" bunu da kapatır (aşağıya bakın).
 - Kablolu yansıtma ağı hiç kullanmaz: cihazla yalnızca USB kablosu üzerinden konuşulur.
 - Yönetici onayı yalnızca şunlar için istenir: güvenlik duvarı kuralları, sanal kameranın ve USB sürücüsünün
   kurulması / kaldırılması. USB sürücüsünü küçük, ayrı bir program kurar (relios-usb-kurucu.exe; yönetici onayıyla
   yalnızca o çalışır ve program klasöründen hiçbir DLL yüklemez): önce dosyaların SHA-256 parmak izini denetler,
   dosyaları denetlediği bellekteki halinden yazar.
+
+
+SIKI KORUMA (Ayarlar > Program; varsayılan: kapalı)
+Açıkken Wi-Fi alıcısı, Windows'un Store uygulamalarını kapattığı "kafes"te (AppContainer) de çalışır:
+- Kişisel dosyalarınızı göremez: Belgeler, Masaüstü, Resimler, İndirilenler, tarayıcı verileri ve diğer
+  programların klasörleri ona kapalıdır. Okuyabildikleri yalnızca kendi program dosyası, anahtarı ve Windows'un
+  herkese açık sistem dosyalarıdır.
+- Yalnızca "Özel" (ev) ağlarda ağa çıkabilir; internete çıkışını, güvenlik duvarı kuralları silinse bile
+  Windows'un kendisi engeller.
+- Alıcıda bilinmeyen bir açık olsa bile dosyalarınıza ulaşmak için ikinci, ayrı bir açık daha gerekir.
+Windows bunun için %LOCALAPPDATA%\Packages\ReliosMirror.Receiver klasörünü ve bir kayıt girdisini oluşturur;
+alıcı dosyasına, ayar klasörüne (yalnızca içinden geçmek için) ve anahtar dosyasına bu kafes için okuma izni
+eklenir. Verilenlerin listesi ayar klasöründeki siki-koruma.txt dosyasındadır. Sıkı Koruma kapatılınca (ya da
+"Varsayılan Ayarlara Dön" ile) hepsi geri alınır ve silinir. Programı silmeden önce Sıkı Koruma'yı kapatırsanız
+Windows'ta hiçbir izi kalmaz.
+Kafes bu bilgisayarda kurulamaz ya da alıcı kafeste başlayamazsa program bunu anlar, alıcıyı normal korumayla
+(düşük yetki) çalıştırır ve bunu pencerede yazar. Alıcı kafeste başladığı halde iPad "Relios Mirror"ı listede
+görmez ya da bağlanamazsa Sıkı Koruma'yı kapatın ve log.txt'yi gönderin. Görüntü ve ses kalitesi, gecikme
+değişmez. Kablolu (USB) yansıtma bu ayardan etkilenmez.
 
 
 GÜVENLİK ÖNERİLERİ

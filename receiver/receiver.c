@@ -538,8 +538,13 @@ static const char *integrity_level(void)
 	static char level[16] = "unknown";
 	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
 		unsigned char buffer[256];
-		DWORD len = 0;
-		if (GetTokenInformation(token, TokenIntegrityLevel, buffer, sizeof(buffer), &len)) {
+		DWORD len = 0, box = 0;
+		/* (Relios Mirror's "Sıkı Koruma": in an AppContainer, which is always at low integrity) */
+		if (GetTokenInformation(token, (TOKEN_INFORMATION_CLASS)29 /* TokenIsAppContainer */, &box, sizeof(box),
+					&len) &&
+		    box) {
+			snprintf(level, sizeof(level), "appcontainer");
+		} else if (GetTokenInformation(token, TokenIntegrityLevel, buffer, sizeof(buffer), &len)) {
 			TOKEN_MANDATORY_LABEL *label = (TOKEN_MANDATORY_LABEL *)buffer;
 			DWORD rid = *GetSidSubAuthority(label->Label.Sid,
 							(DWORD)(UCHAR)(*GetSidSubAuthorityCount(label->Label.Sid) - 1));
@@ -615,6 +620,17 @@ int main(int argc, char **argv)
 	if (!keyfile[0]) {
 		send_text(RA_MSG_STATUS, "error text=no key file");
 		return 2;
+	}
+	{
+		/* The key is made beforehand by the program (--make-key); if it cannot be read here (it may not be written
+		 * here either), a new one would last only until the receiver ends, and paired devices would no longer
+		 * know it: an error now instead. */
+		FILE *k = fopen(keyfile, "r");
+		if (!k) {
+			send_text(RA_MSG_STATUS, "error text=could not read the key file");
+			return 2;
+		}
+		fclose(k);
 	}
 
 	ntp_global_init();

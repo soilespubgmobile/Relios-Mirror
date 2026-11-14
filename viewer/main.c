@@ -2,7 +2,8 @@
  * Relios Mirror: the iPad's AirPlay screen mirroring in a window of its own, without OBS.
  *
  * The network side is ReliosOBS's receiver program, unchanged (relios-airplay-receiver, ../receiver): this
- * program starts it (on Windows at low integrity, in a job that ends with this program), keeps the list of
+ * program starts it (on Windows at low integrity, in a job that ends with this program; with "Sıkı Koruma" also in
+ * an AppContainer, see proc_win.c), keeps the list of
  * paired devices and the receiver's key in its settings folder, decodes the video and audio the receiver passes
  * on (FFmpeg) and shows / plays them (SDL2). The window can be captured by Discord, OBS or anything else.
  *
@@ -114,6 +115,7 @@ enum {
 	CMD_VCAM_REMOVE,
 	CMD_USB,
 	CMD_USB_DRIVER,
+	CMD_STRICT,
 };
 
 static struct {
@@ -148,6 +150,12 @@ static struct {
 	int net_private;     /* 1: a network Windows calls private is connected; 0: only public / domain ones (the
 			      * firewall lets nothing reach the receiver there); -1: not known */
 	bool usb_on;         /* wired (USB) mirroring is switched on (usbqt.c); Wi-Fi stays on as well */
+	bool strict_on;      /* "Sıkı Koruma": the receiver also in an AppContainer (proc_win.c); off unless switched on */
+	bool strict_broken;  /* it could not be used in this run: the receiver runs as without it until the program
+			      * starts again or the switch is used again */
+	bool strict_now;     /* the running receiver is in the AppContainer */
+	Uint32 strict_since; /* (SDL ticks) since when */
+	SDL_atomic_t listened; /* the running receiver has said "listening" (it started fully) */
 	char custom_folder[1024]; /* where recordings go, if chosen */
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
 	bool rec_gpu;   /* record with the graphics card's encoder */
@@ -526,6 +534,7 @@ static void load_settings(void)
 	A.rec_kbit = 15000;
 	A.hw_decode = true;
 	A.usb_on = false;
+	A.strict_on = false;
 	SDL_AtomicSet(&A.volume, 100);
 	SDL_AtomicSet(&A.muted, 0);
 	FILE *f = fopen("ayarlar.txt", "r");
@@ -566,6 +575,8 @@ static void load_settings(void)
 			A.hide_connected = a != 0;
 		} else if (sscanf(line, "usb_kablolu=%d", &a) == 1) {
 			A.usb_on = a != 0;
+		} else if (sscanf(line, "siki_koruma=%d", &a) == 1) {
+			A.strict_on = a != 0;
 		} else if (!strncmp(line, "kayit_klasoru=", 14)) {
 			snprintf(A.custom_folder, sizeof(A.custom_folder), "%s", line + 14);
 			A.custom_folder[strcspn(A.custom_folder, "\r\n")] = '\0';
@@ -622,7 +633,8 @@ static void save_settings(void)
 	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=5\n", A.audio_device,
 		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
 		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
-	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\n", A.camera_saved ? 1 : 0, A.usb_on ? 1 : 0);
+	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\nsiki_koruma=%d\n", A.camera_saved ? 1 : 0, A.usb_on ? 1 : 0,
+		A.strict_on ? 1 : 0);
 	fclose(f);
 }
 
@@ -1716,6 +1728,7 @@ static void handle_status(const char *text)
 		app_log("receiver %s", text);
 	} else if (!strncmp(text, "listening", 9)) {
 		app_log("receiver listening (%s)", text + 9);
+		SDL_AtomicSet(&A.listened, 1);
 		set_state(MIRROR_LISTENING);
 	} else if (!strncmp(text, "client", 6)) {
 		/* (the name may hold spaces: everything between "name=" and " model=") */
@@ -2120,6 +2133,15 @@ static void session_fail(const char *text)
 	A.restart_at = SDL_GetTicks() + 5000;
 }
 
+/* "Sıkı Koruma" could not be used: the receiver runs as without it (low integrity, in its job) until the program
+ * starts again or the switch is used again */
+static void strict_failed(const char *why)
+{
+	A.strict_broken = true;
+	app_log("strict protection not used (%s): the receiver runs at low integrity, as without it", why);
+	set_notice("Sıkı Koruma ile alıcı başlamadı: normal korumayla çalışıyor (ayrıntı: log.txt)", false);
+}
+
 static void session_start(void)
 {
 	session_stop();
@@ -2155,15 +2177,30 @@ static void session_start(void)
 	bool allow = pair || paired_n == 0;
 
 	SDL_AtomicSet(&A.register_ok, allow ? 1 : 0);
-	/* (the part that reads what the network sends runs at low integrity, or not at all) */
-	A.proc = proc_start(A.exe, "--serve", true);
+	/* (the part that reads what the network sends runs at low integrity, or not at all; with "Sıkı Koruma" also in
+	 * an AppContainer, or, where that cannot be used, as without it) */
+	A.strict_now = false;
+	SDL_AtomicSet(&A.listened, 0);
+	if (A.strict_on && !A.strict_broken) {
+		/* (if it then ends, or does not listen within 15 s, before it listens: see the window loop) */
+		if (!proc_strict_prepare(A.exe, "receiver-key.pem"))
+			strict_failed("it could not be made ready");
+		else if (!(A.proc = proc_start(A.exe, "--serve", PROC_BOX_STRICT)))
+			strict_failed("the receiver could not be started in it");
+		else
+			A.strict_now = true;
+		A.strict_since = SDL_GetTicks();
+	}
+	if (!A.proc)
+		A.proc = proc_start(A.exe, "--serve", PROC_BOX_LOW);
 	if (!A.proc) {
 		free(paired);
 		session_fail("Alıcı korumalı modda başlatılamadı");
 		return;
 	}
-	app_log("receiver started; paired devices: %d, pairing a new device: %s, asked %dx%d@%d %s", (int)paired_n,
-		allow ? "on" : "off", A.width, A.height, A.fps, A.h265 ? "H.264/H.265" : "H.264");
+	app_log("receiver started (%s); paired devices: %d, pairing a new device: %s, asked %dx%d@%d %s",
+		A.strict_now ? "strict protection: AppContainer" : "low integrity", (int)paired_n, allow ? "on" : "off",
+		A.width, A.height, A.fps, A.h265 ? "H.264/H.265" : "H.264");
 
 	char config[512];
 	snprintf(config, sizeof(config),
@@ -2631,8 +2668,14 @@ static const char *build_settings(void)
 	} else if (settings_tab == 3) {
 		toggle("Windows İle Başlat", CMD_AUTOSTART, autostart_get());
 		toggle("Pencere Her Zaman Üstte", CMD_ONTOP, A.on_top);
+#ifdef _WIN32
+		toggle("Sıkı Koruma (Wi-Fi Alıcısı)", CMD_STRICT, A.strict_on);
+#endif
 		action("Varsayılan Ayarlara Dön (İlk Açılış Gibi)", CMD_RESET, "Sıfırla");
-		note = "Sürüm " APP_VERSION "  •  Sıfırlama, ayarları ve eşleşmiş cihazları siler; önce onay ister.";
+		note = A.strict_on && A.strict_broken ?
+			       "Sıkı Koruma bu çalıştırmada kullanılamadı: alıcı normal korumada (ayrıntı: log.txt)." :
+		       A.strict_on ? "Sıkı Koruma açık: alıcı kişisel dosyaları göremez. iPad bağlanamazsa kapatın." :
+				     "Sürüm " APP_VERSION "  •  Sıfırlama, ayarları ve eşleşmiş cihazları siler; önce onay ister.";
 	} else {
 		int paired = 0;
 		const char *names = paired_names(&paired);
@@ -3305,6 +3348,7 @@ static void reset_everything(void)
 		return;
 	usbqt_stop(false);
 	session_stop();
+	proc_strict_remove(); /* (off at a first start: what it was given in Windows is taken back) */
 	A.restart_at = 0;
 	A.apply_at = 0;
 	SDL_LockMutex(R.mutex);
@@ -3544,6 +3588,22 @@ static void run_command(int cmd, int arg)
 		break;
 	case CMD_USB_DRIVER:
 		usb_driver();
+		break;
+	case CMD_STRICT:
+		A.strict_on = !A.strict_on;
+		A.strict_broken = false; /* (switched again: tried again) */
+		save_settings();
+		app_log("strict protection switched %s", A.strict_on ? "on" : "off");
+		session_stop();
+		if (!A.strict_on) {
+			/* all it was given in Windows is taken back: its profile, the permissions on files */
+			set_notice(proc_strict_remove() ? "Sıkı Koruma kapandı: Windows'taki izleri silindi" :
+							  "Sıkı Koruma kapandı; bazı izleri silinemedi, sonraki açılışta yeniden denenecek",
+				   false);
+		}
+		session_start();
+		if (A.strict_now)
+			set_notice("Sıkı Koruma açık: alıcı kişisel dosyalarınızı göremez. iPad bağlanamazsa kapatın", false);
 		break;
 	case CMD_RES_NEXT: {
 		static const int sizes[4][2] = {{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
@@ -3868,6 +3928,10 @@ int main(int argc, char *argv[])
 	app_log("Relios Mirror %s started; receiver: %s", APP_VERSION, A.exe);
 	av_log_set_level(AV_LOG_ERROR);
 	load_settings();
+	/* "Sıkı Koruma" switched off: whatever it was once given in Windows and not yet taken back goes now */
+	app_log("strict protection: %s", A.strict_on ? "on" : "off");
+	if (!A.strict_on)
+		proc_strict_remove();
 	find_video_folder();
 	A.hover = -1;
 	if (A.camera_saved) {
@@ -3949,8 +4013,20 @@ int main(int argc, char *argv[])
 						SDL_LockMutex(A.mutex);
 						bool failed = A.state == MIRROR_ERROR;
 						SDL_UnlockMutex(A.mutex);
+						/* (in the AppContainer, it ended before it listened: it is started again
+						 * without it, at once) */
+						bool strict_broke = A.strict_now && !SDL_AtomicGet(&A.listened);
+						if (strict_broke) {
+							unsigned long code = 0;
+							proc_alive(A.proc, 2000, &code);
+							app_log("the receiver ended while starting in the AppContainer (exit code "
+								"0x%08lx)",
+								code);
+						}
 						session_stop();
-						A.restart_at = SDL_GetTicks() + (failed ? 5000 : 700);
+						if (strict_broke)
+							strict_failed("the receiver stopped while starting in it");
+						A.restart_at = SDL_GetTicks() + (failed && !strict_broke ? 5000 : 700);
 						redraw = retitle = true;
 					}
 				} else if (e.type == SDL_WINDOWEVENT) {
@@ -4016,6 +4092,15 @@ int main(int argc, char *argv[])
 		}
 		if (!quit && A.restart_at && SDL_TICKS_PASSED(now, A.restart_at) && !A.proc) {
 			session_start();
+			retitle = true;
+		}
+		if (!quit && A.proc && A.strict_now && !SDL_AtomicGet(&A.listened) &&
+		    SDL_TICKS_PASSED(now, A.strict_since + 15000)) {
+			/* started in the AppContainer, but not listening after 15 s: started again without it */
+			app_log("the receiver did not start within 15 s in the AppContainer");
+			session_stop();
+			strict_failed("the receiver did not start in it");
+			A.restart_at = now + 700;
 			retitle = true;
 		}
 		if (now - A.stats_at >= 1000) {
