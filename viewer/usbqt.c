@@ -931,8 +931,8 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 	 * device may need a moment) */
 	memset(q, 0, sizeof(*q));
 	int active = -1;
-	bool ready = false;
-	ULONGLONG deadline = GetTickCount64() + 5000;
+	bool ready = false, configured = false;
+	ULONGLONG deadline = GetTickCount64() + 5000, unconfigured_since = 0;
 	do {
 		struct capture_iface probe;
 		memset(&probe, 0, sizeof(probe));
@@ -942,6 +942,25 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 		if (q->config && active == q->config) {
 			ready = true;
 			break;
+		}
+		/* Back in no configuration at all (0): nothing on this computer chose one for it. Apple's driver would
+		 * (it is not the one running the device then: e.g. libusb0 runs it instead of only filtering it), so
+		 * the capture configuration is chosen here, once, after the device has shown 0 for a second. A
+		 * configuration someone else chose is never changed */
+		if (q->config && active == 0) {
+			ULONGLONG t = GetTickCount64();
+			if (!unconfigured_since)
+				unconfigured_since = t;
+			if (!configured && t - unconfigured_since >= 1000) {
+				configured = true;
+				int r = L.set_configuration(h, q->config);
+				ulog("the device came back without a configuration: configuration %d chosen (%d%s%s)", q->config,
+				     r, r < 0 ? ", " : "", r < 0 ? lu_error() : "");
+				if (r >= 0 && deadline < t + 3000)
+					deadline = t + 3000;
+			}
+		} else {
+			unconfigured_since = 0;
 		}
 		Sleep(100);
 	} while (GetTickCount64() < deadline && !stopping());
