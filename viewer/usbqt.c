@@ -40,6 +40,7 @@
 #include "qtproto.h"
 
 #include <ctype.h>
+#include <wctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -909,6 +910,83 @@ static bool libusb0_runs_device(void)
  * cannot help, so the device is not switched again and again */
 static bool claim_blocked;
 
+/* Read only, for the log: the devices Windows' composite driver made for the device's interfaces in its capture
+ * configuration (Apple's driver selects it after the switch). One of them is the capture interface itself
+ * (...&MI_02 for interface 2): with a driver of its own there (libusb0 / WinUSB), libusb0 would not need to select any
+ * configuration (what crashed Windows). What Windows shows for it (its driver, problem, compatible ID) decides whether
+ * that way can work; nothing is changed here. Waits up to 4 s for that interface's device to appear */
+static void log_interfaces(int iface)
+{
+	struct usbqt_device d;
+	if (!usbqt_find_device(&d)) {
+		ulog("interfaces: the device is not in Windows' list");
+		return;
+	}
+	wchar_t inst[200];
+	size_t k = 0;
+	for (; d.instance[k] && k + 1 < sizeof(inst) / sizeof(inst[0]); k++)
+		inst[k] = (wchar_t)(unsigned char)d.instance[k];
+	inst[k] = L'\0';
+	wchar_t want[16];
+	_snwprintf(want, 15, L"&MI_%02X", iface & 0xFF);
+	want[15] = L'\0';
+	DEVINST parent = 0;
+	ULONGLONG until = GetTickCount64() + 4000;
+	for (;;) {
+		bool seen = false;
+		DEVINST child = 0;
+		if (CM_Locate_DevNodeW(&parent, inst, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+		    CM_Get_Child(&child, parent, 0) == CR_SUCCESS) {
+			for (int n = 0; n < 32 && !seen; n++) {
+				wchar_t id[300];
+				if (CM_Get_Device_IDW(child, id, 299, 0) == CR_SUCCESS) {
+					id[299] = L'\0';
+					for (wchar_t *c = id; *c; c++)
+						*c = (wchar_t)towupper(*c);
+					seen = wcsstr(id, want) != NULL;
+				}
+				if (CM_Get_Sibling(&child, child, 0) != CR_SUCCESS)
+					break;
+			}
+		}
+		if (seen || GetTickCount64() >= until || stopping())
+			break;
+		Sleep(250);
+	}
+	DEVINST child = 0;
+	if (!parent || CM_Get_Child(&child, parent, 0) != CR_SUCCESS) {
+		ulog("interfaces: none in Windows' list for %s", d.instance);
+		return;
+	}
+	for (int n = 0; n < 32; n++) {
+		wchar_t id[300], service[64], desc[160], compat[400];
+		char a_id[300], a_service[64], a_desc[160], a_compat[160];
+		ULONG len, status = 0, problem = 0;
+		memset(id, 0, sizeof(id));
+		memset(service, 0, sizeof(service));
+		memset(desc, 0, sizeof(desc));
+		memset(compat, 0, sizeof(compat));
+		CM_Get_Device_IDW(child, id, 299, 0);
+		len = sizeof(service) - 4;
+		CM_Get_DevNode_Registry_PropertyW(child, CM_DRP_SERVICE, NULL, service, &len, 0);
+		len = sizeof(desc) - 4;
+		CM_Get_DevNode_Registry_PropertyW(child, CM_DRP_DEVICEDESC, NULL, desc, &len, 0);
+		len = sizeof(compat) - 4;
+		CM_Get_DevNode_Registry_PropertyW(child, CM_DRP_COMPATIBLEIDS, NULL, compat, &len, 0);
+		bool got_status = CM_Get_DevNode_Status(&status, &problem, child, 0) == CR_SUCCESS;
+		wide_to_utf8(id, a_id, sizeof(a_id));
+		wide_to_utf8(service, a_service, sizeof(a_service));
+		wide_to_utf8(desc, a_desc, sizeof(a_desc));
+		wide_to_utf8(compat, a_compat, sizeof(a_compat)); /* (the first of the list) */
+		ulog("interface device: %s; driver %s; \"%s\"; compatible %s; %s%lu", a_id, a_service[0] ? a_service : "none",
+		     a_desc, a_compat[0] ? a_compat : "-",
+		     !got_status ? "status unknown " : (status & DN_STARTED) ? "started, problem " : "not started, problem ",
+		     problem);
+		if (CM_Get_Sibling(&child, child, 0) != CR_SUCCESS)
+			break;
+	}
+}
+
 /* the device in its capture configuration: found again by its serial, its capture interface claimed.
  * newly: this program has just switched it (only then may libusb0's view of it be initialized) */
 static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, struct capture_iface *q)
@@ -996,6 +1074,7 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 			/* (here 1.3.4 selected the configuration through libusb0: Windows crashed) */
 			ulog("libusb0 cannot take the capture interface while Apple's driver runs the device; selecting the "
 			     "configuration through it is not done (it crashed Windows). Wired mirroring does not work this way");
+			log_interfaces(q->iface);
 			claim_blocked = true;
 			L.close(h);
 			return NULL;
