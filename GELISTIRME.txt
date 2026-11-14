@@ -259,6 +259,17 @@ Program (elle; her yeni sürümde):
   seçildiği anda bir kez söylüyor; önceki oturumdan o yapılandırmada kalmış cihaz susuyor (geri verme bu bilgisayarda
   33 ile bitiyor, cihaz ayrılmıyor). 1.3.4'te 1,5 sn içinde hiç bayt gelmezse yapılandırma kaldırılıp yeniden seçilir
   (libusb0 etkin olanı yeniden seçmeyi atladığı için önce 0) ve arayüz yeniden alınır (usbqt.c, select_anew).
+- ÖNEMLİ (1.3.4, gerçek iPad, Windows 10 19045): cihazı Apple'ın sürücüsü çalıştırırken (USBCCGP +
+  AppleLowerFilter, libusb0 üst filtre) geçişten sonra libusb0 arayüzü vermedi ("invalid configuration 0": filtre
+  olarak, Windows'un bileşik sürücüsünün seçtiği yapılandırmayı görmez) ve program o durumda yapılandırmayı libusb0
+  üzerinden yeniden seçti (open_capture'daki yedek adım, iPhoneMirror'dan): Windows mavi ekranla çöktü. 1.3.5'te
+  libusb0 cihazın kendi sürücüsü değilse hiçbir yapılandırma seçilmez (libusb0_runs_device); arayüz alınamazsa
+  bunu söyler ve cihazı yeniden takılana ya da "Yeniden Dene"ye kadar bir daha geçirmez.
+  Sonuç: Apple'ın sürücüsü + libusb0 filtresi düzeniyle bu bilgisayarda kablolu yansıtma çalışmaz. Görüntü yalnızca
+  libusb0 cihazın kendi sürücüsüyken geldi (1.3.0 denemesi), ama o düzende Apple'ın hizmeti cihaza ulaşamaz ("Bu
+  Bilgisayara Güven" çıkmaz, Apple Aygıtları iPad'i görmez). Çalışan bir yol için tasarım değişmeli (ör. yalnızca
+  ekran kaydı arayüzüne, Windows'un bileşik sürücüsünün açtığı alt cihaza (MI_02) sürücü); her denemesi çekirdek
+  sürücüsü işi, mavi ekran riski taşır.
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

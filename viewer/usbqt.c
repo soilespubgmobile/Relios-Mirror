@@ -894,6 +894,21 @@ static void sink_log(void *ctx, const char *text)
 	ulog("%s", text);
 }
 
+/* Whether libusb0 itself is the device's driver (not only a filter over Apple's driver). Only then may libusb0
+ * select a configuration of the device: as an upper filter over Windows' composite driver (Apple's setup) it does
+ * not see the configuration that driver selected (it reports 0 and refuses the interface), and selecting one through
+ * it, under that driver, crashed Windows (a blue screen, 1.3.4, on a real iPad). So under Apple's driver a
+ * configuration is never selected by this program */
+static bool libusb0_runs_device(void)
+{
+	struct usbqt_device d;
+	return usbqt_find_device(&d) && !_stricmp(d.service, "libusb0");
+}
+
+/* set when the capture interface could not be had because Apple's driver runs the device (see above): trying again
+ * cannot help, so the device is not switched again and again */
+static bool claim_blocked;
+
 /* the device in its capture configuration: found again by its serial, its capture interface claimed.
  * newly: this program has just switched it (only then may libusb0's view of it be initialized) */
 static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, struct capture_iface *q)
@@ -945,7 +960,7 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 			ULONGLONG t = GetTickCount64();
 			if (!unconfigured_since)
 				unconfigured_since = t;
-			if (!configured && t - unconfigured_since >= 1000) {
+			if (!configured && t - unconfigured_since >= 1000 && libusb0_runs_device()) {
 				configured = true;
 				int r = L.set_configuration(h, q->config);
 				ulog("the device came back without a configuration: configuration %d chosen (%d%s%s)", q->config,
@@ -974,6 +989,14 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 		 * handle ("invalid configuration 0"). Only then, and only after our own switch, is the (already
 		 * active) configuration selected once more (as iPhoneMirror does) */
 		if (!newly || r != LU_INVALID || !strstr(why, "invalid configuration 0")) {
+			L.close(h);
+			return NULL;
+		}
+		if (!libusb0_runs_device()) {
+			/* (here 1.3.4 selected the configuration through libusb0: Windows crashed) */
+			ulog("libusb0 cannot take the capture interface while Apple's driver runs the device; selecting the "
+			     "configuration through it is not done (it crashed Windows). Wired mirroring does not work this way");
+			claim_blocked = true;
 			L.close(h);
 			return NULL;
 		}
@@ -1058,6 +1081,10 @@ static int read_some(lu_handle *h, struct reader *r, size_t missing)
  * already active, so first none), and it starts afresh. The interface is claimed again after that */
 static bool select_anew(lu_handle *h, const struct capture_iface *q)
 {
+	if (!libusb0_runs_device()) {
+		ulog("no hello from the device; its configuration is not selected anew (Apple's driver runs it)");
+		return true;
+	}
 	int rel = L.release_interface(h, q->iface);
 	int none = L.set_configuration(h, 0);
 	Sleep(200);
@@ -1423,10 +1450,15 @@ static DWORD WINAPI usb_main(LPVOID unused)
 			break;
 		}
 		unsigned pid = f.pid; /* (as it shows itself now) */
+		claim_blocked = false;
 		lu_handle *stream_h = open_capture(f.serial, &pid, newly, &q);
 		if (!stream_h) {
 			give_back(f.serial, pid);
 			not_before = after_failure(++failures, &shown);
+			if (claim_blocked) {
+				not_before = ~0ull;
+				ulog("not switched again: waiting for \"Yeniden Dene\" or for the device to be plugged in anew");
+			}
 			continue;
 		}
 		ULONGLONG began = GetTickCount64();
