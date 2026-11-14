@@ -14,6 +14,7 @@
  *          is done); the libusb0 kernel service is made (or an existing one checked); "libusb0" is added to the
  *          iPad's upper filters and the iPad is restarted. If Windows does not start it again without a problem
  *          (e.g. Memory Integrity refusing the old driver), everything this run did is undone.
+ * winusb-install <interface device>: Microsoft's WinUSB for the iPad's screen-capture interface alone (see below).
  * remove:  "libusb0" is taken out of the iPad's upper filters and the iPad restarted. Then, if this program
  *          installed the driver (marked in the service's key) and no device or device class names libusb0 any
  *          more, the service and the files it put into System32 are deleted too (a file still in use: at the next
@@ -626,6 +627,196 @@ static int remove_filter(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *ins
 	return remove_driver();
 }
 
+/* ------------------------------------------------------------------ WinUSB for the screen-capture interface */
+
+/* Under Apple's driver, Windows' composite driver (usbccgp) opens a device of its own for each interface of the
+ * iPad's capture configuration. The capture interface's device (class FF/2A) gets whatever driver Windows had for
+ * that interface number (an iPad's network adapter, which cannot run it: problem 10). Here Microsoft's WinUSB, from
+ * Windows' own winusb.inf, is made its driver, as Device Manager does when "WinUsb Device" is picked from the list
+ * by hand: no driver package of ours, no certificate. Apple's driver keeps the iPad itself (pairing, "Trust"), and
+ * the configuration stays Windows' to select: nothing selects one through libusb0 (that crashed Windows, 1.3.4). */
+
+static const GUID usbdevice_class = {0x88bae032, 0x5a81, 0x49f0, {0xbc, 0x3d, 0xa4, 0xff, 0x13, 0x82, 0x16, 0xd6}};
+
+/* whether one of the device's compatible IDs is the screen-capture interface's (USB\Class_ff&SubClass_2a...) */
+static bool is_capture_interface(HDEVINFO set, SP_DEVINFO_DATA *info)
+{
+	wchar_t ids[1024];
+	DWORD type = 0;
+	memset(ids, 0, sizeof(ids));
+	if (!SetupDiGetDeviceRegistryPropertyW(set, info, SPDRP_COMPATIBLEIDS, &type, (PBYTE)ids, sizeof(ids) - 4,
+					       NULL) ||
+	    type != REG_MULTI_SZ)
+		return false;
+	for (const wchar_t *p = ids; p < ids + 1020 && *p; p += wcslen(p) + 1) {
+		if (!_wcsnicmp(p, L"USB\\Class_ff&SubClass_2a", 24))
+			return true;
+	}
+	return false;
+}
+
+/* whether this program marked the device (its interface GUID in the device's DeviceInterfaceGUIDs) */
+static bool marked_ours(HDEVINFO set, SP_DEVINFO_DATA *info)
+{
+	HKEY key = SetupDiOpenDevRegKey(set, info, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+	if (key == INVALID_HANDLE_VALUE)
+		return false;
+	wchar_t v[256];
+	DWORD type = 0, size = sizeof(v) - 4;
+	memset(v, 0, sizeof(v));
+	bool ours = RegQueryValueExW(key, L"DeviceInterfaceGUIDs", NULL, &type, (BYTE *)v, &size) == ERROR_SUCCESS &&
+		    type == REG_MULTI_SZ && !_wcsicmp(v, USBQT_CAPTURE_GUID_W);
+	RegCloseKey(key);
+	return ours;
+}
+
+static bool started_without_problem(const wchar_t *instance, DWORD timeout_ms)
+{
+	ULONGLONG until = GetTickCount64() + timeout_ms;
+	for (;;) {
+		DEVINST node = 0;
+		ULONG status = 0, problem = 0;
+		if (CM_Locate_DevNodeW(&node, (DEVINSTID_W)instance, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+		    CM_Get_DevNode_Status(&status, &problem, node, 0) == CR_SUCCESS && (status & DN_STARTED) &&
+		    !(status & DN_HAS_PROBLEM))
+			return true;
+		if (GetTickCount64() >= until)
+			return false;
+		Sleep(250);
+	}
+}
+
+static int winusb_install(HDEVINFO set, SP_DEVINFO_DATA *info, const wchar_t *instance)
+{
+	/* only the screen-capture interface of an Apple device that is here now */
+	DEVINST node = 0;
+	if (CM_Locate_DevNodeW(&node, (DEVINSTID_W)instance, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+		return USBQT_DRIVER_NO_DEVICE;
+	if (!is_capture_interface(set, info))
+		return USBQT_DRIVER_NOT_CAPTURE;
+	wchar_t service[64];
+	DWORD type = 0;
+	memset(service, 0, sizeof(service));
+	if (SetupDiGetDeviceRegistryPropertyW(set, info, SPDRP_SERVICE, &type, (PBYTE)service, sizeof(service) - 4,
+					      NULL) &&
+	    !_wcsicmp(service, L"WinUSB") && marked_ours(set, info))
+		return USBQT_DRIVER_DONE; /* (already) */
+
+	/* the interface GUID WinUSB registers it under (how the program finds it), in the device's own key */
+	HKEY key = SetupDiCreateDevRegKeyW(set, info, DICS_FLAG_GLOBAL, 0, DIREG_DEV, NULL, NULL);
+	if (key == INVALID_HANDLE_VALUE)
+		return USBQT_DRIVER_REGISTRY;
+	static const wchar_t guids[] = USBQT_CAPTURE_GUID_W L"\0";
+	LONG w = RegSetValueExW(key, L"DeviceInterfaceGUIDs", 0, REG_MULTI_SZ, (const BYTE *)guids, sizeof(guids));
+	RegCloseKey(key);
+	if (w != ERROR_SUCCESS)
+		return USBQT_DRIVER_REGISTRY;
+
+	/* WinUSB's list: Windows' own winusb.inf alone, of its class ("Universal Serial Bus devices"), also for a
+	 * device whose IDs it does not name (Device Manager's "pick from a list") */
+	wchar_t old_class[64];
+	memset(old_class, 0, sizeof(old_class));
+	SetupDiGetDeviceRegistryPropertyW(set, info, SPDRP_CLASSGUID, &type, (PBYTE)old_class, sizeof(old_class) - 4,
+					  NULL);
+	/* (written out by hand: ole32's StringFromGUID2 is not among this program's DLLs) */
+	wchar_t cls[64];
+	const GUID *g = &usbdevice_class;
+	_snwprintf(cls, 63, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}", (unsigned long)g->Data1, g->Data2,
+		   g->Data3, g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3], g->Data4[4], g->Data4[5], g->Data4[6],
+		   g->Data4[7]);
+	cls[63] = L'\0';
+	int result = USBQT_DRIVER_WINUSB_STEP + 1;
+	SP_DEVINSTALL_PARAMS_W params;
+	memset(&params, 0, sizeof(params));
+	params.cbSize = sizeof(params);
+	wchar_t windir[MAX_PATH];
+	UINT wl = GetSystemWindowsDirectoryW(windir, MAX_PATH);
+	if (!wl || wl > MAX_PATH - 30)
+		return USBQT_DRIVER_WINUSB;
+	if (!SetupDiSetDeviceRegistryPropertyW(set, info, SPDRP_CLASSGUID, (const BYTE *)cls,
+					       (DWORD)((wcslen(cls) + 1) * sizeof(wchar_t))))
+		return USBQT_DRIVER_WINUSB_STEP + 1;
+	/* (which step failed, for the log: USBQT_DRIVER_WINUSB_STEP + 1..5) */
+	result = USBQT_DRIVER_WINUSB_STEP + 2;
+	if (SetupDiGetDeviceInstallParamsW(set, info, &params)) {
+		_snwprintf(params.DriverPath, MAX_PATH, L"%ls\\INF\\winusb.inf", windir);
+		params.DriverPath[MAX_PATH - 1] = L'\0';
+		params.Flags |= DI_ENUMSINGLEINF;
+		params.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS;
+		if (SetupDiSetDeviceInstallParamsW(set, info, &params) &&
+		    SetupDiBuildDriverInfoList(set, info, SPDIT_CLASSDRIVER)) {
+			SP_DRVINFO_DATA_W drv;
+			memset(&drv, 0, sizeof(drv));
+			drv.cbSize = sizeof(drv);
+			bool found = false;
+			for (DWORD i = 0; !found && SetupDiEnumDriverInfoW(set, info, SPDIT_CLASSDRIVER, i, &drv); i++)
+				found = drv.DriverType == SPDIT_CLASSDRIVER;
+			result = found ? USBQT_DRIVER_WINUSB_STEP + 4 : USBQT_DRIVER_WINUSB_STEP + 3;
+			/* newdev.dll (Device Manager's own installer), from System32 */
+			typedef BOOL(WINAPI * di_install_fn)(HWND, HDEVINFO, PSP_DEVINFO_DATA, PSP_DRVINFO_DATA_W, DWORD, PBOOL);
+			HMODULE newdev = found ? LoadLibraryExW(L"newdev.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32) : NULL;
+			di_install_fn di_install =
+				newdev ? (di_install_fn)(void (*)(void))GetProcAddress(newdev, "DiInstallDevice") : NULL;
+			BOOL reboot = FALSE;
+			if (di_install && di_install(NULL, set, info, &drv, 0, &reboot)) {
+				/* (the mark again, should the installation have rewritten the device's key; then a restart
+				 * so that WinUSB reads it) */
+				if (!marked_ours(set, info)) {
+					HKEY again = SetupDiCreateDevRegKeyW(set, info, DICS_FLAG_GLOBAL, 0, DIREG_DEV, NULL, NULL);
+					if (again != INVALID_HANDLE_VALUE) {
+						RegSetValueExW(again, L"DeviceInterfaceGUIDs", 0, REG_MULTI_SZ, (const BYTE *)guids,
+							       sizeof(guids));
+						RegCloseKey(again);
+					}
+					restart_device(set, info);
+				}
+				result = marked_ours(set, info) && started_without_problem(instance, 15000) ?
+						 USBQT_DRIVER_DONE :
+						 USBQT_DRIVER_WINUSB_STEP + 5;
+			}
+			if (newdev)
+				FreeLibrary(newdev);
+			SetupDiDestroyDriverInfoList(set, info, SPDIT_CLASSDRIVER);
+		}
+	}
+	if (result != USBQT_DRIVER_DONE) {
+		/* put back: its old class (Windows then gives it its old driver again when it next appears) and
+		 * the device removed, so that nothing half-made stays */
+		if (old_class[0])
+			SetupDiSetDeviceRegistryPropertyW(set, info, SPDRP_CLASSGUID, (const BYTE *)old_class,
+							  (DWORD)((wcslen(old_class) + 1) * sizeof(wchar_t)));
+		SetupDiRemoveDevice(set, info);
+	}
+	return result;
+}
+
+/* every device this program gave WinUSB (marked; present or not) taken away: Windows makes them anew, with their
+ * old driver, when the iPad next shows them. Apple's own WinUSB devices (its pairing channel) are not marked */
+static void winusb_remove_all(void)
+{
+	HDEVINFO set = SetupDiGetClassDevsW(NULL, L"USB", NULL, DIGCF_ALLCLASSES);
+	if (set == INVALID_HANDLE_VALUE)
+		return;
+	SP_DEVINFO_DATA info;
+	info.cbSize = sizeof(info);
+	for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
+		wchar_t id[300];
+		char a[300];
+		if (!SetupDiGetDeviceInstanceIdW(set, &info, id, 300, NULL))
+			continue;
+		size_t k = 0;
+		bool plain = true;
+		for (; id[k] && k + 1 < sizeof(a); k++) {
+			plain = plain && id[k] < 0x80;
+			a[k] = (char)toupper((unsigned char)(id[k] & 0x7f));
+		}
+		a[k] = '\0';
+		if (plain && valid_interface_instance(a) && marked_ours(set, &info))
+			SetupDiRemoveDevice(set, &info);
+	}
+	SetupDiDestroyDeviceInfoList(set);
+}
+
 /* ------------------------------------------------------------------ the virtual camera */
 
 /* The camera's DLL (softcam.dll, built by the workflow) is accepted only with the SHA-256 fingerprint the build
@@ -744,8 +935,9 @@ static int run(int argc, wchar_t **argv)
 		return camera_remove();
 	if (argc != 3)
 		return USBQT_DRIVER_ARGUMENTS;
+	bool winusb = !wcscmp(argv[1], L"winusb-install");
 	bool install = !wcscmp(argv[1], L"install");
-	if (!install && wcscmp(argv[1], L"remove"))
+	if (!install && !winusb && wcscmp(argv[1], L"remove"))
 		return USBQT_DRIVER_ARGUMENTS;
 	/* the device instance: plain ASCII, as the program found it */
 	char instance[200];
@@ -759,7 +951,7 @@ static int run(int argc, wchar_t **argv)
 	}
 	instance[i] = '\0';
 	winstance[i] = L'\0';
-	if (!valid_instance(instance))
+	if (winusb ? !valid_interface_instance(instance) : !valid_instance(instance))
 		return USBQT_DRIVER_ARGUMENTS;
 
 	HDEVINFO set = SetupDiCreateDeviceInfoList(NULL, NULL);
@@ -770,7 +962,10 @@ static int run(int argc, wchar_t **argv)
 	info.cbSize = sizeof(info);
 	int result = USBQT_DRIVER_NO_DEVICE;
 	if (SetupDiOpenDeviceInfoW(set, winstance, NULL, 0, &info))
-		result = install ? install_filter(set, &info, winstance) : remove_filter(set, &info, winstance);
+		result = winusb ? winusb_install(set, &info, winstance) :
+			 install ? install_filter(set, &info, winstance) : remove_filter(set, &info, winstance);
+	if (!install && !winusb)
+		winusb_remove_all();
 	SetupDiDestroyDeviceInfoList(set);
 	return result;
 }

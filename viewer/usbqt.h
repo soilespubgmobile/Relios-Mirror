@@ -16,6 +16,7 @@ enum usbqt_state {
 	USBQT_REPLUG,        /* the driver is installed, not loaded yet: unplug and plug the device */
 	USBQT_NO_APPLE,      /* Apple's own USB support (Apple Devices or iTunes) is missing, or does not run the device */
 	USBQT_APPLE_STOPPED, /* Apple's service (Apple Mobile Device Service) is installed but stopped */
+	USBQT_NEED_WINUSB,   /* the capture interface needs Microsoft's WinUSB (Settings > USB); the device is held */
 	USBQT_STARTING,      /* switching the device to screen capture */
 	USBQT_LOCKED,        /* no answer: the device should be unlocked and trust this computer (given back meanwhile) */
 	USBQT_STREAMING,
@@ -40,6 +41,8 @@ bool usbqt_running(void);
 bool usbqt_streaming(void);
 /* "try again now": ends a wait between attempts (after "Trust" was answered on the device, say) */
 void usbqt_retry(void);
+/* in USBQT_NEED_WINUSB: the capture interface's device (USB\VID_05AC&PID_xxxx&MI_nn\...) to give WinUSB */
+bool usbqt_capture_device(char *out, size_t size);
 
 struct usbqt_device {
 	char instance[200]; /* USB\VID_05AC&PID_xxxx\<serial> */
@@ -91,7 +94,18 @@ enum {
 	USBQT_DRIVER_RESTART_FIRST = 13, /* a removal is still waiting for a restart of Windows: nothing was done */
 	USBQT_DRIVER_NO_APPLE = 14,      /* Apple's driver does not run the device (install: refused, nothing done) */
 	USBQT_DRIVER_REGISTER = 15,      /* the virtual camera was put in place, but Windows did not take it (regsvr32) */
+	USBQT_DRIVER_NOT_CAPTURE = 16,   /* winusb-install: that device is not a screen-capture interface (nothing done) */
+	USBQT_DRIVER_WINUSB = 17,        /* winusb-install: Windows did not take WinUSB for it (put back as it was) */
+	/* winusb-install, the same, by step (log): +1 class, +2 WinUSB's list, +3 not in it, +4 installing, +5 start */
+	USBQT_DRIVER_WINUSB_STEP = 170,
 };
+
+/* "winusb-install <interface device>": Microsoft's own WinUSB (Windows' winusb.inf, signed by Microsoft) is made
+ * the driver of the device Windows' composite driver opens for the iPad's screen-capture interface alone
+ * (USB\VID_05AC&PID_xxxx&MI_nn\..., class FF/2A), marked with this interface GUID; Apple's driver keeps the rest of
+ * the iPad (pairing). "remove" takes such marked devices away again (Windows then gives them their old driver). */
+#define USBQT_CAPTURE_GUID_W L"{5E0A7C3D-2B91-4F68-A1D4-93C7E2B8F610}"
+#define USBQT_CAPTURE_GUID_INIT {0x5e0a7c3d, 0x2b91, 0x4f68, {0xa1, 0xd4, 0x93, 0xc7, 0xe2, 0xb8, 0xf6, 0x10}}
 
 /* The installer also puts the virtual camera in place and takes it away ("camera-install" / "camera-remove", no
  * device): the camera's DLL next to it is accepted only with the fingerprint the build wrote into the installer.

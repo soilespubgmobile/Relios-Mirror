@@ -33,6 +33,7 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
+#include <winusb.h>
 #endif
 
 #include "usbqt.h"
@@ -906,9 +907,11 @@ static bool libusb0_runs_device(void)
 	return usbqt_find_device(&d) && !_stricmp(d.service, "libusb0");
 }
 
-/* set when the capture interface could not be had because Apple's driver runs the device (see above): trying again
- * cannot help, so the device is not switched again and again */
-static bool claim_blocked;
+/* set when the capture interface's own device lacks Microsoft's WinUSB (Apple's driver runs the device): the device
+ * is then held in its capture configuration until WinUSB is installed there (Settings > USB) */
+static bool need_winusb;
+static SRWLOCK need_lock = SRWLOCK_INIT;
+static char need_instance[200]; /* (that device; read by the program's window) */
 
 /* Read only, for the log: the devices Windows' composite driver made for the device's interfaces in its capture
  * configuration (Apple's driver selects it after the switch). One of them is the capture interface itself
@@ -987,10 +990,273 @@ static void log_interfaces(int iface)
 	}
 }
 
+/* ------------------------------------------------------------------ the capture pipe: libusb0 or WinUSB */
+
+/* Microsoft's WinUSB (System32's winusb.dll), for the capture interface's own device under Apple's driver */
+static struct {
+	HMODULE dll;
+	__typeof__(WinUsb_Initialize) *initialize;
+	__typeof__(WinUsb_Free) *free_;
+	__typeof__(WinUsb_ReadPipe) *read;
+	__typeof__(WinUsb_WritePipe) *write;
+	__typeof__(WinUsb_SetPipePolicy) *policy;
+	__typeof__(WinUsb_ControlTransfer) *control;
+} W;
+
+static bool load_winusb(void)
+{
+	if (W.dll)
+		return true;
+	W.dll = LoadLibraryExW(L"winusb.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+	if (!W.dll)
+		return false;
+#define GETW(field, name) (W.field = (__typeof__(W.field))(void (*)(void))GetProcAddress(W.dll, name))
+	bool ok = GETW(initialize, "WinUsb_Initialize") && GETW(free_, "WinUsb_Free") && GETW(read, "WinUsb_ReadPipe") &&
+		  GETW(write, "WinUsb_WritePipe") && GETW(policy, "WinUsb_SetPipePolicy") &&
+		  GETW(control, "WinUsb_ControlTransfer");
+#undef GETW
+	if (!ok) {
+		FreeLibrary(W.dll);
+		memset(&W, 0, sizeof(W));
+	}
+	return ok;
+}
+
+/* the open capture pipe: through libusb0 (libusb0 runs the device itself) or through WinUSB (on the capture
+ * interface's own device, Apple's driver running the rest) */
+struct pipe {
+	lu_handle *lu;
+	HANDLE file;
+	WINUSB_INTERFACE_HANDLE wu;
+	int ep_in, ep_out;
+	ULONG in_timeout;
+	DWORD error; /* (WinUSB: the last Windows error) */
+};
+
+static const char *pipe_error(const struct pipe *p)
+{
+	static char text[64];
+	if (p->lu)
+		return lu_error();
+	snprintf(text, sizeof(text), "Windows error %lu", (unsigned long)p->error);
+	return text;
+}
+
+/* bytes (> 0), 0, LU_TIMEOUT (nothing yet) or another negative number (an error) */
+static int pipe_read(struct pipe *p, uint8_t *buf, int want, int timeout_ms)
+{
+	if (p->lu) {
+		for (int attempt = 0;; attempt++) {
+			int n = L.bulk_read(p->lu, p->ep_in, (char *)buf, want, timeout_ms);
+			if (n != LU_NO_DEVICE || attempt >= 12 || stopping())
+				return n;
+			Sleep(50);
+		}
+	}
+	if (p->in_timeout != (ULONG)timeout_ms) {
+		ULONG t = (ULONG)timeout_ms;
+		W.policy(p->wu, (UCHAR)p->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof(t), &t);
+		p->in_timeout = t;
+	}
+	ULONG got = 0;
+	if (W.read(p->wu, (UCHAR)p->ep_in, buf, (ULONG)want, &got, NULL))
+		return (int)got;
+	p->error = GetLastError();
+	return p->error == ERROR_SEM_TIMEOUT ? LU_TIMEOUT : -1000;
+}
+
+static bool pipe_write(struct pipe *p, const uint8_t *data, size_t n)
+{
+	if (p->lu)
+		return write_all(p->lu, p->ep_out, data, n);
+	while (n > 0) {
+		ULONG chunk = n > READ_SIZE ? READ_SIZE : (ULONG)n, sent = 0;
+		if (!W.write(p->wu, (UCHAR)p->ep_out, (PUCHAR)data, chunk, &sent, NULL) || !sent) {
+			p->error = GetLastError();
+			return false;
+		}
+		data += sent;
+		n -= sent;
+	}
+	return true;
+}
+
+/* the vendor request that wakes a freshly switched device (to the device itself) */
+static void pipe_nudge(struct pipe *p)
+{
+	if (p->lu) {
+		L.control_msg(p->lu, 0x40, 0x40, 0x6400, 0x6400, NULL, 0, 1000);
+		return;
+	}
+	WINUSB_SETUP_PACKET setup = {0x40, 0x40, 0x6400, 0x6400, 0};
+	ULONG n = 0;
+	W.control(p->wu, setup, NULL, 0, &n, NULL);
+}
+
+static void pipe_close(struct pipe *p)
+{
+	/* (libusb0: closing releases the interface; releasing it separately first could release it twice) */
+	if (p->lu)
+		L.close(p->lu);
+	if (p->wu)
+		W.free_(p->wu);
+	if (p->file && p->file != INVALID_HANDLE_VALUE)
+		CloseHandle(p->file);
+	memset(p, 0, sizeof(*p));
+}
+
+/* The device Windows' composite driver made for the capture interface (...&MI_nn of the device with this serial),
+ * and its driver ("" for none). Waits up to 5 s for it to appear (after the switch, Apple's driver selects the
+ * capture configuration and Windows opens the interfaces' devices) */
+static bool capture_child(const char *serial, int iface, char *instance, size_t isize, char *service, size_t ssize)
+{
+	struct usbqt_device d;
+	if (!find_entry(serial, &d))
+		return false;
+	wchar_t parent_id[200];
+	size_t k = 0;
+	for (; d.instance[k] && k + 1 < sizeof(parent_id) / sizeof(parent_id[0]); k++)
+		parent_id[k] = (wchar_t)(unsigned char)d.instance[k];
+	parent_id[k] = L'\0';
+	wchar_t want[16];
+	_snwprintf(want, 15, L"&MI_%02X\\", iface & 0xFF);
+	want[15] = L'\0';
+	ULONGLONG until = GetTickCount64() + 5000;
+	while (!stopping()) {
+		DEVINST parent = 0, child = 0;
+		if (CM_Locate_DevNodeW(&parent, parent_id, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+		    CM_Get_Child(&child, parent, 0) == CR_SUCCESS) {
+			for (int n = 0; n < 32; n++) {
+				wchar_t id[300];
+				memset(id, 0, sizeof(id));
+				if (CM_Get_Device_IDW(child, id, 299, 0) == CR_SUCCESS) {
+					for (wchar_t *c = id; *c; c++)
+						*c = (wchar_t)towupper(*c);
+					if (wcsstr(id, want)) {
+						wchar_t svc[64];
+						ULONG len = sizeof(svc) - 4;
+						memset(svc, 0, sizeof(svc));
+						CM_Get_DevNode_Registry_PropertyW(child, CM_DRP_SERVICE, NULL, svc, &len, 0);
+						bool plain;
+						ascii_upper(id, instance, isize, &plain);
+						if (!plain || !valid_interface_instance(instance))
+							return false;
+						ascii_upper(svc, service, ssize, &plain);
+						if (!plain)
+							service[0] = '\0';
+						return true;
+					}
+				}
+				if (CM_Get_Sibling(&child, child, 0) != CR_SUCCESS)
+					break;
+			}
+		}
+		if (GetTickCount64() >= until)
+			break;
+		Sleep(250);
+	}
+	return false;
+}
+
+enum winusb_open { WU_OPENED, WU_NOT_THERE, WU_FAILED };
+
+/* the capture interface's device through WinUSB (its interface, which the installer marked, waited for 5 s) */
+static enum winusb_open open_winusb(const char *instance, const struct capture_iface *q, struct pipe *p)
+{
+	memset(p, 0, sizeof(*p));
+	if (!load_winusb()) {
+		ulog("winusb.dll cannot be loaded");
+		return WU_FAILED;
+	}
+	wchar_t inst[200];
+	size_t k = 0;
+	for (; instance[k] && k + 1 < sizeof(inst) / sizeof(inst[0]); k++)
+		inst[k] = (wchar_t)(unsigned char)instance[k];
+	inst[k] = L'\0';
+	GUID guid = USBQT_CAPTURE_GUID_INIT;
+	wchar_t *list = NULL;
+	ULONGLONG until = GetTickCount64() + 5000;
+	while (!stopping()) {
+		ULONG size = 0;
+		if (CM_Get_Device_Interface_List_SizeW(&size, &guid, inst, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) ==
+			    CR_SUCCESS &&
+		    size > 1 && size < 4096) {
+			list = calloc(size + 1, sizeof(wchar_t));
+			if (list && CM_Get_Device_Interface_ListW(&guid, inst, list, size,
+								  CM_GET_DEVICE_INTERFACE_LIST_PRESENT) == CR_SUCCESS &&
+			    list[0])
+				break;
+			free(list);
+			list = NULL;
+		}
+		if (GetTickCount64() >= until)
+			break;
+		Sleep(250);
+	}
+	if (!list)
+		return WU_NOT_THERE;
+	p->file = CreateFileW(list, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+			      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+	free(list);
+	if (p->file == INVALID_HANDLE_VALUE) {
+		ulog("the capture interface's device cannot be opened (Windows error %lu)", (unsigned long)GetLastError());
+		p->file = NULL;
+		return WU_FAILED;
+	}
+	if (!W.initialize(p->file, &p->wu)) {
+		ulog("WinUSB does not take the capture interface (Windows error %lu)", (unsigned long)GetLastError());
+		p->wu = NULL;
+		pipe_close(p);
+		return WU_FAILED;
+	}
+	p->ep_in = q->ep_in;
+	p->ep_out = q->ep_out;
+	ULONG t = 1000;
+	W.policy(p->wu, (UCHAR)p->ep_out, PIPE_TRANSFER_TIMEOUT, sizeof(t), &t);
+	return WU_OPENED;
+}
+
+/* Apple's driver runs the device: the capture interface is had through its own device and WinUSB, never by
+ * selecting a configuration through libusb0 (that crashed Windows, 1.3.4). Without WinUSB there yet, need_winusb */
+static bool open_child(const char *serial, const struct capture_iface *q, struct pipe *p)
+{
+	char child[200], service[64];
+	if (!capture_child(serial, q->iface, child, sizeof(child), service, sizeof(service))) {
+		ulog("the capture interface's own device did not appear in Windows' list");
+		log_interfaces(q->iface);
+		return false;
+	}
+	bool winusb = !strcmp(service, "WINUSB");
+	enum winusb_open r = winusb ? open_winusb(child, q, p) : WU_NOT_THERE;
+	if (r == WU_OPENED) {
+		ulog("capture interface opened through WinUSB (%s)", child);
+		return true;
+	}
+	if (r == WU_FAILED)
+		return false;
+	ulog("the capture interface (%s) has driver %s: Microsoft's WinUSB is needed there (Settings > USB)", child,
+	     winusb ? "WinUSB without this program's mark" : service[0] ? service : "none");
+	AcquireSRWLockExclusive(&need_lock);
+	snprintf(need_instance, sizeof(need_instance), "%s", child);
+	ReleaseSRWLockExclusive(&need_lock);
+	need_winusb = true;
+	return false;
+}
+
+bool usbqt_capture_device(char *out, size_t size)
+{
+	AcquireSRWLockShared(&need_lock);
+	bool got = U.state == USBQT_NEED_WINUSB && need_instance[0];
+	snprintf(out, size, "%s", got ? need_instance : "");
+	ReleaseSRWLockShared(&need_lock);
+	return got;
+}
+
 /* the device in its capture configuration: found again by its serial, its capture interface claimed.
  * newly: this program has just switched it (only then may libusb0's view of it be initialized) */
-static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, struct capture_iface *q)
+static bool open_capture(const char *serial, unsigned *pid, bool newly, struct capture_iface *q, struct pipe *p)
 {
+	memset(p, 0, sizeof(*p));
 	struct found f;
 	bool got = false;
 	for (int i = 0; i < 40 && !stopping(); i++) {
@@ -1003,7 +1269,7 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 	}
 	if (!got) {
 		ulog("the device was not found again after the switch");
-		return NULL;
+		return false;
 	}
 	if (f.pid != *pid) {
 		ulog("after the switch the device shows product %04x", f.pid);
@@ -1012,7 +1278,7 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 	lu_handle *h = L.open(f.dev);
 	if (!h) {
 		ulog("the device cannot be opened: %s", lu_error());
-		return NULL;
+		return false;
 	}
 	/* both have to be seen: the capture interface described and its configuration active (after the switch the
 	 * device may need a moment) */
@@ -1057,47 +1323,39 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 		ulog(q->config ? "the device is not in its capture configuration" :
 				 "the device shows no screen-capture interface");
 		L.close(h);
-		return NULL;
+		return false;
+	}
+	if (!libusb0_runs_device()) {
+		/* Apple's driver runs it: libusb0 (only its filter) cannot take the interface ("invalid configuration
+		 * 0"), and selecting the configuration through it crashed Windows (1.3.4). The interface's own device,
+		 * with WinUSB, instead */
+		L.close(h);
+		return open_child(serial, q, p);
 	}
 	int r = L.claim_interface(h, q->iface);
 	if (r < 0) {
 		const char *why = lu_error();
 		ulog("claiming the capture interface: %d (%s)", r, why);
-		/* a freshly switched device can show its configuration before libusb0 has set up its pipes for this
-		 * handle ("invalid configuration 0"). Only then, and only after our own switch, is the (already
-		 * active) configuration selected once more (as iPhoneMirror does) */
-		if (!newly || r != LU_INVALID || !strstr(why, "invalid configuration 0")) {
+		/* libusb0 runs the device itself: a freshly switched device can show its configuration before libusb0
+		 * has set up its pipes for this handle ("invalid configuration 0"); then it is selected once more */
+		if (!newly || r != LU_INVALID || !strstr(why, "invalid configuration 0") ||
+		    L.set_configuration(h, q->config) < 0 || (r = L.claim_interface(h, q->iface)) < 0) {
+			if (r >= 0 || newly)
+				ulog("claiming the capture interface again: %s", lu_error());
 			L.close(h);
-			return NULL;
-		}
-		if (!libusb0_runs_device()) {
-			/* (here 1.3.4 selected the configuration through libusb0: Windows crashed) */
-			ulog("libusb0 cannot take the capture interface while Apple's driver runs the device; selecting the "
-			     "configuration through it is not done (it crashed Windows). Wired mirroring does not work this way");
-			log_interfaces(q->iface);
-			claim_blocked = true;
-			L.close(h);
-			return NULL;
-		}
-		if (L.set_configuration(h, q->config) < 0) {
-			ulog("setting up configuration %d: %s", q->config, lu_error());
-			L.close(h);
-			return NULL;
-		}
-		r = L.claim_interface(h, q->iface);
-		if (r < 0) {
-			ulog("claiming the capture interface: %d (%s)", r, lu_error());
-			L.close(h);
-			return NULL;
+			return false;
 		}
 	}
 	if (q->alt && L.set_altinterface(h, q->alt) < 0) {
 		ulog("alternate setting %d: %s", q->alt, lu_error());
 		L.close(h);
-		return NULL;
+		return false;
 	}
 	/* (1.3.3 reset the pipe to the device here (usb_clear_halt): after that the device never said hello. Not done) */
-	return h;
+	p->lu = h;
+	p->ep_in = q->ep_in;
+	p->ep_out = q->ep_out;
+	return true;
 }
 
 /* Reads from the capture pipe. When the time limit of usb_bulk_read runs out, libusb-win32 aborts the request and
@@ -1142,16 +1400,9 @@ static int read_wanted(const struct reader *r, size_t missing)
 
 /* one read: bytes (> 0), 0 (an empty packet), LU_TIMEOUT (nothing yet) or an error.
  * Rides out the few polls in which libusb0 reports the device missing while its node settles */
-static int read_some(lu_handle *h, struct reader *r, size_t missing)
+static int read_some(struct pipe *p, struct reader *r, size_t missing)
 {
-	int want = read_wanted(r, missing);
-	int timeout = missing ? 3000 : 250;
-	for (int attempt = 0;; attempt++) {
-		int n = L.bulk_read(h, r->ep, (char *)r->buf, want, timeout);
-		if (n != LU_NO_DEVICE || attempt >= 12 || stopping())
-			return n;
-		Sleep(50);
-	}
+	return pipe_read(p, r->buf, read_wanted(r, missing), missing ? 3000 : 250);
 }
 
 /* The device says hello (PING) right after its capture configuration has been selected, once. A device found
@@ -1160,7 +1411,7 @@ static int read_some(lu_handle *h, struct reader *r, size_t missing)
  * already active, so first none), and it starts afresh. The interface is claimed again after that */
 static bool select_anew(lu_handle *h, const struct capture_iface *q)
 {
-	if (!libusb0_runs_device()) {
+	if (!h || !libusb0_runs_device()) {
 		ulog("no hello from the device; its configuration is not selected anew (Apple's driver runs it)");
 		return true;
 	}
@@ -1178,7 +1429,7 @@ static bool select_anew(lu_handle *h, const struct capture_iface *q)
 enum end_reason { END_STOP, END_GONE, END_ERROR, END_LOCKED, END_DEVICE_STOPPED };
 
 /* reads until stopped, unplugged or broken; then the release. The handle is closed here */
-static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool newly, const char *serial,
+static enum end_reason stream(struct pipe *h, const struct capture_iface *q, bool newly, const char *serial,
 			      unsigned pid)
 {
 	struct qt_sink sink = {sink_video, sink_audio, sink_log, NULL};
@@ -1189,7 +1440,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 	enum end_reason why = END_ERROR;
 	if (!s || !reader_open(&rd, q)) {
 		qt_session_free(s);
-		L.close(h);
+		pipe_close(h);
 		return END_ERROR;
 	}
 	const uint8_t *buf = rd.buf;
@@ -1210,7 +1461,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 			     (unsigned long long)(now - start));
 		}
 		if (n < 0 && n != LU_TIMEOUT) {
-			ulog("reading stopped: %d (%s)", n, lu_error());
+			ulog("reading stopped: %d (%s)", n, pipe_error(h));
 			why = interface_present(pid, serial) ? END_ERROR : END_GONE;
 			break;
 		}
@@ -1223,8 +1474,8 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				break;
 			}
 			qt_session_trace_out(s, &out);
-			if (out.failed || (out.n && !write_all(h, q->ep_out, out.p, out.n))) {
-				ulog("writing to the device failed: %s", lu_error());
+			if (out.failed || (out.n && !pipe_write(h, out.p, out.n))) {
+				ulog("writing to the device failed: %s", pipe_error(h));
 				why = interface_present(pid, serial) ? END_ERROR : END_GONE;
 				break;
 			}
@@ -1249,7 +1500,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		if (st == QT_WAIT_PING) {
 			if (n <= 0 && !got_any && !reselected && now - start > 1500) {
 				reselected = true;
-				if (!select_anew(h, q)) {
+				if (!select_anew(h->lu, q)) {
 					why = END_ERROR;
 					break;
 				}
@@ -1260,10 +1511,10 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				 * PING of ours (iPhoneMirror). The nudge is never sent to a session found running */
 				nudged = true;
 				if (newly)
-					L.control_msg(h, 0x40, 0x40, 0x6400, 0x6400, NULL, 0, 1000);
+					pipe_nudge(h);
 				qt_out_clear(&out);
 				qt_make_ping(&out);
-				write_all(h, q->ep_out, out.p, out.n);
+				pipe_write(h, out.p, out.n);
 				ulog("no hello from the device yet: nudged");
 			}
 			if (now - start > 9000) {
@@ -1281,8 +1532,8 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 			pinged_again = true;
 			qt_out_clear(&out);
 			qt_make_ping(&out);
-			bool sent = write_all(h, q->ep_out, out.p, out.n);
-			ulog("the device has not gone on after its hello: hello sent again (%s)", sent ? "sent" : lu_error());
+			bool sent = pipe_write(h, out.p, out.n);
+			ulog("the device has not gone on after its hello: hello sent again (%s)", sent ? "sent" : pipe_error(h));
 		}
 		if (!qt_session_video_frames(s) && now - answered > 12000) {
 			ulog("the device answered but sent no picture in 12 s");
@@ -1306,7 +1557,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		bool started = qt_session_state(s) != QT_WAIT_PING;
 		qt_out_clear(&out);
 		qt_session_stop(s, &out);
-		bool ok = write_all(h, q->ep_out, out.p, out.n);
+		bool ok = pipe_write(h, out.p, out.n);
 		DWORD wait = why == END_DEVICE_STOPPED || !started ? 1000 : quick() ? 2000 : 6000;
 		ULONGLONG until = GetTickCount64() + wait;
 		while (ok && qt_session_releases(s) < 2 && GetTickCount64() < until) {
@@ -1318,19 +1569,18 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				if (!qt_session_feed(s, buf, (size_t)n, &out, now_ns()))
 					break;
 				if (out.n)
-					write_all(h, q->ep_out, out.p, out.n);
+					pipe_write(h, out.p, out.n);
 			}
 		}
 		if (qt_session_releases(s) >= 2) {
 			qt_out_clear(&out);
 			qt_session_finish(s, &out);
-			write_all(h, q->ep_out, out.p, out.n);
+			pipe_write(h, out.p, out.n);
 		}
 		ulog("released (%d of 2 answers)", qt_session_releases(s));
 	}
 	reader_close(&rd);
-	/* (closing releases the interface; releasing it separately first could make libusb0 release it twice) */
-	L.close(h);
+	pipe_close(h);
 	qt_out_free(&out);
 	qt_session_free(s);
 	return why;
@@ -1425,6 +1675,7 @@ static DWORD WINAPI usb_main(LPVOID unused)
 	(void)unused;
 	wait_for_helpers();
 	unsigned failures = 0, locked = 0;
+	bool held_new = false; /* (held for WinUSB right after this program's switch) */
 	char seen[80] = "";                       /* the device on USB (its serial): new ones are described in the log */
 	ULONGLONG not_before = 0;                 /* no switch before then */
 	enum usbqt_state shown = USBQT_STARTING;  /* shown while waiting for that */
@@ -1529,19 +1780,35 @@ static DWORD WINAPI usb_main(LPVOID unused)
 			break;
 		}
 		unsigned pid = f.pid; /* (as it shows itself now) */
-		claim_blocked = false;
-		lu_handle *stream_h = open_capture(f.serial, &pid, newly, &q);
-		if (!stream_h) {
+		/* (held for WinUSB after this program's own switch: still counts as freshly switched) */
+		if (capturing && held_new)
+			newly = true;
+		held_new = false;
+		need_winusb = false;
+		struct pipe stream_h;
+		if (!open_capture(f.serial, &pid, newly, &q, &stream_h)) {
+			if (need_winusb) {
+				/* Held in its capture configuration (that is when the interface's device exists, so that the
+				 * installer can give it WinUSB); tried again when asked, given back when unplugged / stopped */
+				held_new = newly;
+				shown = USBQT_NEED_WINUSB;
+				set_state(USBQT_NEED_WINUSB);
+				ulog("held until WinUSB is installed for the capture interface (Settings > USB) or until unplugged");
+				wait_quietly(~0ull >> 2, pid, f.serial);
+				if (stopping()) {
+					give_back(f.serial, pid);
+					break;
+				}
+				take_retry();
+				shown = USBQT_STARTING;
+				continue;
+			}
 			give_back(f.serial, pid);
 			not_before = after_failure(++failures, &shown);
-			if (claim_blocked) {
-				not_before = ~0ull;
-				ulog("not switched again: waiting for \"Yeniden Dene\" or for the device to be plugged in anew");
-			}
 			continue;
 		}
 		ULONGLONG began = GetTickCount64();
-		enum end_reason why = stream(stream_h, &q, newly, f.serial, pid);
+		enum end_reason why = stream(&stream_h, &q, newly, f.serial, pid);
 		bool short_session = GetTickCount64() - began < 30000;
 		if (why != END_GONE)
 			give_back(f.serial, pid);
@@ -1658,6 +1925,13 @@ bool usbqt_streaming(void)
 
 void usbqt_retry(void)
 {
+}
+
+bool usbqt_capture_device(char *out, size_t size)
+{
+	if (size)
+		out[0] = '\0';
+	return false;
 }
 
 bool usbqt_find_device(struct usbqt_device *out)

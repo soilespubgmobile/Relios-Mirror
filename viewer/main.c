@@ -116,6 +116,7 @@ enum {
 	CMD_USB,
 	CMD_USB_DRIVER,
 	CMD_USB_RETRY,
+	CMD_USB_WINUSB,
 	CMD_STRICT,
 };
 
@@ -2077,6 +2078,8 @@ static const char *usb_state_text(int state)
 		return "Apple Aygıtları gerekli";
 	case USBQT_APPLE_STOPPED:
 		return "Apple hizmeti çalışmıyor";
+	case USBQT_NEED_WINUSB:
+		return "Ekran kaydı sürücüsü gerekli";
 	case USBQT_STARTING:
 		return "Bağlanıyor…";
 	case USBQT_LOCKED:
@@ -2663,6 +2666,8 @@ static const char *build_settings(void)
 		if (usb == USBQT_LOCKED || usb == USBQT_ERROR || usb == USBQT_FAILED || usb == USBQT_NO_APPLE ||
 		    usb == USBQT_APPLE_STOPPED)
 			action(line, CMD_USB_RETRY, "Yeniden Dene");
+		else if (usb == USBQT_NEED_WINUSB)
+			action(line, CMD_USB_WINUSB, "Kur");
 		else
 			row(line);
 		struct usbqt_device device;
@@ -2674,7 +2679,9 @@ static const char *build_settings(void)
 		else
 			action("USB Sürücüsü (iPad takılıyken)", CMD_USB_DRIVER, "Kur");
 		row("Gerekli: Apple Aygıtları ya da iTunes");
-		note = usb == USBQT_DRIVER_FAILED ?
+		note = usb == USBQT_NEED_WINUSB ?
+			       "Ekran kaydı bölümüne Microsoft'un WinUSB sürücüsü kurulacak: \"Kur\"a basın." :
+		       usb == USBQT_DRIVER_FAILED ?
 			       "Windows bu sürücüyü yüklemiyor (Bellek bütünlüğü açık olabilir): kaldırıp Wi-Fi ile yansıtın." :
 		       usb == USBQT_NO_APPLE ?
 			       "Microsoft Store'dan \"Apple Aygıtları\"nı (ya da iTunes'u) kurun, sonra cihazı çıkarıp takın." :
@@ -3197,7 +3204,8 @@ static void usb_driver(void)
 		     false))
 		return;
 	if (removing) {
-		if (!confirm("USB sürücüsü bu iPad'den kaldırılacak; Windows izin isteyecek, \"Evet\" deyin.\n"
+		if (!confirm("USB sürücüsü bu iPad'den kaldırılacak (ekran kaydı bölümüne kurulan WinUSB de);\n"
+			     "Windows izin isteyecek, \"Evet\" deyin.\n"
 			     "Sonra iPad'i çıkarıp yeniden takın. (Wi-Fi ile yansıtma bundan etkilenmez.)\n\n"
 			     "Devam edilsin mi?",
 			     false))
@@ -3334,6 +3342,53 @@ static void autostart_set(bool on)
 	}
 	RegCloseKey(key);
 }
+
+/* Microsoft's WinUSB for the iPad's screen-capture interface alone (the device usbqt.c holds in its capture
+ * configuration meanwhile): installed by relios-usb-kurucu.exe ("winusb-install"), with the user's consent */
+static void usb_winusb(void)
+{
+	char child[200];
+	if (!usbqt_capture_device(child, sizeof(child))) {
+		set_notice("Önce iPad'i takın; durum \"Ekran kaydı sürücüsü gerekli\" olunca \"Kur\"a basın", false);
+		return;
+	}
+	if (!confirm("iPad'in yalnızca ekran kaydı bölümüne Microsoft'un kendi WinUSB sürücüsü kurulacak\n"
+		     "(Windows'un içinde gelir, Microsoft imzalıdır; başka bir şey indirilmez ya da kurulmaz).\n\n"
+		     "Apple'ın sürücüsü iPad'in geri kalanında kalır: \"Bu Bilgisayara Güven\" ve eşleşme çalışır.\n"
+		     "Bedeli: bu bilgisayarda iPad'in kabloyla internet paylaşımı çalışmaz.\n"
+		     "Geri almak için: Ayarlar > USB > USB Sürücüsü > Kaldır.\n\n"
+		     "Windows izin isteyecek; \"Evet\" deyin. Devam edilsin mi?",
+		     true))
+		return;
+	char exe[2100], args[300];
+	char *base = SDL_GetBasePath();
+	snprintf(exe, sizeof(exe), "%srelios-usb-kurucu.exe", base ? base : "");
+	SDL_free(base);
+	if (!file_exists_utf8(exe)) {
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, APP_NAME,
+					 "Bu sürümde USB sürücüsünün kurucusu yok (relios-usb-kurucu.exe eksik).", A.win);
+		return;
+	}
+	snprintf(args, sizeof(args), "winusb-install %s", child);
+	app_log("USB: WinUSB for the capture interface %s", child);
+	int code = run_elevated_wait(exe, args, 90000);
+	app_log("USB: WinUSB result %d", code);
+	if (code == USBQT_DRIVER_DONE) {
+		set_notice("Ekran kaydı sürücüsü kuruldu; bağlanıyor…", false);
+		usbqt_retry();
+		return;
+	}
+	const char *text = code == -1 ? "İşlem yapılmadı (Windows izni verilmedi)." :
+			   code == USBQT_DRIVER_NO_DEVICE ? "iPad'in ekran kaydı bölümü bulunamadı (çıkarılmış olabilir).\n"
+							     "iPad'i takıp durumu bekleyin, sonra yeniden deneyin." :
+			   code == USBQT_DRIVER_NOT_CAPTURE ? "Bu bölüm ekran kaydı bölümü değil; hiçbir şey yapılmadı." :
+			   (code == USBQT_DRIVER_WINUSB || (code > USBQT_DRIVER_WINUSB_STEP && code <= USBQT_DRIVER_WINUSB_STEP + 5)) ?
+							 "Windows WinUSB sürücüsünü almadı; yapılan geri alındı.\n"
+							 "log.txt'yi gönderin." :
+							 "Ekran kaydı sürücüsü kurulamadı (ayrıntı log.txt'de).";
+	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, APP_NAME, text, A.win);
+	usbqt_retry();
+}
 #else
 static bool install_camera(void)
 {
@@ -3343,6 +3398,9 @@ static bool install_camera(void)
 static void usb_driver(void)
 {
 	set_notice("Kablolu yansıtma yalnızca Windows'ta var", false);
+}
+static void usb_winusb(void)
+{
 }
 static void remove_camera(void)
 {
@@ -3627,6 +3685,9 @@ static void run_command(int cmd, int arg)
 		break;
 	case CMD_USB_DRIVER:
 		usb_driver();
+		break;
+	case CMD_USB_WINUSB:
+		usb_winusb();
 		break;
 	case CMD_USB_RETRY:
 		app_log("USB: try again (asked)");

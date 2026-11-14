@@ -273,6 +273,19 @@ Program (elle; her yeni sürümde):
 - 1.3.6 (yalnızca ölçüm): arayüz alınamadığında iPad'in Windows'taki alt cihazları (bileşik sürücünün her arayüz
   için açtığı, ör. ...&MI_02) sürücüleri ve sorun kodlarıyla log'a yazılır (usbqt.c, log_interfaces). Hiçbir şey
   değiştirilmez. Sıradaki adım ve kararlar: depodaki DEVAM-NOTU.md.
+  Ölçüm sonucu (Windows 10, iPad 12ab): ekran kaydı yapılandırmasında MI_01 = Apple'ın eşleşme kanalı (WinUSB,
+  çalışıyor), MI_02 = ekran kaydı arayüzü (sınıf ff/2a) ama sürücüsü "Netaapl" (iPad'in USB ağ bağdaştırıcısı:
+  normal yapılandırmada 2 numaralı arayüz odur), çalışmıyor (sorun 10); MI_03/MI_04 sürücüsüz.
+- 1.3.7: Apple'ın sürücüsü cihazı çalıştırırken ekran kaydı arayüzü, kendi alt cihazı (MI_02) üzerinden
+  Microsoft'un WinUSB'si ile okunur (usbqt.c: struct pipe, open_child, open_winusb). WinUSB yoksa cihaz ekran kaydı
+  yapılandırmasında tutulur, durum "Ekran kaydı sürücüsü gerekli" olur; kullanıcı onaylarsa kurucu
+  ("winusb-install <alt cihaz>", usbdriver.c) Windows'un kendi winusb.inf'inden WinUSB'yi yalnızca o alt cihaza
+  kurar (Aygıt Yöneticisi'ndeki "listeden seç" gibi: sınıfı "Universal Serial Bus devices" yapılır, DiInstallDevice)
+  ve onu programın arayüz GUID'iyle işaretler. Ne paket ne sertifika eklenir. libusb0 filtresi yalnızca geçiş
+  isteği için kalır; hiçbir yapılandırma libusb0 üzerinden seçilmez. "Kaldır" işaretli alt cihazları da siler
+  (Windows onları eski sürücüleriyle yeniden yapar). Bedeli: o bilgisayarda iPad'in kabloyla internet paylaşımı
+  çalışmaz. Kurucu başarısızsa sonuç kodu 171-175 hangi adımda kaldığını söyler (usbqt.h). Gerçek cihazda henüz
+  denenmedi.
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

@@ -44,4 +44,29 @@ static inline bool valid_instance(const char *a)
 	return true;
 }
 
+
+/* The device Windows' composite driver makes for one interface of an iPad / iPhone:
+ * USB\VID_05AC&PID_xxxx&MI_nn\<id> (the id Windows gives it: hex digits and '&') */
+static inline bool valid_interface_instance(const char *a)
+{
+	size_t n = strlen(a);
+	if (strncmp(a, "USB\\VID_05AC&PID_", 17) || n < 27 + 3 || n > 27 + 40 || strncmp(a + 21, "&MI_", 4) ||
+	    a[27] != '\\')
+		return false;
+	for (int i = 17; i < 27; i++) {
+		if (i >= 21 && i < 25)
+			continue;
+		if (!isxdigit((unsigned char)a[i]))
+			return false;
+	}
+	char hex[5] = {a[17], a[18], a[19], a[20], 0};
+	if (!apple_mobile_product((unsigned)strtoul(hex, NULL, 16)))
+		return false;
+	for (const char *p = a + 28; *p; p++) {
+		if (!isxdigit((unsigned char)*p) && *p != '&')
+			return false;
+	}
+	return true;
+}
+
 #endif

@@ -67,6 +67,15 @@ Log'a göre karar:
 - MI_02 bir Apple sürücüsüne bağlıysa ya da hiç görünmüyorsa → bu yol kapalı; kablolu yansıtmayı kapatıp ağ
   üzerinden yansıtmayı önermek daha doğru.
 
+## 1.3.6 ölçümü ve 1.3.7
+
+- Ölçüm: MI_02 (ekran kaydı, sınıf ff/2a) var ama sürücüsü **Netaapl** (iPad'in USB Ethernet'i; normal
+  yapılandırmada 2 numaralı arayüz o), sorun 10 ile çalışmıyor. MI_01 (Apple'ın eşleşme kanalı) zaten **WinUSB**.
+- Kullanıcı yolu onayladı. **1.3.7**: MI_02'ye Windows'un kendi winusb.inf'inden WinUSB (Aygıt Yöneticisi'nin
+  "listeden seç"i gibi; sertifika/paket yok), akış WinUSB ile okunur. Ayrıntı: GELISTIRME.txt 1.3.7 maddesi.
+- Gerçek cihazda denenecek: Ayarlar > USB'de "Ekran kaydı sürücüsü gerekli" > Kur. Kurucu kodu 171-175 ise
+  hangi adımda kaldığı usbqt.h'deki USBQT_DRIVER_WINUSB_STEP açıklamasında.
+
 ## Yapılmaması gerekenler
 
 - Apple'ın sürücüsü cihazı çalıştırırken libusb0 üzerinden `usb_set_configuration` (mavi ekran, 1.3.4).
