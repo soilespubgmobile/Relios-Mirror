@@ -55,6 +55,11 @@ void qt_session_free(struct qt_session *s);
  * false: the stream cannot be followed any more (a broken length) */
 bool qt_session_feed(struct qt_session *s, const uint8_t *data, size_t len, struct qt_out *out, uint64_t now_ns);
 
+/* how many bytes the message being put together still lacks (0: the next read starts a new message; until its
+ * length has been read, the bytes that complete the length). The USB reader sizes its reads by this: a read never
+ * waits for bytes the device has not been asked for yet */
+size_t qt_session_missing(const struct qt_session *s);
+
 void qt_session_stop(struct qt_session *s, struct qt_out *out);   /* asks for the release: HPA0, HPD0 */
 void qt_session_finish(struct qt_session *s, struct qt_out *out); /* after both releases: the last HPD0 */
 void qt_make_ping(struct qt_out *out);

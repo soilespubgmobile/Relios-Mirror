@@ -340,6 +340,43 @@ int main(int argc, char **argv)
 			qt_out_free(&o2);
 			qt_session_free(c);
 		}
+		/* read the way the USB reader reads (viewer/usbqt.c, read_wanted): one packet when a message begins, then
+		 * what it still lacks in whole packets. Every message is one transfer of the device, without an empty packet
+		 * after it; a read gets at most what it asked for and ends at the end of the transfer. No read may ask past
+		 * the message being read (else it would wait for bytes the device sends only after an answer) */
+		static const size_t packets[] = {512, 1024};
+		for (size_t k = 0; k < 2; k++) {
+			size_t pk = packets[k];
+			struct seen paced = {0};
+			struct qt_session *c = session(&paced);
+			struct qt_out o2 = {0};
+			bool ok = true, overreach = false;
+			size_t msg = 0, reads = 0;
+			for (int i = 0; i < 13 && ok; i++) {
+				size_t mlen = rd32(all + msg), got = 0;
+				while (got < mlen && ok) {
+					size_t missing = qt_session_missing(c);
+					size_t want = missing ? (missing + pk - 1) / pk * pk : pk;
+					if (want > 65536)
+						want = 65536 - 65536 % pk;
+					size_t n = mlen - got < want ? mlen - got : want;
+					/* a request that is neither full nor ended by a short packet would wait */
+					if (n < want && n % pk == 0)
+						overreach = true;
+					ok = qt_session_feed(c, all + msg + got, n, &o2, 1000);
+					got += n;
+					reads++;
+				}
+				msg += mlen;
+			}
+			CHECK(ok && !overreach && qt_session_missing(c) == 0 && paced.videos == whole.videos &&
+				      paced.audios == whole.audios && paced.video_bytes == whole.video_bytes && o2.n == o1.n,
+			      "read in %zu-byte packets: different (%d/%d pictures, %zu/%zu answer bytes%s)", pk, paced.videos,
+			      whole.videos, o2.n, o1.n, overreach ? ", a read waited past a message" : "");
+			printf("read in %zu-byte packets: %zu reads\n", pk, reads);
+			qt_out_free(&o2);
+			qt_session_free(c);
+		}
 		printf("whole stream: %d pictures, %d sounds, %zu answer bytes\n", whole.videos, whole.audios, o1.n);
 		qt_out_free(&o1);
 		free(all);
@@ -352,6 +389,7 @@ int main(int argc, char **argv)
 		struct qt_out o = {0};
 		uint8_t bad[8] = {4, 0, 0, 0, 'g', 'n', 'i', 'p'};
 		CHECK(!qt_session_feed(s, bad, sizeof(bad), &o, 1), "a length below 8 was accepted");
+		CHECK(seen.logs > 0, "a broken length was not written to the log");
 		qt_session_free(s);
 		s = session(&seen);
 		uint8_t huge[8] = {0xff, 0xff, 0xff, 0x7f, 'n', 'y', 's', 'a'};

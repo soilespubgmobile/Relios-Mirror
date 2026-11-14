@@ -869,6 +869,18 @@ void qt_session_free(struct qt_session *s)
 	free(s);
 }
 
+/* why the stream was given up: written to the log, so that a next report shows what came */
+static void broken_length(struct qt_session *s, const uint8_t *p, size_t n, uint32_t plen)
+{
+	char hex[3 * 16 + 1];
+	size_t k = n < 16 ? n : 16;
+	for (size_t i = 0; i < k; i++)
+		snprintf(hex + 3 * i, 4, "%02x ", p[i]);
+	hex[3 * k] = 0;
+	say(s, "a message with the length %u (%zu bytes at hand; after %llu pictures, %llu sound packets): %s", plen, n,
+	    (unsigned long long)s->video_frames, (unsigned long long)s->audio_packets, hex);
+}
+
 bool qt_session_feed(struct qt_session *s, const uint8_t *data, size_t len, struct qt_out *o, uint64_t now_ns)
 {
 	if (!s->epoch_set) {
@@ -879,8 +891,10 @@ bool qt_session_feed(struct qt_session *s, const uint8_t *data, size_t len, stru
 	while (len > 0) {
 		if (s->rlen == 0 && len >= 4) {
 			uint32_t plen = rd32(data);
-			if (plen < 8 || plen > QT_MAX_PACKET)
+			if (plen < 8 || plen > QT_MAX_PACKET) {
+				broken_length(s, data, len, plen);
 				return false;
+			}
 			if (len >= plen) {
 				process(s, data + 4, plen - 4, o);
 				data += plen;
@@ -901,6 +915,7 @@ bool qt_session_feed(struct qt_session *s, const uint8_t *data, size_t len, stru
 		}
 		uint32_t plen = rd32(s->rbuf);
 		if (plen < 8 || plen > QT_MAX_PACKET) {
+			broken_length(s, s->rbuf, s->rlen, plen);
 			s->rlen = 0;
 			return false;
 		}
@@ -931,6 +946,16 @@ void qt_session_finish(struct qt_session *s, struct qt_out *o)
 {
 	async_control(o, EMPTY_CLOCK, FCC('h', 'p', 'd', '0'));
 	s->state = QT_STOPPED;
+}
+
+size_t qt_session_missing(const struct qt_session *s)
+{
+	if (s->rlen == 0)
+		return 0;
+	if (s->rlen < 4)
+		return 4 - s->rlen;
+	uint32_t plen = rd32(s->rbuf);
+	return plen > s->rlen ? plen - s->rlen : 0;
 }
 
 enum qt_state qt_session_state(const struct qt_session *s)
