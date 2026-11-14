@@ -6,5 +6,5 @@
  * For a new version: change both lines and push. The build on GitHub keeps its files as a draft release of that
  * version (see GELISTIRME.txt).
  */
-#define APP_VERSION "1.3.2"
-#define APP_VERSION_NUMBERS 1, 3, 2, 0
+#define APP_VERSION "1.3.3"
+#define APP_VERSION_NUMBERS 1, 3, 3, 0

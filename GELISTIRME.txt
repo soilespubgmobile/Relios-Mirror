@@ -241,12 +241,19 @@ Program (elle; her yeni sürümde):
   okumalar zaman uyumsuz yapılır (usbqt.c, struct reader): süresi dolan istek iptal edilmez, beklemeye devam
   edilir (usb_reap_async_nocancel); her istek de okunan mesajın eksik kalan kısmı kadardır (qt_session_missing,
   paket boyutuna yuvarlanmış), böylece cihazın ancak bizim cevabımızdan sonra göndereceği baytları beklemez.
+  (Zaman uyumsuz okuma 1.3.3'te bırakıldı; aşağıya bakın.)
   Akış yine de koparsa log.txt'ye bozuk uzunluk ve ilk 16 bayt yazılır.
 - 1.3.1 denemesinde iPad ekran kaydı moduna geçti ama geri geldiğinde hiçbir yapılandırma seçilmemişti
   ("active configuration 0"): o bilgisayarda cihazı Apple'ın sürücüsü değil libusb0 çalıştırıyordu (log: "Windows
   driver LIBUSB0, lower filters []") ve libusb0 kendiliğinden yapılandırma seçmez. 1.3.2'de cihaz yapılandırmasız
   dönerse program ekran kaydı yapılandırmasını (5) bir kez kendisi seçer (usbqt.c, open_capture). Başkasının
   seçtiği bir yapılandırma değiştirilmez.
+- 1.3.2 denemesinde cihaz ekran kaydı yapılandırmasına geçti ve ilk mesajını (PING) gönderdi, cevabımızdan sonra
+  sustu; iptal edilen zaman uyumsuz okuma da bitmedi. 1.3.3'te okumalar yeniden usb_bulk_read ile yapılır (1.3.0'da
+  akış onunla gelmişti), ama boyutları mesaja göre kalır: iki mesaj arasında tek paket, kısa süre (o anda iptal
+  edilen okumaya hiç bayt gelmemiştir); mesajın içinde eksik kısım kadar, uzun süre. Akış başında cihaza giden pipe
+  sıfırlanır (usb_clear_halt; quicktime_video_hack de yapar), merhabadan 3 sn sonra saat gelmezse PING bir kez daha
+  gönderilir. Log'a ilk 40 mesaj (iki yönde) ve ilk 12 okumanın boyu yazılır: başlangıç nerede takılıyor görülür.
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

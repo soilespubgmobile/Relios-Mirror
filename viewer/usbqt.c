@@ -122,11 +122,7 @@ static struct {
 	int (*set_altinterface)(lu_handle *, int);
 	int (*bulk_read)(lu_handle *, int, char *, int, int);
 	int (*bulk_write)(lu_handle *, int, char *, int, int);
-	int (*bulk_setup_async)(lu_handle *, void **, unsigned char);
-	int (*submit_async)(void *, char *, int);
-	int (*reap_async_nocancel)(void *, int);
-	int (*cancel_async)(void *);
-	int (*free_async)(void **);
+	int (*clear_halt)(lu_handle *, unsigned int);
 	char *(*strerror)(void);
 } L;
 
@@ -139,7 +135,7 @@ static struct {
 #define CAPTURE_SUBCLASS 0x2A
 /* One read is at most 64 KiB: libusb-win32 cuts larger ones into 64 KiB requests, and when a request after the
  * first runs into the time limit, the bytes the earlier ones brought are lost with the error it returns.
- * (Reads from the capture pipe do not use usb_bulk_read at all: see struct reader) */
+ * (How the capture pipe is read so that nothing is lost: see struct reader) */
 #define READ_SIZE 65536
 
 /* the library the driver installation put into System32 (it belongs to the installed driver; without the driver it
@@ -166,9 +162,7 @@ static bool load_libusb(void)
 		  LOAD(control_msg, "usb_control_msg") && LOAD(set_configuration, "usb_set_configuration") &&
 		  LOAD(claim_interface, "usb_claim_interface") && LOAD(set_altinterface, "usb_set_altinterface") &&
 		  LOAD(bulk_read, "usb_bulk_read") && LOAD(bulk_write, "usb_bulk_write") &&
-		  LOAD(bulk_setup_async, "usb_bulk_setup_async") && LOAD(submit_async, "usb_submit_async") &&
-		  LOAD(reap_async_nocancel, "usb_reap_async_nocancel") && LOAD(cancel_async, "usb_cancel_async") &&
-		  LOAD(free_async, "usb_free_async") && LOAD(strerror, "usb_strerror");
+		  LOAD(clear_halt, "usb_clear_halt") && LOAD(strerror, "usb_strerror");
 #undef LOAD
 	if (!ok) {
 		FreeLibrary(L.dll);
@@ -1000,61 +994,41 @@ static lu_handle *open_capture(const char *serial, unsigned *pid, bool newly, st
 		L.close(h);
 		return NULL;
 	}
+	/* the pipe to the device started afresh on both sides (Windows resets its end and clears the device's: the
+	 * packet counters agree again), as quicktime_video_hack does. Only that pipe: the device may already have put
+	 * its hello into the other one */
+	int c = L.clear_halt(h, (unsigned)q->ep_out);
+	if (c < 0)
+		ulog("resetting the pipe to the device: %d (%s)", c, lu_error());
 	return h;
 }
 
-/* Reads from the capture pipe. usb_bulk_read of libusb-win32 is not used for them: when its time limit runs out it
- * aborts the pipe and the bytes that request had already received are lost (it returns only the error). Then the
- * rest of a message is missing, the next message is taken for its rest, and the stream cannot be followed any
- * more. So a request is never given up here: when the time limit runs out it stays pending, and the next read waits
- * for that same request (usb_reap_async_nocancel); it is cancelled only at the end.
- * And a request never asks for more than the message being read still lacks (rounded up to whole packets): it is
- * then complete either full or with the message's last, short packet, and it does not wait for bytes the device
- * will send only after an answer of ours (the device sends the next picture only after our NEED) */
+/* Reads from the capture pipe. When the time limit of usb_bulk_read runs out, libusb-win32 aborts the request and
+ * the bytes it had already received are lost (it returns only the error); then the rest of a message is missing,
+ * the next message is taken for its rest and the stream cannot be followed any more (1.3.0).
+ * So a read never asks for more than the message being read still lacks (rounded up to whole packets): it ends
+ * either full or with the message's last, short packet, as soon as the device has sent that message. Between
+ * messages a read asks for one packet: when it runs into the short time limit nothing has arrived in it (a message
+ * that had begun would have filled it or ended it), so nothing is lost. Within a message the device keeps sending;
+ * there the time limit is long. (1.3.1-1.3.2 read with libusb0's asynchronous requests instead; on a real device
+ * the stream stopped after the first message there, and a cancelled request did not end: not used) */
 struct reader {
-	lu_handle *h;
-	void *ctx;
 	uint8_t *buf;
+	int ep;
 	int packet; /* the pipe's packet size: a request is a whole number of packets */
-	int asked;  /* the size of the pending request (0: none) */
 };
 
-static bool reader_open(struct reader *r, lu_handle *h, const struct capture_iface *q)
+static bool reader_open(struct reader *r, const struct capture_iface *q)
 {
 	memset(r, 0, sizeof(*r));
-	r->h = h;
+	r->ep = q->ep_in;
 	r->packet = q->in_packet >= 8 && q->in_packet <= 1024 ? q->in_packet : 512;
 	r->buf = malloc(READ_SIZE);
-	if (!r->buf)
-		return false;
-	int e = L.bulk_setup_async(h, &r->ctx, (unsigned char)q->ep_in);
-	if (e < 0 || !r->ctx) {
-		ulog("preparing reads from the device: %d (%s)", e, lu_error());
-		free(r->buf);
-		r->buf = NULL;
-		r->ctx = NULL;
-		return false;
-	}
-	return true;
+	return r->buf != NULL;
 }
 
-/* before the handle is closed: a pending request is cancelled and its end waited for (the driver writes into buf
- * until then) */
 static void reader_close(struct reader *r)
 {
-	if (r->ctx) {
-		if (r->asked) {
-			L.cancel_async(r->ctx);
-			if (L.reap_async_nocancel(r->ctx, 2000) == LU_TIMEOUT) {
-				/* (still not ended: its buffer and event are left alone rather than freed under the driver) */
-				ulog("a read from the device did not end when cancelled");
-				memset(r, 0, sizeof(*r));
-				return;
-			}
-			r->asked = 0;
-		}
-		L.free_async(&r->ctx);
-	}
 	free(r->buf);
 	memset(r, 0, sizeof(*r));
 }
@@ -1069,24 +1043,14 @@ static int read_wanted(const struct reader *r, size_t missing)
 	return (int)want;
 }
 
-/* one read: bytes (> 0), 0 (an empty packet), LU_TIMEOUT (nothing yet; the request stays) or an error.
+/* one read: bytes (> 0), 0 (an empty packet), LU_TIMEOUT (nothing yet) or an error.
  * Rides out the few polls in which libusb0 reports the device missing while its node settles */
-static int read_some(struct reader *r, size_t missing, int timeout_ms)
+static int read_some(lu_handle *h, struct reader *r, size_t missing)
 {
+	int want = read_wanted(r, missing);
+	int timeout = missing ? 3000 : 250;
 	for (int attempt = 0;; attempt++) {
-		int n = 0;
-		if (!r->asked) {
-			int want = read_wanted(r, missing);
-			n = L.submit_async(r->ctx, (char *)r->buf, want);
-			if (n >= 0)
-				r->asked = want;
-		}
-		if (r->asked) {
-			n = L.reap_async_nocancel(r->ctx, timeout_ms);
-			if (n == LU_TIMEOUT)
-				return n;
-			r->asked = 0; /* (done, or failed: either way no longer pending) */
-		}
+		int n = L.bulk_read(h, r->ep, (char *)r->buf, want, timeout);
 		if (n != LU_NO_DEVICE || attempt >= 12 || stopping())
 			return n;
 		Sleep(50);
@@ -1105,21 +1069,28 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 	struct reader rd;
 	struct qt_out out = {0};
 	enum end_reason why = END_ERROR;
-	if (!s || !reader_open(&rd, h, q)) {
+	if (!s || !reader_open(&rd, q)) {
 		qt_session_free(s);
 		L.close(h);
 		return END_ERROR;
 	}
 	const uint8_t *buf = rd.buf;
 	ULONGLONG start = GetTickCount64(), last_data = start, answered = 0;
-	bool nudged = false, greeted = false;
+	bool nudged = false, greeted = false, pinged_again = false;
+	unsigned reads_logged = 0; /* (the first reads in the log: how the device's messages come) */
 	for (;;) {
 		if (stopping()) {
 			why = END_STOP;
 			break;
 		}
-		int n = read_some(&rd, qt_session_missing(s), 250);
+		size_t missing = qt_session_missing(s);
+		int n = read_some(h, &rd, missing);
 		ULONGLONG now = GetTickCount64();
+		if (n >= 0 && reads_logged < 12) {
+			reads_logged++;
+			ulog("read: %d bytes (asked %d, after %llu ms)", n, read_wanted(&rd, missing),
+			     (unsigned long long)(now - start));
+		}
 		if (n < 0 && n != LU_TIMEOUT) {
 			ulog("reading stopped: %d (%s)", n, lu_error());
 			why = interface_present(pid, serial) ? END_ERROR : END_GONE;
@@ -1132,6 +1103,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 				ulog("the stream from the device could not be followed");
 				break;
 			}
+			qt_session_trace_out(s, &out);
 			if (out.failed || (out.n && !write_all(h, q->ep_out, out.p, out.n))) {
 				ulog("writing to the device failed: %s", lu_error());
 				why = interface_present(pid, serial) ? END_ERROR : END_GONE;
@@ -1176,6 +1148,15 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		}
 		if (!answered)
 			answered = now;
+		/* the device said hello and was answered, but its clock has not come: our answer may not have reached it.
+		 * Said once more (iPhoneMirror sends a PING of its own too) */
+		if (st == QT_WAIT_CLOCK && !pinged_again && now - answered > 3000) {
+			pinged_again = true;
+			qt_out_clear(&out);
+			qt_make_ping(&out);
+			bool sent = write_all(h, q->ep_out, out.p, out.n);
+			ulog("the device has not gone on after its hello: hello sent again (%s)", sent ? "sent" : lu_error());
+		}
 		if (!qt_session_video_frames(s) && now - answered > 12000) {
 			ulog("the device answered but sent no picture in 12 s");
 			break;
@@ -1202,7 +1183,7 @@ static enum end_reason stream(lu_handle *h, const struct capture_iface *q, bool 
 		DWORD wait = why == END_DEVICE_STOPPED || !started ? 1000 : quick() ? 2000 : 6000;
 		ULONGLONG until = GetTickCount64() + wait;
 		while (ok && qt_session_releases(s) < 2 && GetTickCount64() < until) {
-			int n = read_some(&rd, qt_session_missing(s), 250);
+			int n = read_some(h, &rd, qt_session_missing(s));
 			if (n < 0 && n != LU_TIMEOUT)
 				break;
 			if (n > 0) {

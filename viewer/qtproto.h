@@ -63,6 +63,8 @@ size_t qt_session_missing(const struct qt_session *s);
 void qt_session_stop(struct qt_session *s, struct qt_out *out);   /* asks for the release: HPA0, HPD0 */
 void qt_session_finish(struct qt_session *s, struct qt_out *out); /* after both releases: the last HPD0 */
 void qt_make_ping(struct qt_out *out);
+/* the first messages of a session, both ways, written to the log (code, subtype, length): how far a start got */
+void qt_session_trace_out(struct qt_session *s, const struct qt_out *out);
 
 enum qt_state qt_session_state(const struct qt_session *s);
 uint64_t qt_session_video_frames(const struct qt_session *s);

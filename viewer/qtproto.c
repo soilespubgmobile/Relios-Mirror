@@ -29,7 +29,7 @@ struct qt_session {
 	uint64_t dev_audio_clock, dev_video_clock;
 	uint64_t video_frames, audio_packets, replies;
 	int releases;
-	unsigned bad_samples, logged;
+	unsigned bad_samples, logged, traced;
 
 	/* a message split over reads */
 	uint8_t *rbuf;
@@ -806,10 +806,38 @@ static void handle_async(struct qt_session *s, const uint8_t *p, size_t n)
 	/* (sprp, srat, tbas, tjmp: properties and clock rates; nothing to answer) */
 }
 
+#define QT_TRACE_MAX 40
+
+/* one message (from its code on, n bytes) in the log, while the session is young */
+static void trace(struct qt_session *s, const char *way, const uint8_t *p, size_t n)
+{
+	if (s->traced >= QT_TRACE_MAX || n < 4)
+		return;
+	s->traced++;
+	uint32_t code = rd32(p);
+	char c[5], sub[5] = "";
+	code_text(code, c);
+	if ((code == FCC('s', 'y', 'n', 'c') || code == FCC('a', 's', 'y', 'n')) && n >= 16)
+		code_text(rd32(p + 12), sub);
+	say(s, "%s: %s%s%s, %zu bytes", way, c, sub[0] ? " " : "", sub, n + 4);
+}
+
+void qt_session_trace_out(struct qt_session *s, const struct qt_out *o)
+{
+	for (size_t pos = 0; pos + 8 <= o->n && s->traced < QT_TRACE_MAX;) {
+		uint32_t len = rd32(o->p + pos);
+		if (len < 8 || len > o->n - pos)
+			break;
+		trace(s, "to the device", o->p + pos + 4, len - 4);
+		pos += len;
+	}
+}
+
 static void process(struct qt_session *s, const uint8_t *p, size_t n, struct qt_out *o)
 {
 	if (n < 4)
 		return;
+	trace(s, "from the device", p, n);
 	uint32_t code = rd32(p);
 	if (code == FCC('p', 'i', 'n', 'g')) {
 		qt_make_ping(o);
