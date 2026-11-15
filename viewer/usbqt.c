@@ -1001,6 +1001,9 @@ static struct {
 	__typeof__(WinUsb_WritePipe) *write;
 	__typeof__(WinUsb_SetPipePolicy) *policy;
 	__typeof__(WinUsb_ControlTransfer) *control;
+	__typeof__(WinUsb_GetOverlappedResult) *result;
+	__typeof__(WinUsb_AbortPipe) *abort_;
+	__typeof__(WinUsb_QueryPipe) *query;
 } W;
 
 static bool load_winusb(void)
@@ -1013,7 +1016,8 @@ static bool load_winusb(void)
 #define GETW(field, name) (W.field = (__typeof__(W.field))(void (*)(void))GetProcAddress(W.dll, name))
 	bool ok = GETW(initialize, "WinUsb_Initialize") && GETW(free_, "WinUsb_Free") && GETW(read, "WinUsb_ReadPipe") &&
 		  GETW(write, "WinUsb_WritePipe") && GETW(policy, "WinUsb_SetPipePolicy") &&
-		  GETW(control, "WinUsb_ControlTransfer");
+		  GETW(control, "WinUsb_ControlTransfer") && GETW(result, "WinUsb_GetOverlappedResult") &&
+		  GETW(abort_, "WinUsb_AbortPipe") && GETW(query, "WinUsb_QueryPipe");
 #undef GETW
 	if (!ok) {
 		FreeLibrary(W.dll);
@@ -1024,13 +1028,22 @@ static bool load_winusb(void)
 
 /* the open capture pipe: through libusb0 (libusb0 runs the device itself) or through WinUSB (on the capture
  * interface's own device, Apple's driver running the rest) */
+/* WinUSB reads: one request is kept waiting at the device until data comes; a wait that ends empty-handed leaves
+ * it waiting (it is never cancelled on a time-out: a cancelled read can lose what it had received, and WinUSB's own
+ * time-outs were the first suspect when the iPad stayed silent, 1.3.7). What a request brings beyond what the
+ * reader asked for is kept for the next read */
+#define PIPE_BUF 65536
 struct pipe {
 	lu_handle *lu;
 	HANDLE file;
 	WINUSB_INTERFACE_HANDLE wu;
 	int ep_in, ep_out;
-	ULONG in_timeout;
 	DWORD error; /* (WinUSB: the last Windows error) */
+	ULONG packet; /* the IN pipe's packet size (requests are whole packets: a smaller one could overflow) */
+	OVERLAPPED ov;
+	bool pending;
+	uint8_t *rbuf;		/* PIPE_BUF: the waiting request's buffer */
+	size_t have, used;	/* bytes it brought, of them already given out */
 };
 
 static const char *pipe_error(const struct pipe *p)
@@ -1053,32 +1066,87 @@ static int pipe_read(struct pipe *p, uint8_t *buf, int want, int timeout_ms)
 			Sleep(50);
 		}
 	}
-	if (p->in_timeout != (ULONG)timeout_ms) {
-		ULONG t = (ULONG)timeout_ms;
-		W.policy(p->wu, (UCHAR)p->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof(t), &t);
-		p->in_timeout = t;
+	if (p->used < p->have) {
+		size_t n = p->have - p->used < (size_t)want ? p->have - p->used : (size_t)want;
+		memcpy(buf, p->rbuf + p->used, n);
+		p->used += n;
+		return (int)n;
 	}
+	if (!p->pending) {
+		/* (asks for at least what the reader wants, rounded up to whole packets) */
+		ULONG pk = p->packet ? p->packet : 512;
+		ULONG ask = ((ULONG)want + pk - 1) / pk * pk;
+		if (ask > PIPE_BUF)
+			ask = PIPE_BUF / pk * pk;
+		ResetEvent(p->ov.hEvent);
+		ULONG got = 0;
+		p->have = p->used = 0;
+		if (W.read(p->wu, (UCHAR)p->ep_in, p->rbuf, ask, &got, &p->ov)) {
+			p->have = got;
+			return pipe_read(p, buf, want, timeout_ms);
+		}
+		p->error = GetLastError();
+		if (p->error != ERROR_IO_PENDING)
+			return -1000;
+		p->pending = true;
+	}
+	if (WaitForSingleObject(p->ov.hEvent, (DWORD)timeout_ms) != WAIT_OBJECT_0)
+		return LU_TIMEOUT; /* (still waiting at the device) */
 	ULONG got = 0;
-	if (W.read(p->wu, (UCHAR)p->ep_in, buf, (ULONG)want, &got, NULL))
-		return (int)got;
-	p->error = GetLastError();
-	return p->error == ERROR_SEM_TIMEOUT ? LU_TIMEOUT : -1000;
+	p->pending = false;
+	if (!W.result(p->wu, &p->ov, &got, FALSE)) {
+		p->error = GetLastError();
+		return -1000;
+	}
+	p->have = got;
+	p->used = 0;
+	if (!got)
+		return 0;
+	return pipe_read(p, buf, want, timeout_ms);
 }
 
 static bool pipe_write(struct pipe *p, const uint8_t *data, size_t n)
 {
 	if (p->lu)
 		return write_all(p->lu, p->ep_out, data, n);
-	while (n > 0) {
+	OVERLAPPED ov;
+	memset(&ov, 0, sizeof(ov));
+	ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (!ov.hEvent)
+		return false;
+	bool ok = true;
+	while (ok && n > 0) {
 		ULONG chunk = n > READ_SIZE ? READ_SIZE : (ULONG)n, sent = 0;
-		if (!W.write(p->wu, (UCHAR)p->ep_out, (PUCHAR)data, chunk, &sent, NULL) || !sent) {
+		ResetEvent(ov.hEvent);
+		if (!W.write(p->wu, (UCHAR)p->ep_out, (PUCHAR)data, chunk, &sent, &ov)) {
 			p->error = GetLastError();
-			return false;
+			if (p->error != ERROR_IO_PENDING) {
+				ok = false;
+				break;
+			}
+			if (WaitForSingleObject(ov.hEvent, 3000) != WAIT_OBJECT_0) {
+				/* (a write the device does not take in 3 s: given up; the session fails anyway) */
+				W.abort_(p->wu, (UCHAR)p->ep_out);
+				W.result(p->wu, &ov, &sent, TRUE);
+				p->error = ERROR_SEM_TIMEOUT;
+				ok = false;
+				break;
+			}
+			if (!W.result(p->wu, &ov, &sent, FALSE)) {
+				p->error = GetLastError();
+				ok = false;
+				break;
+			}
+		}
+		if (!sent) {
+			ok = false;
+			break;
 		}
 		data += sent;
 		n -= sent;
 	}
-	return true;
+	CloseHandle(ov.hEvent);
+	return ok;
 }
 
 /* the vendor request that wakes a freshly switched device (to the device itself) */
@@ -1098,8 +1166,16 @@ static void pipe_close(struct pipe *p)
 	/* (libusb0: closing releases the interface; releasing it separately first could release it twice) */
 	if (p->lu)
 		L.close(p->lu);
+	if (p->wu && p->pending) {
+		W.abort_(p->wu, (UCHAR)p->ep_in);
+		ULONG got = 0;
+		W.result(p->wu, &p->ov, &got, TRUE);
+	}
 	if (p->wu)
 		W.free_(p->wu);
+	if (p->ov.hEvent)
+		CloseHandle(p->ov.hEvent);
+	free(p->rbuf);
 	if (p->file && p->file != INVALID_HANDLE_VALUE)
 		CloseHandle(p->file);
 	memset(p, 0, sizeof(*p));
@@ -1211,8 +1287,22 @@ static enum winusb_open open_winusb(const char *instance, const struct capture_i
 	}
 	p->ep_in = q->ep_in;
 	p->ep_out = q->ep_out;
-	ULONG t = 1000;
-	W.policy(p->wu, (UCHAR)p->ep_out, PIPE_TRANSFER_TIMEOUT, sizeof(t), &t);
+	p->rbuf = malloc(PIPE_BUF);
+	p->ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (!p->rbuf || !p->ov.hEvent) {
+		pipe_close(p);
+		return WU_FAILED;
+	}
+	/* (what WinUSB knows of the interface's pipes, for the log) */
+	for (UCHAR i = 0; i < 4; i++) {
+		WINUSB_PIPE_INFORMATION info;
+		if (!W.query(p->wu, 0, i, &info))
+			break;
+		ulog("WinUSB pipe %u: endpoint 0x%02x, type %d, packet %u", i, info.PipeId, (int)info.PipeType,
+		     info.MaximumPacketSize);
+		if (info.PipeId == p->ep_in && info.MaximumPacketSize)
+			p->packet = info.MaximumPacketSize;
+	}
 	return WU_OPENED;
 }
 

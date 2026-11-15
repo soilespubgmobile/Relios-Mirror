@@ -76,6 +76,11 @@ Log'a göre karar:
 - Gerçek cihazda denenecek: Ayarlar > USB'de "Ekran kaydı sürücüsü gerekli" > Kur. Kurucu kodu 171-175 ise
   hangi adımda kaldığı usbqt.h'deki USBQT_DRIVER_WINUSB_STEP açıklamasında.
 
+- 1.3.7 denemesi: WinUSB kuruldu ve açıldı, iPad PING göndermedi (0 bayt). 1.3.8: WinUSB okumaları zaman
+  aşımıyla iptal edilmiyor (bekleyen istek). Hâlâ sessizse sıradaki şüpheli: WinUSB'nin alt cihazı başlatırken
+  uç noktaları sıfırlaması (1.3.3'teki clear_halt gibi cihazı susturur) ya da PING'in WinUSB başlamadan önce
+  kaybolması.
+
 ## Yapılmaması gerekenler
 
 - Apple'ın sürücüsü cihazı çalıştırırken libusb0 üzerinden `usb_set_configuration` (mavi ekran, 1.3.4).
