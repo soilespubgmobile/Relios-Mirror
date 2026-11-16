@@ -39,6 +39,10 @@ bool usbqt_start(const struct usbqt_callbacks *cb);
 void usbqt_stop(bool wait);
 bool usbqt_running(void);
 bool usbqt_streaming(void);
+/* Fast charging (as DouWan's "accelerated charging"): Apple's vendor request that lets the device draw more current
+ * from the port (2500 mA more; off: none more, so it charges slowly). It does not stop charging: nothing can; the
+ * device itself stops when full. Sent to each device found (and again after each switch) */
+void usbqt_set_fast_charge(bool on);
 /* "try again now": ends a wait between attempts (after "Trust" was answered on the device, say) */
 void usbqt_retry(void);
 /* in USBQT_NEED_WINUSB: the capture interface's device (USB\VID_05AC&PID_xxxx&MI_nn\...) to give WinUSB */

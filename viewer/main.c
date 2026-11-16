@@ -117,6 +117,7 @@ enum {
 	CMD_USB_DRIVER,
 	CMD_USB_RETRY,
 	CMD_USB_WINUSB,
+	CMD_FAST_CHARGE,
 	CMD_STRICT,
 };
 
@@ -152,6 +153,7 @@ static struct {
 	int net_private;     /* 1: a network Windows calls private is connected; 0: only public / domain ones (the
 			      * firewall lets nothing reach the receiver there); -1: not known */
 	bool usb_on;         /* wired (USB) mirroring is switched on (usbqt.c); Wi-Fi stays on as well */
+	bool fast_charge;    /* the device may draw more current from the port (usbqt_set_fast_charge) */
 	bool strict_on;      /* "Sıkı Koruma": the receiver also in an AppContainer (proc_win.c); on unless switched off */
 	bool strict_broken;  /* it could not be used in this run: the receiver runs as without it until the program
 			      * starts again or the switch is used again */
@@ -577,6 +579,8 @@ static void load_settings(void)
 			A.hide_connected = a != 0;
 		} else if (sscanf(line, "usb_kablolu=%d", &a) == 1) {
 			A.usb_on = a != 0;
+		} else if (sscanf(line, "hizli_sarj=%d", &a) == 1) {
+			A.fast_charge = a != 0;
 		} else if (sscanf(line, "siki_koruma=%d", &a) == 1) {
 			A.strict_on = a != 0;
 		} else if (!strncmp(line, "kayit_klasoru=", 14)) {
@@ -635,8 +639,8 @@ static void save_settings(void)
 	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=5\n", A.audio_device,
 		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
 		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
-	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\nsiki_koruma=%d\n", A.camera_saved ? 1 : 0, A.usb_on ? 1 : 0,
-		A.strict_on ? 1 : 0);
+	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\nsiki_koruma=%d\nhizli_sarj=%d\n", A.camera_saved ? 1 : 0,
+		A.usb_on ? 1 : 0, A.strict_on ? 1 : 0, A.fast_charge ? 1 : 0);
 	fclose(f);
 }
 
@@ -2678,6 +2682,7 @@ static const char *build_settings(void)
 			action("USB Sürücüsü: Kurulu Değil", CMD_USB_DRIVER, "Kur");
 		else
 			action("USB Sürücüsü (iPad takılıyken)", CMD_USB_DRIVER, "Kur");
+		toggle("Hızlı Şarj (kabloyla)", CMD_FAST_CHARGE, A.fast_charge);
 		row("Gerekli: Apple Aygıtları ya da iTunes");
 		note = usb == USBQT_NEED_WINUSB ?
 			       "Ekran kaydı bölümüne Microsoft'un WinUSB sürücüsü kurulacak: \"Kur\"a basın." :
@@ -3689,6 +3694,15 @@ static void run_command(int cmd, int arg)
 	case CMD_USB_WINUSB:
 		usb_winusb();
 		break;
+	case CMD_FAST_CHARGE:
+		A.fast_charge = !A.fast_charge;
+		save_settings();
+		usbqt_set_fast_charge(A.fast_charge);
+		app_log("fast charging switched %s", A.fast_charge ? "on" : "off");
+		set_notice(A.fast_charge ? "Hızlı şarj açık (cihaz ısınırsa kapatın)" :
+					   "Hızlı şarj kapalı: cihaz yavaş şarj olur (şarjı tamamen durdurmak mümkün değil)",
+			   false);
+		break;
 	case CMD_USB_RETRY:
 		app_log("USB: try again (asked)");
 		usbqt_retry();
@@ -4091,6 +4105,7 @@ int main(int argc, char *argv[])
 	A.net_private = -1;
 	check_network();
 	session_start();
+	usbqt_set_fast_charge(A.fast_charge);
 	if (A.usb_on)
 		usb_start();
 	update_title();

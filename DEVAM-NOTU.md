@@ -80,6 +80,8 @@ Log'a göre karar:
   aşımıyla iptal edilmiyor (bekleyen istek). Hâlâ sessizse sıradaki şüpheli: WinUSB'nin alt cihazı başlatırken
   uç noktaları sıfırlaması (1.3.3'teki clear_halt gibi cihazı susturur) ya da PING'in WinUSB başlamadan önce
   kaybolması.
+- 1.3.9: Hızlı şarj aç/kapa (Ayarlar > USB). Apple isteği 0x40/0x40, 2500 mA ya da 0. Kablolu yansıtma
+  denemesi (1.3.8 okumaları) hâlâ bekleniyor.
 
 ## Yapılmaması gerekenler
 

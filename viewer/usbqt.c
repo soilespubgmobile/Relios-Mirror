@@ -188,6 +188,7 @@ static struct {
 	/* detached: the program stopped waiting for this thread (it is ending): nothing is called back any more.
 	 * retry: "try again now" (usbqt_retry) */
 	volatile LONG stop, quick, streaming, detached, retry;
+	volatile LONG fast_charge, charge_applied; /* (wanted; and as sent last: -1 not yet / after a switch) */
 	struct usbqt_callbacks cb;
 	enum usbqt_state state;
 } U;
@@ -1681,6 +1682,7 @@ static void give_back(const char *serial, unsigned pid)
 	if (!interface_present(pid, serial))
 		return;
 	int code = run_switch("restore", serial, pid, quick() ? 6000 : 20000);
+	InterlockedExchange(&U.charge_applied, -1); /* (the device came anew) */
 	ulog("device given back to its usual configuration (%d)", code);
 }
 
@@ -1726,7 +1728,8 @@ static void describe(const struct found *f, int active, bool capturing, bool mux
 static void wait_quietly(ULONGLONG ms, unsigned pid, const char *serial)
 {
 	ULONGLONG until = GetTickCount64() + ms, check = GetTickCount64() + 1000;
-	while (GetTickCount64() < until && !stopping() && !retry_asked()) {
+	while (GetTickCount64() < until && !stopping() && !retry_asked() &&
+	       InterlockedCompareExchange(&U.charge_applied, 0, 0) == InterlockedCompareExchange(&U.fast_charge, 0, 0)) {
 		if (GetTickCount64() >= check) {
 			if (!interface_present(pid, serial))
 				return;
@@ -1734,6 +1737,26 @@ static void wait_quietly(ULONGLONG ms, unsigned pid, const char *serial)
 		}
 		Sleep(50);
 	}
+}
+
+/* the charging request (Apple's vendor request 0x40, the same as Linux's apple-mfi-fastcharge): sent once to the
+ * device as it is now, when wanted differs from what was sent (and after each switch, which makes the device anew) */
+static void apply_charge(const struct found *f)
+{
+	LONG want = InterlockedCompareExchange(&U.fast_charge, 0, 0);
+	if (InterlockedCompareExchange(&U.charge_applied, 0, 0) == want)
+		return;
+	/* (marked as sent whatever happens: a request that fails is not repeated again and again) */
+	InterlockedExchange(&U.charge_applied, want);
+	lu_handle *h = L.open(f->dev);
+	if (!h) {
+		ulog("fast charging: the device cannot be opened");
+		return;
+	}
+	int ma = want ? 2500 : 0;
+	int r = L.control_msg(h, 0x40, 0x40, ma, ma, NULL, 0, 1000);
+	L.close(h);
+	ulog("fast charging %s: %s", want ? "on" : "off", r >= 0 ? "sent" : lu_error());
 }
 
 /* How long a device in its usual configuration is left to Apple's service before it is switched (freshly plugged in,
@@ -1818,8 +1841,11 @@ static DWORD WINAPI usb_main(LPVOID unused)
 		bool known = active > 0 && config_listed(f.dev, active);
 		bool mux = known && config_has(f.dev, active, MUX_SUBCLASS);
 		enum usbqt_apple apple = usbqt_apple_service();
-		if (fresh)
+		if (fresh) {
 			describe(&f, active, capturing, mux, apple);
+			InterlockedExchange(&U.charge_applied, -1);
+		}
+		apply_charge(&f);
 
 		/* Apple's own support: its driver makes Windows use the capture configuration after the switch, its
 		 * service pairs with the device. Without them a switch can only fail, and the device would leave and come
@@ -1857,6 +1883,7 @@ static DWORD WINAPI usb_main(LPVOID unused)
 		if (!capturing) {
 			ulog("switching the device to screen capture");
 			int code = run_switch("activate", f.serial, f.pid, 25000);
+			InterlockedExchange(&U.charge_applied, -1); /* (the device came anew) */
 			ulog("switch: %d", code);
 			if (code != 0 && code != 20 && code != 32 && code != 33) {
 				not_before = after_failure(++failures, &shown);
@@ -1954,6 +1981,7 @@ bool usbqt_start(const struct usbqt_callbacks *cb)
 	InterlockedExchange(&U.streaming, 0);
 	InterlockedExchange(&U.detached, 0);
 	InterlockedExchange(&U.retry, 0);
+	InterlockedExchange(&U.charge_applied, -1);
 	U.thread = CreateThread(NULL, 0, usb_main, NULL, 0, NULL);
 	return U.thread != NULL;
 }
@@ -1961,6 +1989,11 @@ bool usbqt_start(const struct usbqt_callbacks *cb)
 void usbqt_retry(void)
 {
 	InterlockedExchange(&U.retry, 1);
+}
+
+void usbqt_set_fast_charge(bool on)
+{
+	InterlockedExchange(&U.fast_charge, on ? 1 : 0); /* (a wait ends for it: wait_quietly) */
 }
 
 void usbqt_stop(bool wait)
@@ -2015,6 +2048,11 @@ bool usbqt_streaming(void)
 
 void usbqt_retry(void)
 {
+}
+
+void usbqt_set_fast_charge(bool on)
+{
+	(void)on;
 }
 
 bool usbqt_capture_device(char *out, size_t size)
