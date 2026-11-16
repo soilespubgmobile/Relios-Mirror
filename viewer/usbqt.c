@@ -1162,6 +1162,26 @@ static void pipe_nudge(struct pipe *p)
 	W.control(p->wu, setup, NULL, 0, &n, NULL);
 }
 
+/* fast charging switched while the screen is sent: the same request as before the switch (apply_charge), through the
+ * capture interface's own handle (the default pipe reaches the whole device). Sent once, even if it fails */
+static void pipe_charge(struct pipe *p)
+{
+	LONG want = InterlockedCompareExchange(&U.fast_charge, 0, 0);
+	if (InterlockedCompareExchange(&U.charge_applied, 0, 0) == want)
+		return;
+	InterlockedExchange(&U.charge_applied, want);
+	USHORT ma = want ? 2500 : 0;
+	bool ok;
+	if (p->lu) {
+		ok = L.control_msg(p->lu, 0x40, 0x40, ma, ma, NULL, 0, 1000) >= 0;
+	} else {
+		WINUSB_SETUP_PACKET setup = {0x40, 0x40, ma, ma, 0};
+		ULONG n = 0;
+		ok = W.control(p->wu, setup, NULL, 0, &n, NULL) != FALSE;
+	}
+	ulog("fast charging %s (while mirroring): %s", want ? "on" : "off", ok ? "sent" : "failed");
+}
+
 static void pipe_close(struct pipe *p)
 {
 	/* (libusb0: closing releases the interface; releasing it separately first could release it twice) */
@@ -1543,6 +1563,8 @@ static enum end_reason stream(struct pipe *h, const struct capture_iface *q, boo
 			why = END_STOP;
 			break;
 		}
+		if (InterlockedCompareExchange(&U.streaming, 0, 0))
+			pipe_charge(h); /* (only once the pictures come: nothing extra during the greeting) */
 		size_t missing = qt_session_missing(s);
 		int n = read_some(h, &rd, missing);
 		ULONGLONG now = GetTickCount64();

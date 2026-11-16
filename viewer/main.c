@@ -2616,15 +2616,15 @@ static const char *build_settings(void)
 {
 	const char *note = "";
 	if (settings_tab == 0) {
-		row("Çözünürlük");
+		row("Çözünürlük (Wi-Fi)");
 		choice(CMD_RES_NEXT, 0, A.height == 720, "720p");
 		choice(CMD_RES_NEXT, 1, A.height == 1080, "1080p");
 		choice(CMD_RES_NEXT, 2, A.height == 1440, "1440p");
 		choice(CMD_RES_NEXT, 3, A.height == 2160, "4K");
-		row("Kare Hızı");
+		row("Kare Hızı (Wi-Fi)");
 		choice(CMD_FPS_NEXT, 30, A.fps == 30, "30 fps");
 		choice(CMD_FPS_NEXT, 60, A.fps != 30, "60 fps");
-		row("Kodek");
+		row("Kodek (Wi-Fi)");
 		choice(CMD_CODEC_NEXT, 0, !A.h265, "H.264");
 		choice(CMD_CODEC_NEXT, 1, A.h265, "H.265");
 		row("Görüntü Çözme");
@@ -2634,7 +2634,7 @@ static const char *build_settings(void)
 		row("Görüntü Oranı");
 		choice(CMD_ASPECT, 0, !fit, "Özgün");
 		choice(CMD_ASPECT, 1, fit, "16:9");
-		note = "İlk dört ayar değişince cihazdan yeniden bağlanın. 16:9 yalnızca yatay görüntüye uygulanır.";
+		note = "Wi-Fi ayarları değişince cihazdan yeniden bağlanın. Kabloyla iPad kendi ekran boyutunda gönderir. 16:9 yalnızca yatay görüntüye uygulanır.";
 	} else if (settings_tab == 1) {
 		row("Biçim");
 		choice(CMD_REC_FORMAT, 0, A.rec_format == 0, "MP4");

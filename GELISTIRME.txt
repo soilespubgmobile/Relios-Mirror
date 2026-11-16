@@ -294,6 +294,11 @@ Program (elle; her yeni sürümde):
   (bRequest 0x40, tür 0x40, wValue = wIndex = ek mA: açıkken 2500, kapalıyken 0; Linux apple-mfi-fastcharge ile
   aynı). Şarjı tamamen durdurmaz: iPad dolunca kendisi durur. Varsayılan kapalı; ayar "hizli_sarj=" satırında.
   İstek bir kez denenir (başarısız olsa da yeniden denenmez, döngü olmasın).
+- 1.3.10: 1.3.8 denemesi başarılı: kabloyla 2420x1668 H.264 + ses, 7 dakikada 23062 kare, bozuk örnek yok.
+  Hızlı şarj yansıtma sürerken de uygulanır (yakalama arayüzünün tutamacıyla, varsayılan boru üzerinden; resimler
+  geldikten sonra, bir kez). Kabloyla iPad kendi ekran boyutunda gönderir (bizim DisplaySize'ı dikkate almadı):
+  çözünürlük / kare hızı / kodek ayarları yalnızca Wi-Fi içindir, ayarlarda öyle yazıyor. iPad'in kendi ekran
+  kaydı açıkken iPad 30 fps gönderir (iPadOS'un sınırı).
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

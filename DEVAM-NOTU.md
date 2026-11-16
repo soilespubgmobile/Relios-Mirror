@@ -82,6 +82,8 @@ Log'a göre karar:
   kaybolması.
 - 1.3.9: Hızlı şarj aç/kapa (Ayarlar > USB). Apple isteği 0x40/0x40, 2500 mA ya da 0. Kablolu yansıtma
   denemesi (1.3.8 okumaları) hâlâ bekleniyor.
+- 1.3.8/1.3.9 denemesi: KABLOLU YANSITMA ÇALIŞIYOR (WinUSB, 2420x1668 H.264, ses, ~55 fps). 1.3.10: hızlı şarj
+  yansıtma sırasında da gönderilir; kalite ayarları yalnızca Wi-Fi (kabloyla iPad kendi boyutunda gönderir).
 
 ## Yapılmaması gerekenler
 
