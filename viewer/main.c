@@ -97,6 +97,7 @@ enum {
 	CMD_CODEC_NEXT,
 	CMD_REC_ENCODER,
 	CMD_REC_FORMAT,
+	CMD_REC_RES,
 	CMD_REC_BITRATE,
 	CMD_REC_MODE,
 	CMD_HW_DECODE,
@@ -164,6 +165,7 @@ static struct {
 	SDL_atomic_t fit169; /* a landscape picture is spread to 16:9 (window, recording, virtual camera) */
 	bool rec_gpu;   /* record with the graphics card's encoder */
 	int rec_format; /* 0: .mp4, 1: .mov (QuickTime), 2: .mkv */
+	int rec_res;    /* the recording's short side: 0 as it comes, or 720 / 1080 / 1440 (never enlarged) */
 	int rec_mode;   /* 0: by quality, 1: CBR, 2: VBR */
 	int rec_kbit;   /* the recording's bit rate for CBR / VBR */
 	SDL_Texture *logo;
@@ -603,6 +605,8 @@ static void load_settings(void)
 		} else if (!strncmp(line, "ses_aygiti=", 11)) {
 			snprintf(A.audio_device, sizeof(A.audio_device), "%s", line + 11);
 			A.audio_device[strcspn(A.audio_device, "\r\n")] = '\0';
+		} else if (sscanf(line, "kayit_cozunurluk=%d", &a) == 1 && (a == 0 || a == 720 || a == 1080 || a == 1440)) {
+			A.rec_res = a;
 		} else if (sscanf(line, "kayit_bicim=%d", &a) == 1 && a >= 0 && a <= 2) {
 			A.rec_format = a;
 		} else if (sscanf(line, "kayit_mod=%d", &a) == 1 && a >= 0 && a <= 2) {
@@ -639,8 +643,8 @@ static void save_settings(void)
 	fprintf(f, "ses_aygiti=%s\noran169=%d\ncozunurluk_oto=%d\nbagliyken_gizle=%d\nkayit_klasoru=%s\nkayit_ses=%d\ntepsi=%d\nlistede_goster=%d\nsurum=5\n", A.audio_device,
 		SDL_AtomicGet(&A.fit169), A.res_auto ? 1 : 0, A.hide_connected ? 1 : 0, A.custom_folder, A.rec_audio ? 1 : 0,
 		A.to_tray ? 1 : 0, A.visible ? 1 : 0);
-	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\nsiki_koruma=%d\nhizli_sarj=%d\n", A.camera_saved ? 1 : 0,
-		A.usb_on ? 1 : 0, A.strict_on ? 1 : 0, A.fast_charge ? 1 : 0);
+	fprintf(f, "sanal_kamera=%d\nusb_kablolu=%d\nsiki_koruma=%d\nhizli_sarj=%d\nkayit_cozunurluk=%d\n", A.camera_saved ? 1 : 0,
+		A.usb_on ? 1 : 0, A.strict_on ? 1 : 0, A.fast_charge ? 1 : 0, A.rec_res);
 	fclose(f);
 }
 
@@ -807,10 +811,17 @@ static bool rec_open_locked(const AVFrame *f, bool full, bool bt709, uint64_t t0
 		R.enc = avcodec_alloc_context3(codec);
 		if (!R.enc)
 			return false;
-		R.enc->width = f->width & ~1;
-		R.enc->height = f->height & ~1;
-		if (SDL_AtomicGet(&A.fit169) && f->width > f->height)
-			R.enc->width = (f->height * 16 / 9) & ~1; /* landscape: spread to 16:9 */
+		int ew = f->width, eh = f->height;
+		if (SDL_AtomicGet(&A.fit169) && ew > eh)
+			ew = eh * 16 / 9; /* landscape: spread to 16:9 */
+		int short_side = ew < eh ? ew : eh;
+		if (A.rec_res > 0 && short_side > A.rec_res) {
+			/* made smaller to the chosen size (the short side), keeping the shape */
+			ew = (int)((int64_t)ew * A.rec_res / short_side);
+			eh = (int)((int64_t)eh * A.rec_res / short_side);
+		}
+		R.enc->width = ew & ~1;
+		R.enc->height = eh & ~1;
 		R.enc->pix_fmt = gpu ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
 		R.enc->time_base = (AVRational){1, R.fps}; /* a constant frame rate: one tick per frame */
 		R.enc->framerate = (AVRational){R.fps, 1};
@@ -2640,6 +2651,11 @@ static const char *build_settings(void)
 		choice(CMD_REC_FORMAT, 0, A.rec_format == 0, "MP4");
 		choice(CMD_REC_FORMAT, 1, A.rec_format == 1, "MOV");
 		choice(CMD_REC_FORMAT, 2, A.rec_format == 2, "MKV");
+		row("Çözünürlük");
+		choice(CMD_REC_RES, 0, A.rec_res == 0, "Özgün");
+		choice(CMD_REC_RES, 720, A.rec_res == 720, "720p");
+		choice(CMD_REC_RES, 1080, A.rec_res == 1080, "1080p");
+		choice(CMD_REC_RES, 1440, A.rec_res == 1440, "1440p");
 		row("Kodlayıcı");
 		choice(CMD_REC_ENCODER, 1, A.rec_gpu, "Ekran Kartı");
 		choice(CMD_REC_ENCODER, 0, !A.rec_gpu, "İşlemci");
@@ -3525,6 +3541,10 @@ static void run_command(int cmd, int arg)
 		break;
 	case CMD_REC_FORMAT:
 		A.rec_format = arg >= 0 && arg <= 2 ? arg : 0;
+		save_settings();
+		break;
+	case CMD_REC_RES:
+		A.rec_res = arg == 720 || arg == 1080 || arg == 1440 ? arg : 0;
 		save_settings();
 		break;
 	case CMD_REC_MODE:
