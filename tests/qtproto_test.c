@@ -297,6 +297,55 @@ int main(int argc, char **argv)
 		qt_session_free(s);
 	}
 
+	/* sound formats the device may switch to (an app with the microphone on): float or 24-bit, channels one after
+	 * another, more than two channels; always 16-bit interleaved out, at most two channels */
+	{
+		size_t al, el;
+		uint8_t *afmt = load("afmt-request", &al), *eat = load("asyn-eat-nofdsc", &el);
+		struct {
+			uint32_t flags, frame_bytes, channels, bits;
+			int bytes;
+		} formats[] = {
+			{0x4c, 4, 2, 16, 2},  /* as the device sends it normally */
+			{0x29, 4, 2, 32, 4},  /* float, non-interleaved */
+			{0x0c, 6, 2, 24, 3},  /* 24-bit in three bytes */
+			{0x1c, 8, 2, 24, 4},  /* 24-bit at the top of four bytes */
+			{0x4c, 12, 6, 16, 2}, /* six channels */
+			{0x4c, 2, 1, 16, 2},  /* one channel */
+		};
+		int frames0 = 0;
+		for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
+			struct seen seen = {0};
+			struct qt_session *a = session(&seen);
+			struct qt_out o = {0};
+			uint8_t *m = malloc(al);
+			memcpy(m, afmt, al);
+			uint8_t *asbd = m + 28;
+			memcpy(asbd + 12, &formats[f].flags, 4);
+			uint32_t packet = formats[f].frame_bytes;
+			memcpy(asbd + 16, &packet, 4);
+			memcpy(asbd + 24, &formats[f].frame_bytes, 4);
+			memcpy(asbd + 28, &formats[f].channels, 4);
+			memcpy(asbd + 32, &formats[f].bits, 4);
+			qt_session_feed(a, m, al, &o, 1000);
+			qt_session_feed(a, eat, el, &o, 2000);
+			int out_ch = formats[f].channels > 2 ? 2 : (int)formats[f].channels;
+			if (f == 0)
+				frames0 = seen.audio_frames;
+			int expected = frames0 * 2 * 2 / ((int)formats[f].channels * formats[f].bytes);
+			CHECK(seen.audios == 1 && seen.audio_channels == out_ch && seen.audio_frames == expected &&
+				      seen.audio_rate == 48000,
+			      "sound format %zu: %d packets, %d channels (%d expected), %d frames (%d expected), %d Hz", f,
+			      seen.audios, seen.audio_channels, out_ch, seen.audio_frames, expected, seen.audio_rate);
+			free(m);
+			qt_out_free(&o);
+			qt_session_free(a);
+		}
+		CHECK(frames0 > 0, "sound: no frames from the captured sound");
+		free(afmt);
+		free(eat);
+	}
+
 	/* the same stream cut into pieces at every possible size: the same result */
 	{
 		const char *names[] = {"cwpa-request1", "afmt-request", "cvrp-request", "asyn-feed", "asyn-eat",
@@ -320,31 +369,90 @@ int main(int argc, char **argv)
 		struct qt_out o1 = {0};
 		CHECK(qt_session_feed(s, all, total, &o1, 1000), "whole stream: failed");
 		CHECK(qt_session_releases(s) == 1, "whole stream: %d releases", qt_session_releases(s));
-		CHECK(qt_session_state(s) == QT_STOPPED, "whole stream: state %d", (int)qt_session_state(s));
+		/* (it ends with a STOP: that stops one clock of ours, not the session) */
+		CHECK(qt_session_state(s) == QT_STREAMING, "whole stream: state %d", (int)qt_session_state(s));
 		qt_session_free(s);
-		/* after its own stop the device starts over on the same pipe: hello, clock, pictures */
+		/* a STOP stops one clock of ours, not the session: the pictures go on, a NEED after each */
 		{
-			struct seen again_seen = {0};
-			s = session(&again_seen);
-			struct qt_out ping = {0}, o3 = {0};
-			CHECK(qt_session_feed(s, all, total, &o3, 1000), "restart: the first stream failed");
-			qt_make_ping(&ping);
-			CHECK(qt_session_feed(s, ping.p, ping.n, &o3, 2000), "restart: hello not taken");
-			CHECK(qt_session_state(s) == QT_WAIT_CLOCK, "restart: state %d after the hello",
-			      (int)qt_session_state(s));
-			const char *again[] = {"cwpa-request1", "cvrp-request", "asyn-feed"};
-			int videos = again_seen.videos;
-			for (int i = 0; i < 3; i++) {
-				size_t l;
-				uint8_t *r = load(again[i], &l);
-				CHECK(qt_session_feed(s, r, l, &o3, 2000), "restart: %s not taken", again[i]);
-				free(r);
-			}
-			CHECK(qt_session_state(s) == QT_STREAMING, "restart: state %d after pictures",
-			      (int)qt_session_state(s));
-			CHECK(again_seen.videos == videos + 1, "restart: %d pictures (%d expected)", again_seen.videos,
+			struct seen st_seen = {0};
+			s = session(&st_seen);
+			struct qt_out o3 = {0};
+			CHECK(qt_session_feed(s, all, total, &o3, 1000), "after a stop: the first stream failed");
+			size_t fl, el;
+			uint8_t *feed = load("asyn-feed", &fl), *eat = load("asyn-eat", &el);
+			int videos = st_seen.videos;
+			qt_out_clear(&o3);
+			CHECK(qt_session_feed(s, feed, fl, &o3, 2000), "after a stop: picture not taken");
+			size_t at[4], len[4];
+			int k = messages(&o3, at, len, 4);
+			CHECK(k == 1 && code_of(o3.p, at[0] + 16) == FCC('n', 'e', 'e', 'd'),
+			      "after a stop: the picture was not followed by a NEED (%d answers)", k);
+			CHECK(st_seen.videos == videos + 1, "after a stop: %d pictures (%d expected)", st_seen.videos,
 			      videos + 1);
-			qt_out_free(&ping);
+			CHECK(qt_session_state(s) == QT_STREAMING, "after a stop: state %d", (int)qt_session_state(s));
+
+			/* which clock: the one the pictures carry is the picture clock, the sound's the sound clock */
+			uint8_t stop[28] = {28, 0, 0, 0, 'c', 'n', 'y', 's'};
+			memcpy(stop + 16, "pots", 4);
+			stop[20] = 7;
+			unsigned counts[4], before[4];
+			qt_session_stops(s, before); /* (the stream above ends with a STOP of its own) */
+			uint64_t t0 = 5000000000ull;
+			memcpy(stop + 8, feed + 8, 8); /* the picture clock */
+			qt_out_clear(&o3);
+			CHECK(qt_session_feed(s, stop, sizeof(stop), &o3, t0), "picture stop not taken");
+			k = messages(&o3, at, len, 4);
+			CHECK(k == 1 && len[0] == 24 && code_of(o3.p, at[0] + 4) == FCC('r', 'p', 'l', 'y'),
+			      "picture stop: not answered with a 24-byte reply");
+			CHECK(qt_session_video_stopped_ns(s) == t0, "picture stop: not noted");
+			qt_out_clear(&o3);
+			qt_session_feed(s, feed, fl, &o3, t0 + 100000000ull); /* (100 ms: one on its way) */
+			CHECK(qt_session_video_stopped_ns(s) == t0, "picture stop: undone by a picture already on its way");
+			qt_session_feed(s, feed, fl, &o3, t0 + 500000000ull);
+			CHECK(qt_session_video_stopped_ns(s) == 0, "picture stop: pictures came again but it stays");
+			qt_session_feed(s, stop, sizeof(stop), &o3, t0 + 1000000000ull);
+			CHECK(qt_session_video_stopped_ns(s) != 0, "second picture stop: not noted");
+			size_t cl;
+			uint8_t *cvrp = load("cvrp-request", &cl);
+			qt_session_feed(s, cvrp, cl, &o3, t0 + 1100000000ull);
+			CHECK(qt_session_video_stopped_ns(s) == 0, "a new picture clock does not undo the picture stop");
+			free(cvrp);
+
+			memcpy(stop + 8, eat + 8, 8); /* the sound clock */
+			qt_session_feed(s, stop, sizeof(stop), &o3, t0 + 2000000000ull);
+			memset(stop + 8, 0x5a, 8); /* a clock it never used */
+			qt_session_feed(s, stop, sizeof(stop), &o3, t0 + 2100000000ull);
+			qt_session_stops(s, counts);
+			CHECK(counts[0] - before[0] == 1 && counts[1] - before[1] == 2 && counts[3] - before[3] == 1,
+			      "stops counted as sound %u, picture %u, time %u, other %u (1, 2, -, 1 more expected)",
+			      counts[0] - before[0], counts[1] - before[1], counts[2] - before[2], counts[3] - before[3]);
+			CHECK(qt_session_video_stopped_ns(s) == 0, "a sound stop is taken for a picture stop");
+			CHECK(qt_session_state(s) == QT_STREAMING, "after the stops: state %d", (int)qt_session_state(s));
+
+			/* SKEW: the time scale of the sound (its timestamps, else its format), never anything odd */
+			size_t kl;
+			uint8_t *skew = load("skew-request", &kl);
+			qt_out_clear(&o3);
+			qt_session_feed(s, skew, kl, &o3, t0 + 2200000000ull);
+			k = messages(&o3, at, len, 4);
+			double v = 0;
+			if (k == 1 && len[0] == 28)
+				memcpy(&v, o3.p + at[0] + 20, 8);
+			/* (the sound's timestamps count 48000 a second) */
+			CHECK(k == 1 && v == 48000.0, "skew answer %f (48000 expected)", v);
+			printf("ok? skew answer after sound: %.0f\n", v);
+			free(skew);
+
+			/* the release still works after the stops */
+			qt_out_clear(&o3);
+			qt_session_stop(s, &o3);
+			CHECK(qt_session_state(s) == QT_STOPPING, "release: state %d", (int)qt_session_state(s));
+			qt_out_clear(&o3);
+			qt_session_feed(s, feed, fl, &o3, t0 + 3000000000ull);
+			k = messages(&o3, at, len, 4);
+			CHECK(k == 0, "release: a picture during the release was answered (%d answers)", k);
+			free(feed);
+			free(eat);
 			qt_out_free(&o3);
 		}
 		qt_session_free(s);

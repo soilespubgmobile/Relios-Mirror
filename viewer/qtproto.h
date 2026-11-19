@@ -39,7 +39,7 @@ enum qt_state {
 	QT_NEGOTIATING, /* the display and sound were requested */
 	QT_STREAMING,   /* pictures arrive */
 	QT_STOPPING,    /* the release was requested */
-	QT_STOPPED,     /* the device said stop */
+	QT_STOPPED,     /* released (the last HPD0). A STOP from the device does not lead here: it stops one clock only */
 };
 
 struct qt_options {
@@ -71,5 +71,10 @@ uint64_t qt_session_video_frames(const struct qt_session *s);
 uint64_t qt_session_audio_packets(const struct qt_session *s);
 int qt_session_releases(const struct qt_session *s);
 unsigned qt_session_bad_samples(const struct qt_session *s);
+/* the device stopped our picture clock and has neither started its pictures again (a new picture clock) nor sent any
+ * since: when (now_ns of that feed); 0 otherwise */
+uint64_t qt_session_video_stopped_ns(const struct qt_session *s);
+/* how many STOPs came for: [0] the sound clock, [1] the picture clock, [2] the time clock, [3] another clock */
+void qt_session_stops(const struct qt_session *s, unsigned out[4]);
 
 #endif

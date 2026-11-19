@@ -27,6 +27,13 @@ struct qt_session {
 	uint64_t epoch_ns, now_ns;
 	bool epoch_set;
 	uint64_t dev_audio_clock, dev_video_clock;
+	/* the clocks we gave the device (a STOP names one of them: "stop that clock of yours", not "the capture
+	 * ended"), and the ones its pictures and sound carry */
+	uint64_t our_audio_clock, our_video_clock, our_main_clock, feed_clock, eat_clock;
+	unsigned stops[4];         /* STOPs for: the sound clock, the picture clock, the time clock, another one */
+	uint64_t video_stop_ns;    /* the device stopped the picture clock then (0: not, or pictures came again) */
+	int32_t eat_timescale;     /* the time scale of the sound's timestamps (the SKEW answer) */
+	unsigned noted;            /* messages written to the log after the first ones (trace) */
 	uint64_t video_frames, audio_packets, replies;
 	int releases;
 	unsigned bad_samples, logged, traced;
@@ -46,6 +53,7 @@ struct qt_session {
 	double rate;
 	int channels, bits;
 	uint32_t flags;
+	int sample_bytes; /* the bytes one sample of one channel takes (its bits may fill fewer) */
 
 	uint8_t *vout, *aout;
 	size_t vout_cap, aout_cap;
@@ -379,11 +387,18 @@ static void reply_skew(struct qt_out *o, uint64_t correlation, double skew)
 
 static void set_audio_format(struct qt_session *s, const uint8_t *asbd)
 {
+	/* AudioStreamBasicDescription: rate (f64), format, flags, bytes per packet, frames per packet, bytes per frame,
+	 * channels, bits per channel */
 	double rate = rdf64(asbd);
-	uint32_t format = rd32(asbd + 8), flags = rd32(asbd + 12);
+	uint32_t format = rd32(asbd + 8), flags = rd32(asbd + 12), frame_bytes = rd32(asbd + 24);
 	uint32_t channels = rd32(asbd + 28), bits = rd32(asbd + 32);
+	bool is_float = (flags & 1u) != 0, separate = (flags & 0x20u) != 0;
+	/* one channel's sample: interleaved, a frame holds all channels; non-interleaved, one */
+	uint32_t sample_bytes = channels ? (separate ? frame_bytes : frame_bytes / channels) : 0;
+	if (sample_bytes == 0 || sample_bytes > 4 || sample_bytes * 8 < bits)
+		sample_bytes = (bits + 7) / 8;
 	if (format != FCC('l', 'p', 'c', 'm') || !(rate >= 8000.0 && rate <= 192000.0) || channels < 1 || channels > 8 ||
-	    (bits != 16 && bits != 32)) {
+	    bits < 8 || bits > 32 || sample_bytes > 4 || (is_float && (bits != 32 || sample_bytes != 4))) {
 		char f[5];
 		code_text(format, f);
 		say(s, "sound format not used: %s, %.0f Hz, %u channels, %u bits", f, rate, (unsigned)channels,
@@ -397,6 +412,19 @@ static void set_audio_format(struct qt_session *s, const uint8_t *asbd)
 	s->channels = (int)channels;
 	s->bits = (int)bits;
 	s->flags = flags;
+	s->sample_bytes = (int)sample_bytes;
+}
+
+/* SKEW: how many ticks our sound clock made while the device's made one second's worth (the time scale of its sound
+ * timestamps, the sample rate): the same, as the sound is played at the pace it comes. Follows the sound format when
+ * it changes (an app with the microphone on can switch it) */
+static double skew_value(const struct qt_session *s)
+{
+	if (s->eat_timescale >= 8000 && s->eat_timescale <= 192000)
+		return (double)s->eat_timescale;
+	if (s->rate >= 8000.0 && s->rate <= 192000.0)
+		return s->rate;
+	return 48000.0;
 }
 
 static void append_nal(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *nal, size_t n, bool *ok)
@@ -659,44 +687,60 @@ bad:
 		say(s, "a picture with a broken NAL length was skipped");
 }
 
+/* one sample as a 16-bit value: little- or big-endian, integer (any width up to 32 bits, aligned high or low in its
+ * bytes) or 32-bit float */
+static int16_t sample16(const uint8_t *p, int bytes, int bits, uint32_t flags)
+{
+	bool big_endian = (flags & 2u) != 0, high = (flags & 0x10u) != 0;
+	uint32_t u = 0;
+	for (int i = 0; i < bytes; i++)
+		u |= (uint32_t)p[big_endian ? i : bytes - 1 - i] << (8 * (bytes - 1 - i));
+	if (flags & 1u) {
+		float f;
+		memcpy(&f, &u, sizeof(f));
+		if (!(f == f))
+			f = 0.0f;
+		f = f > 1.0f ? 1.0f : f < -1.0f ? -1.0f : f;
+		return (int16_t)(f * 32767.0f);
+	}
+	int container = bytes * 8;
+	if (bits < container && high)
+		u >>= container - bits; /* (the bits at the top of the bytes) */
+	else if (bits < container)
+		u &= bits >= 32 ? 0xffffffffu : (1u << bits) - 1u;
+	/* the value to the top of a 32-bit number (its sign there), then its top 16 bits */
+	int32_t v = (int32_t)(u << (32 - bits));
+	return (int16_t)(v >> 16);
+}
+
 static void deliver_audio(struct qt_session *s, const uint8_t *data, size_t n)
 {
 	if (n == 0 || !s->sink.audio)
 		return;
 	int ch = s->channels >= 1 && s->channels <= 8 ? s->channels : 2;
-	int bits = s->bits == 32 ? 32 : 16;
+	int bits = s->bits >= 8 && s->bits <= 32 ? s->bits : 16;
+	int bytes = s->sample_bytes >= 1 && s->sample_bytes <= 4 && s->sample_bytes * 8 >= bits ? s->sample_bytes :
+														 (bits + 7) / 8;
 	double rate = s->rate > 0 ? s->rate : 48000.0;
-	bool is_float = (s->flags & 1u) != 0, big_endian = (s->flags & 2u) != 0;
-	size_t in_frame = (size_t)ch * (size_t)(bits / 8);
-	size_t frames = n / in_frame;
+	bool separate = (s->flags & 0x20u) != 0; /* each channel's samples one after another */
+	size_t frames = n / ((size_t)ch * (size_t)bytes);
 	if (frames == 0 || frames > 1000000)
 		return;
-	if (!grow(&s->aout, &s->aout_cap, frames * (size_t)ch * 2))
+	/* (more than two channels: the first two, left and right, are played) */
+	int out_ch = ch > 2 ? 2 : ch;
+	if (!grow(&s->aout, &s->aout_cap, frames * (size_t)out_ch * 2))
 		return;
 	uint8_t *o = s->aout;
-	for (size_t i = 0; i < frames * (size_t)ch; i++) {
-		const uint8_t *p = data + i * (size_t)(bits / 8);
-		int16_t v;
-		if (bits == 16) {
-			v = (int16_t)(big_endian ? (uint16_t)((p[0] << 8) | p[1]) : (uint16_t)(p[0] | (p[1] << 8)));
-		} else {
-			uint32_t u = big_endian ? ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3] :
-						  rd32(p);
-			if (is_float) {
-				float f;
-				memcpy(&f, &u, sizeof(f));
-				if (!(f == f))
-					f = 0.0f;
-				f = f > 1.0f ? 1.0f : f < -1.0f ? -1.0f : f;
-				v = (int16_t)(f * 32767.0f);
-			} else {
-				v = (int16_t)((int32_t)u >> 16);
-			}
+	for (size_t i = 0; i < frames; i++) {
+		for (int c = 0; c < out_ch; c++) {
+			size_t at = separate ? ((size_t)c * frames + i) * (size_t)bytes : (i * (size_t)ch + (size_t)c) * (size_t)bytes;
+			int16_t v = sample16(data + at, bytes, bits, s->flags);
+			size_t k = (i * (size_t)out_ch + (size_t)c) * 2;
+			o[k] = (uint8_t)((uint16_t)v);
+			o[k + 1] = (uint8_t)((uint16_t)v >> 8);
 		}
-		o[i * 2] = (uint8_t)((uint16_t)v);
-		o[i * 2 + 1] = (uint8_t)((uint16_t)v >> 8);
 	}
-	s->sink.audio(s->sink.ctx, s->aout, (int)frames, ch, (int)(rate + 0.5));
+	s->sink.audio(s->sink.ctx, s->aout, (int)frames, out_ch, (int)(rate + 0.5));
 }
 
 /* FEED / EAT!: an envelope around a serialized CMSampleBuffer */
@@ -718,6 +762,9 @@ static void handle_media(struct qt_session *s, const uint8_t *p, size_t n, bool 
 		if (code == FCC('s', 'd', 'a', 't')) {
 			sdat = sb + off + 8;
 			sdat_len = clen - 8;
+		} else if (code == FCC('o', 'p', 't', 's') && !video && clen >= 8 + 24) {
+			/* the presentation time: value (8), time scale (4), flags (4), epoch (8) */
+			s->eat_timescale = (int32_t)rd32(sb + off + 8 + 8);
 		} else if (code == FCC('f', 'd', 's', 'c')) {
 			fdsc = sb + off + 8;
 			fdsc_len = clen - 8;
@@ -728,10 +775,16 @@ static void handle_media(struct qt_session *s, const uint8_t *p, size_t n, bool 
 	if (fdsc)
 		parse_format(s, fdsc, fdsc_len);
 	if (video) {
+		s->feed_clock = rd64(p + 4);
+		/* (a picture well after a STOP of the picture clock: the pictures go on; one already on its way does not
+		 * count) */
+		if (s->video_stop_ns && s->now_ns - s->video_stop_ns > 300000000ull)
+			s->video_stop_ns = 0;
 		s->video_frames++;
 		if (sdat)
 			deliver_video(s, sdat, sdat_len);
 	} else {
+		s->eat_clock = rd64(p + 4);
 		s->audio_packets++;
 		if (sdat)
 			deliver_audio(s, sdat, sdat_len);
@@ -753,14 +806,23 @@ static void handle_sync(struct qt_session *s, const uint8_t *p, size_t n, struct
 	if (subtype == FCC('c', 'w', 'p', 'a')) {
 		if (n < 32)
 			return;
+		bool again = s->state == QT_STREAMING || s->state == QT_NEGOTIATING;
+		bool releasing = s->state == QT_STOPPING || s->state == QT_STOPPED;
 		s->dev_audio_clock = rd64(p + 24);
+		s->our_audio_clock = s->dev_audio_clock + 0x1000;
+		if (releasing) {
+			/* (while the release goes on: answered, nothing asked for again) */
+			reply_clock(o, correlation, s->our_audio_clock);
+			return;
+		}
 		make_hpd1(s, o);
-		reply_clock(o, correlation, s->dev_audio_clock + 0x1000);
+		reply_clock(o, correlation, s->our_audio_clock);
 		if (s->opt.audio)
 			make_hpa1(o, s->dev_audio_clock);
-		s->state = QT_NEGOTIATING;
-		say(s, "the device's clock arrived; display %dx%d%s and sound requested", s->opt.width, s->opt.height,
-		    s->opt.valeria ? " (capture mode)" : "");
+		if (s->state == QT_WAIT_PING || s->state == QT_WAIT_CLOCK)
+			s->state = QT_NEGOTIATING;
+		say(s, "the device's clock arrived%s; display %dx%d%s and sound requested", again ? " again" : "",
+		    s->opt.width, s->opt.height, s->opt.valeria ? " (capture mode)" : "");
 	} else if (subtype == FCC('a', 'f', 'm', 't')) {
 		if (n < 64)
 			return;
@@ -770,20 +832,43 @@ static void handle_sync(struct qt_session *s, const uint8_t *p, size_t n, struct
 		if (n < 32)
 			return;
 		s->dev_video_clock = rd64(p + 24);
+		s->our_video_clock = s->dev_video_clock + 0x1000af;
+		s->video_stop_ns = 0;
+		if (s->state == QT_STOPPING || s->state == QT_STOPPED) {
+			/* (while the release goes on: answered, no picture asked for) */
+			reply_clock(o, correlation, s->our_video_clock);
+			return;
+		}
+		if (s->video_frames)
+			say(s, "the device started its pictures again (new picture clock)");
 		make_need(o, s->dev_video_clock);
-		reply_clock(o, correlation, s->dev_video_clock + 0x1000af);
+		reply_clock(o, correlation, s->our_video_clock);
 	} else if (subtype == FCC('c', 'l', 'o', 'k')) {
-		reply_clock(o, correlation, clock + 0x10000);
+		s->our_main_clock = clock + 0x10000;
+		reply_clock(o, correlation, s->our_main_clock);
 	} else if (subtype == FCC('t', 'i', 'm', 'e')) {
 		reply_time(o, correlation, s->now_ns - s->epoch_ns);
 	} else if (subtype == FCC('s', 'k', 'e', 'w')) {
-		reply_skew(o, correlation, 48000.0);
+		reply_skew(o, correlation, skew_value(s));
 	} else if (subtype == FCC('g', 'o', '!', ' ')) {
 		reply_zero(o, correlation);
 	} else if (subtype == FCC('s', 't', 'o', 'p')) {
+		/* "stop this clock of yours": answered, and nothing else changes. The device sends it when one of its
+		 * streams ends or starts over (its sound when an app turns the microphone on; both at the release), and the
+		 * pictures go on as long as they are asked for (NEED), as in quicktime_video_hack */
 		reply_zero(o, correlation);
-		s->state = QT_STOPPED;
-		say(s, "the device stopped the capture");
+		int kind = clock && (clock == s->our_audio_clock || clock == s->eat_clock)   ? 0 :
+			   clock && (clock == s->our_video_clock || clock == s->feed_clock) ? 1 :
+			   clock && clock == s->our_main_clock                               ? 2 :
+											      3;
+		s->stops[kind]++;
+		if (kind == 1 && s->state == QT_STREAMING)
+			s->video_stop_ns = s->now_ns ? s->now_ns : 1;
+		static const char *const names[4] = {"sound", "picture", "time", "unknown"};
+		unsigned all = s->stops[0] + s->stops[1] + s->stops[2] + s->stops[3];
+		if (all <= 12 || all % 50 == 0)
+			say(s, "the device stopped our %s clock (stop %u)%s", names[kind], all,
+			    s->state == QT_STREAMING ? "; the stream goes on" : "");
 	} else {
 		char c[5];
 		code_text(subtype, c);
@@ -833,16 +918,47 @@ void qt_session_trace_out(struct qt_session *s, const struct qt_out *o)
 	}
 }
 
+/* after the first messages (trace): the rarer ones still go to the log, a limited number of them (what the device
+ * did in the middle of a stream: a microphone turned on, a format changed...); pictures, sound, NEED, TIME, SKEW and
+ * replies do not */
+#define QT_NOTE_MAX 80
+
+static void note(struct qt_session *s, const uint8_t *p, size_t n)
+{
+	if (s->traced < QT_TRACE_MAX || s->noted >= QT_NOTE_MAX || n < 4)
+		return;
+	uint32_t code = rd32(p), sub = n >= 16 ? rd32(p + 12) : 0;
+	if (code != FCC('p', 'i', 'n', 'g') && n < 16)
+		return;
+	if (code == FCC('s', 'y', 'n', 'c')) {
+		if (sub == FCC('t', 'i', 'm', 'e') || sub == FCC('s', 'k', 'e', 'w') || sub == FCC('s', 't', 'o', 'p'))
+			return; /* (STOP has its own line) */
+	} else if (code == FCC('a', 's', 'y', 'n')) {
+		if (sub == FCC('f', 'e', 'e', 'd') || sub == FCC('e', 'a', 't', '!'))
+			return;
+	} else if (code != FCC('p', 'i', 'n', 'g')) {
+		return;
+	}
+	s->noted++;
+	char c[5], sb[5];
+	code_text(code, c);
+	code_text(sub, sb);
+	if (code == FCC('p', 'i', 'n', 'g'))
+		say(s, "from the device: %s, %zu bytes", c, n + 4);
+	else
+		say(s, "from the device: %s %s, %zu bytes", c, sb, n + 4);
+}
+
 static void process(struct qt_session *s, const uint8_t *p, size_t n, struct qt_out *o)
 {
 	if (n < 4)
 		return;
 	trace(s, "from the device", p, n);
+	note(s, p, n);
 	uint32_t code = rd32(p);
 	if (code == FCC('p', 'i', 'n', 'g')) {
 		qt_make_ping(o);
-		/* (after the device's own stop it may start over on the same pipe: a new hello) */
-		if (s->state == QT_WAIT_PING || s->state == QT_STOPPED)
+		if (s->state == QT_WAIT_PING)
 			s->state = QT_WAIT_CLOCK;
 	} else if (code == FCC('s', 'y', 'n', 'c')) {
 		if (n >= 24)
@@ -985,6 +1101,16 @@ size_t qt_session_missing(const struct qt_session *s)
 		return 4 - s->rlen;
 	uint32_t plen = rd32(s->rbuf);
 	return plen > s->rlen ? plen - s->rlen : 0;
+}
+
+uint64_t qt_session_video_stopped_ns(const struct qt_session *s)
+{
+	return s->video_stop_ns;
+}
+
+void qt_session_stops(const struct qt_session *s, unsigned out[4])
+{
+	memcpy(out, s->stops, sizeof(s->stops));
 }
 
 enum qt_state qt_session_state(const struct qt_session *s)

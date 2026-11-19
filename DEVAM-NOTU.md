@@ -85,9 +85,17 @@ Log'a göre karar:
 - 1.3.8/1.3.9 denemesi: KABLOLU YANSITMA ÇALIŞIYOR (WinUSB, 2420x1668 H.264, ses, ~55 fps). 1.3.10: hızlı şarj
   yansıtma sırasında da gönderilir; kalite ayarları yalnızca Wi-Fi (kabloyla iPad kendi boyutunda gönderir).
 - log 12: iPad oyunda mikrofon açılınca / ayarlarda 'stop' gönderiyor; eski yolla ~11 s kopuyordu. 1.3.12:
-  aynı boruda yeniden başlaması bekleniyor. Denemede log'da "started the capture again" aranmalı.
+  aynı boruda yeniden başlaması bekleniyor. (1.3.13'te geri alındı, aşağıya bakın.)
+- log 13 (1.3.12): PING ile yeniden başlatma döngüye girdi (20 s'de 8 kopma), ses yok. ASIL NEDEN: SYNC STOP
+  "yakalama bitti" değil, "şu saatini durdur" demek (qvh belgesi 3.2.9; qvh yanıtlayıp devam eder). 1.3.13: STOP
+  durumu değiştirmez, NEED sürer; STOP'un saati log'a yazılır. Mikrofon açıkken iOS ses vermez (voice processing).
+  Denemede bakılacak: "the device stopped our ... clock", "no sound from the device", "sound comes again",
+  oturum sonundaki "clocks the device stopped" sayıları.
 
 ## Yapılmaması gerekenler
+
+- SYNC STOP'u oturumun sonu sayma; STOP gelince NEED'i kesme; akış sırasında PING gönderip el sıkışmayı baştan
+  başlatma (1.3.11 ve 1.3.12'deki kopmalar bundan).
 
 - Apple'ın sürücüsü cihazı çalıştırırken libusb0 üzerinden `usb_set_configuration` (mavi ekran, 1.3.4).
 - `usb_clear_halt` akış başında (cihaz susuyor, 1.3.3).

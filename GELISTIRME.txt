@@ -305,6 +305,20 @@ Program (elle; her yeni sürümde):
   kapatılmaz: aynı boruda yeniden başlaması beklenir (yeni PING -> cwpa -> resimler, aynı oturum nesnesiyle).
   1,5 s'de başlamazsa bizden bir PING; 8 s'de başlamazsa eski yol (bırak, olağan yapılandırma, yeniden geç: ~11 s).
   Bir akışta en çok 30 kez. Test: tests/qtproto_test.c "restart".
+- 1.3.13: SYNC STOP yanlış anlaşılıyordu. quicktime_video_hack'in belgesine ve koduna göre STOP "şu saatini durdur"
+  demek (yakalama bitti değil): yanıtlanır, başka hiçbir şey değişmez, her resimden sonra NEED gönderilmeye devam
+  edilir. Eskiden STOP gelince NEED kesiliyordu: görüntü donuyordu; 1.3.12'deki PING ile yeniden başlatma da cihazı
+  baştan el sıkışmaya sokup yeni STOP'lara yol açıyordu (log 13: 20 saniyede 8 kez kopma). İkisi de kaldırıldı.
+  Oyunda mikrofon açılınca iPad SES saatini durdurur (kayıtlı mesajlarda da STOP'un saati SKEW'inkiyle aynı): iOS,
+  ses işleme (voice processing) açıkken ekran yakalamaya uygulama sesi vermiyor; mikrofon kapanınca ses yeniden gelir
+  (cihaz yeni CWPA gönderirse yanıtlanır: HPD1 + yanıt + HPA1, qvh gibi).
+  STOP hangi saat için geldiyse log'a yazılır (ses / resim / zaman / bilinmeyen) ve oturum sonunda sayılır. Yalnızca
+  RESİM saati durdurulur ve 4 s içinde ne yeni resim saati (CVRP) ne de resim gelirse oturum yeniden kurulur.
+  SKEW yanıtı sesin zaman ölçeği (EAT 'opts' zaman damgası, kayıtlı mesajlarda 48000), yoksa ses biçimi, yoksa 48000.
+  Ses çözme genelleştirildi: 8-32 bit tamsayı (yukarı/aşağı hizalı), 32 bit float, kanal kanal (non-interleaved),
+  2'den fazla kanalda ilk ikisi. Akış sırasında ses ya da resim 3 s gelmezse ve yeniden gelince log'a yazılır.
+  İlk 40 mesajdan sonra da seyrek mesajlar (CWPA, CVRP, AFMT, CLOK, PING, SPRP, SRAT, TJMP, TBAS, RELS) log'a yazılır
+  (en çok 80).
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu
