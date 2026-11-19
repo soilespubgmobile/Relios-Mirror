@@ -841,7 +841,8 @@ static void process(struct qt_session *s, const uint8_t *p, size_t n, struct qt_
 	uint32_t code = rd32(p);
 	if (code == FCC('p', 'i', 'n', 'g')) {
 		qt_make_ping(o);
-		if (s->state == QT_WAIT_PING)
+		/* (after the device's own stop it may start over on the same pipe: a new hello) */
+		if (s->state == QT_WAIT_PING || s->state == QT_STOPPED)
 			s->state = QT_WAIT_CLOCK;
 	} else if (code == FCC('s', 'y', 'n', 'c')) {
 		if (n >= 24)

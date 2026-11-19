@@ -301,6 +301,10 @@ Program (elle; her yeni sürümde):
   kaydı açıkken iPad 30 fps gönderir (iPadOS'un sınırı).
 - 1.3.11: Kayıt ayarlarında "Çözünürlük": Özgün / 720p / 1080p / 1440p (kısa kenar; oran korunur, büyütülmez).
   Ayar "kayit_cozunurluk=" satırında. Görüntü kayıtta küçültülür (sws), yansıtma ve sanal kamera değişmez.
+- 1.3.12: iPad yakalamayı kendisi durdurduğunda (sync stop: oyunda mikrofon açılınca, bazı ekranlarda) bağlantı
+  kapatılmaz: aynı boruda yeniden başlaması beklenir (yeni PING -> cwpa -> resimler, aynı oturum nesnesiyle).
+  1,5 s'de başlamazsa bizden bir PING; 8 s'de başlamazsa eski yol (bırak, olağan yapılandırma, yeniden geç: ~11 s).
+  Bir akışta en çok 30 kez. Test: tests/qtproto_test.c "restart".
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

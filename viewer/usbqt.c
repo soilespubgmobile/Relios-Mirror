@@ -1558,6 +1558,9 @@ static enum end_reason stream(struct pipe *h, const struct capture_iface *q, boo
 	ULONGLONG start = GetTickCount64(), last_data = start, answered = 0;
 	bool nudged = false, greeted = false, pinged_again = false, reselected = false, got_any = false;
 	unsigned reads_logged = 0; /* (the first reads in the log: how the device's messages come) */
+	ULONGLONG stopped_at = 0;      /* the device said stop (and has not sent pictures again since) */
+	bool pinged_after_stop = false;
+	unsigned restarts = 0;
 	for (;;) {
 		if (stopping()) {
 			why = END_STOP;
@@ -1603,10 +1606,40 @@ static enum end_reason stream(struct pipe *h, const struct capture_iface *q, boo
 				set_state(USBQT_STREAMING);
 				ulog("pictures arrive");
 			}
-			if (st == QT_STOPPED) {
+			if (st == QT_STOPPED && !stopped_at) {
+				/* the device stopped on its own (an app turned the microphone on, a screen the device does
+				 * not share...): it usually starts over by itself; waited for here, on the same pipe,
+				 * instead of giving the device back and switching it again (some ten seconds) */
+				if (restarts >= 30) {
+					why = END_DEVICE_STOPPED;
+					break;
+				}
+				stopped_at = now ? now : 1;
+				pinged_after_stop = false;
+				ulog("the device stopped the capture: waiting for it to start again");
+			} else if (stopped_at && st == QT_STREAMING) {
+				restarts++;
+				ulog("the device started the capture again after %llu ms (%u. time)",
+				     (unsigned long long)(now - stopped_at), restarts);
+				stopped_at = 0;
+			}
+		}
+		if (stopped_at) {
+			enum qt_state sst = qt_session_state(s);
+			if (sst == QT_STOPPED && !pinged_after_stop && now - stopped_at > 1500) {
+				/* (not started over by itself: a hello of ours, as at the start) */
+				pinged_after_stop = true;
+				qt_out_clear(&out);
+				qt_make_ping(&out);
+				bool sent = pipe_write(h, out.p, out.n);
+				ulog("the device has not started again: hello sent (%s)", sent ? "sent" : pipe_error(h));
+			}
+			if (now - stopped_at > 8000) {
+				ulog("the device did not start again in 8 s");
 				why = END_DEVICE_STOPPED;
 				break;
 			}
+			continue;
 		}
 		/* (after every read: a device that keeps sending sound but no picture is not waited for forever) */
 		enum qt_state st = qt_session_state(s);

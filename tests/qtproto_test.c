@@ -322,6 +322,32 @@ int main(int argc, char **argv)
 		CHECK(qt_session_releases(s) == 1, "whole stream: %d releases", qt_session_releases(s));
 		CHECK(qt_session_state(s) == QT_STOPPED, "whole stream: state %d", (int)qt_session_state(s));
 		qt_session_free(s);
+		/* after its own stop the device starts over on the same pipe: hello, clock, pictures */
+		{
+			struct seen again_seen = {0};
+			s = session(&again_seen);
+			struct qt_out ping = {0}, o3 = {0};
+			CHECK(qt_session_feed(s, all, total, &o3, 1000), "restart: the first stream failed");
+			qt_make_ping(&ping);
+			CHECK(qt_session_feed(s, ping.p, ping.n, &o3, 2000), "restart: hello not taken");
+			CHECK(qt_session_state(s) == QT_WAIT_CLOCK, "restart: state %d after the hello",
+			      (int)qt_session_state(s));
+			const char *again[] = {"cwpa-request1", "cvrp-request", "asyn-feed"};
+			int videos = again_seen.videos;
+			for (int i = 0; i < 3; i++) {
+				size_t l;
+				uint8_t *r = load(again[i], &l);
+				CHECK(qt_session_feed(s, r, l, &o3, 2000), "restart: %s not taken", again[i]);
+				free(r);
+			}
+			CHECK(qt_session_state(s) == QT_STREAMING, "restart: state %d after pictures",
+			      (int)qt_session_state(s));
+			CHECK(again_seen.videos == videos + 1, "restart: %d pictures (%d expected)", again_seen.videos,
+			      videos + 1);
+			qt_out_free(&ping);
+			qt_out_free(&o3);
+		}
+		qt_session_free(s);
 		static const size_t sizes[] = {1, 2, 3, 7, 13, 512, 4096, 16384, 65536, 100000};
 		for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
 			struct seen cut = {0};
