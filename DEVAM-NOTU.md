@@ -91,11 +91,17 @@ Log'a göre karar:
   durumu değiştirmez, NEED sürer; STOP'un saati log'a yazılır. Mikrofon açıkken iOS ses vermez (voice processing).
   Denemede bakılacak: "the device stopped our ... clock", "no sound from the device", "sound comes again",
   oturum sonundaki "clocks the device stopped" sayıları.
+- log 14 (1.3.13): STOP düzeltmesi doğrulandı (ses saati STOP + go!, akış sürdü, ses paketleri geldi). Kullanıcı:
+  iPad kendi ekranını kaydederken kabloda 30 fps ve takılma. 1.3.14: resimler ayrı iş parçacığında çözülüyor (NEED
+  artık beklemiyor). Denemede bakılacak: "USB: N pictures a second" satırları ve oturum sonundaki "USB pictures:"
+  satırı (çözme süresi, kuyruk, atlanan). Hâlâ 30 ve düzensizse sıradaki adım: resimleri cihazın zaman damgasına
+  (FEED'deki stia/opts) göre aralıklı göstermek (küçük bir gecikmeyle).
 
 ## Yapılmaması gerekenler
 
 - SYNC STOP'u oturumun sonu sayma; STOP gelince NEED'i kesme; akış sırasında PING gönderip el sıkışmayı baştan
   başlatma (1.3.11 ve 1.3.12'deki kopmalar bundan).
+- Kablonun resimlerini USB iş parçacığında çözme: NEED gecikir, cihaz resim kaçırır (1.3.14'e kadar).
 
 - Apple'ın sürücüsü cihazı çalıştırırken libusb0 üzerinden `usb_set_configuration` (mavi ekran, 1.3.4).
 - `usb_clear_halt` akış başında (cihaz susuyor, 1.3.3).

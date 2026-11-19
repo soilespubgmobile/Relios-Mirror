@@ -774,6 +774,8 @@ static void handle_media(struct qt_session *s, const uint8_t *p, size_t n, bool 
 	}
 	if (fdsc)
 		parse_format(s, fdsc, fdsc_len);
+	/* (during the release what still comes is counted, not shown or played: the window was cleared already) */
+	bool releasing = s->state == QT_STOPPING || s->state == QT_STOPPED;
 	if (video) {
 		s->feed_clock = rd64(p + 4);
 		/* (a picture well after a STOP of the picture clock: the pictures go on; one already on its way does not
@@ -781,12 +783,12 @@ static void handle_media(struct qt_session *s, const uint8_t *p, size_t n, bool 
 		if (s->video_stop_ns && s->now_ns - s->video_stop_ns > 300000000ull)
 			s->video_stop_ns = 0;
 		s->video_frames++;
-		if (sdat)
+		if (sdat && !releasing)
 			deliver_video(s, sdat, sdat_len);
 	} else {
 		s->eat_clock = rd64(p + 4);
 		s->audio_packets++;
-		if (sdat)
+		if (sdat && !releasing)
 			deliver_audio(s, sdat, sdat_len);
 	}
 	return;

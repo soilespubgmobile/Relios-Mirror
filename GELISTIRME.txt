@@ -319,6 +319,19 @@ Program (elle; her yeni sürümde):
   2'den fazla kanalda ilk ikisi. Akış sırasında ses ya da resim 3 s gelmezse ve yeniden gelince log'a yazılır.
   İlk 40 mesajdan sonra da seyrek mesajlar (CWPA, CVRP, AFMT, CLOK, PING, SPRP, SRAT, TJMP, TBAS, RELS) log'a yazılır
   (en çok 80).
+- 1.3.13 denemesi (log 14): mikrofon / iPad kaydı sırasında iPad ses saatini durdurup hemen yeniden başlatıyor
+  (STOP + "go!"); yansıtma 5 dakikadan uzun kesintisiz sürdü, ses paketleri de gelmeye devam etti.
+- 1.3.14: Kablonun resimleri kendi iş parçacığında ("usb pictures") çözülür. Cihaz bir sonraki resmi ancak NEED ile
+  istenince gönderir; NEED, USB iş parçacığının geri çağrısı dönünce gider. Çözme oradayken (ekran kartı, resmin
+  belleğe alınması, pencere, kayıt) her istek birkaç ms gecikiyordu: normalde ortalama 54-56 resim/s (60 değil);
+  iPad kendi ekranını da kaydederken resimleri kaçırıp 30'a düşüyor, düzensiz geliyordu (aynı log'da Wi-Fi'de iPad
+  60 resim/s bildiriyor). Artık USB iş parçacığı resmi yalnızca kuyruğa kopyalar (en çok 32 resim / 64 MB); kuyruk
+  doluysa bekler (cihaz daha az gönderir), bir saniye dolu kalırsa boşaltılır ve bir sonraki anahtar kareye kadar
+  resim atlanır (bozuk görüntü olmaz). Oturum bitince kuyruk boşaltılır, çözülmekte olan resim bitirilir, sonra
+  pencere temizlenir. Bırakma (release) sırasında gelen resim ve ses artık gösterilmez/çalınmaz (qtproto.c).
+  Log: "USB: N pictures a second" (5 s'lik pencerede, 8'den çok değişince) ve oturum sonunda "USB pictures: ...
+  decoded (ortalama/en çok ms), at most N waiting, dropped, gaps over 50/100 ms". İş parçacığı açılamazsa eskisi
+  gibi doğrudan çözülür.
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

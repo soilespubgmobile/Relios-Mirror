@@ -1977,13 +1977,156 @@ static int err_thread(void *unused)
 
 /* what usbqt.c delivers, from its own thread */
 static struct {
-	struct decoder dec; /* (under A.media_mutex) */
+	struct decoder dec; /* (the decoding thread's own: uq_thread) */
 	bool dec_hw;
 	SDL_AudioStream *resample; /* the device's sound (16-bit, mostly 48 kHz) to float 44.1 kHz stereo, as AirPlay's */
 	int in_rate, in_ch;
 	float *buf;
 	size_t buf_cap;
 } UV;
+
+/* The cable's pictures are decoded on a thread of their own. The device sends its next picture only when it is asked
+ * for one (NEED), and the USB thread asks only after this callback returns: decoding here (the graphics card, the
+ * picture brought back to memory, the window, the recording) held every request back by some milliseconds, and a
+ * busy device (its own screen recording on) then missed frames: 30 a second, unevenly. Now the USB thread only copies
+ * the picture into this queue and goes on. A full queue holds it back (the device then sends fewer); one that stays
+ * full for a second is emptied, and pictures are skipped up to the next key frame (no broken pictures) */
+#define UQ_ITEMS 32
+#define UQ_BYTES (64u * 1024u * 1024u)
+
+struct uq_item {
+	uint8_t *data; /* Annex B, followed by AV_INPUT_BUFFER_PADDING_SIZE zero bytes */
+	size_t len;
+	bool h265;
+};
+
+static struct {
+	SDL_mutex *mutex;
+	SDL_cond *cond; /* a picture to decode, room in the queue, or the thread idle again */
+	struct uq_item items[UQ_ITEMS];
+	int head, count;
+	size_t bytes;
+	bool busy, quit, want_key;
+	SDL_Thread *thread;
+	/* for the log, per session: how the pictures came and how long decoding took */
+	uint64_t last_t, decode_ns, decode_max_ns;
+	unsigned arrived, decoded, dropped, deepest, gaps50, gaps100;
+	uint64_t window_t;
+	unsigned window_n, fps_lines;
+	int shown_fps;
+} UQ = {.shown_fps = -1};
+
+/* a key frame (H.264 IDR, H.265 IRAP) among the NAL units */
+static bool annexb_key(const uint8_t *d, size_t n, bool h265)
+{
+	for (size_t i = 0; i + 3 < n; i++) {
+		if (d[i] != 0 || d[i + 1] != 0 || d[i + 2] != 1)
+			continue;
+		int type = h265 ? (d[i + 3] >> 1) & 0x3f : d[i + 3] & 0x1f;
+		if (h265 ? type >= 16 && type <= 21 : type == 5)
+			return true;
+		i += 2;
+	}
+	return false;
+}
+
+static void usb_decode(const struct uq_item *it)
+{
+	if (!UV.dec.pkt) {
+		UV.dec.pkt = av_packet_alloc();
+		UV.dec.frame = av_frame_alloc();
+		UV.dec.sw = av_frame_alloc();
+	}
+	if (UV.dec.vdec && UV.dec_hw != A.hw_decode)
+		avcodec_free_context(&UV.dec.vdec); /* (decoding was switched between the graphics card and the processor) */
+	UV.dec_hw = A.hw_decode;
+	if (UV.dec.pkt && UV.dec.frame && UV.dec.sw)
+		decode_video(&UV.dec, it->data, it->len, it->h265);
+}
+
+/* the decoding thread: UV.dec is its own */
+static int uq_thread(void *unused)
+{
+	(void)unused;
+	SDL_LockMutex(UQ.mutex);
+	for (;;) {
+		while (!UQ.quit && UQ.count == 0)
+			SDL_CondWait(UQ.cond, UQ.mutex);
+		if (UQ.quit)
+			break;
+		struct uq_item it = UQ.items[UQ.head];
+		UQ.head = (UQ.head + 1) % UQ_ITEMS;
+		UQ.count--;
+		UQ.bytes -= it.len;
+		UQ.busy = true;
+		SDL_CondBroadcast(UQ.cond);
+		SDL_UnlockMutex(UQ.mutex);
+		uint64_t t0 = now_ns();
+		usb_decode(&it);
+		uint64_t took = now_ns() - t0;
+		free(it.data);
+		SDL_LockMutex(UQ.mutex);
+		UQ.busy = false;
+		UQ.decoded++;
+		UQ.decode_ns += took;
+		if (took > UQ.decode_max_ns)
+			UQ.decode_max_ns = took;
+		SDL_CondBroadcast(UQ.cond);
+	}
+	while (UQ.count > 0) {
+		free(UQ.items[UQ.head].data);
+		UQ.head = (UQ.head + 1) % UQ_ITEMS;
+		UQ.count--;
+	}
+	UQ.bytes = 0;
+	SDL_UnlockMutex(UQ.mutex);
+	return 0;
+}
+
+/* (under UQ.mutex) what waits is dropped */
+static unsigned uq_drop_locked(void)
+{
+	unsigned n = (unsigned)UQ.count;
+	while (UQ.count > 0) {
+		free(UQ.items[UQ.head].data);
+		UQ.head = (UQ.head + 1) % UQ_ITEMS;
+		UQ.count--;
+	}
+	UQ.bytes = 0;
+	UQ.dropped += n;
+	return n;
+}
+
+/* (under UQ.mutex) a session's figures start from nothing */
+static void uq_reset_locked(void)
+{
+	UQ.last_t = UQ.decode_ns = UQ.decode_max_ns = UQ.window_t = 0;
+	UQ.arrived = UQ.decoded = UQ.dropped = UQ.deepest = UQ.gaps50 = UQ.gaps100 = UQ.window_n = UQ.fps_lines = 0;
+	UQ.shown_fps = -1;
+	UQ.want_key = false;
+}
+
+/* the cable's mirroring ended: what waits is dropped, the picture being decoded is finished (it is not shown after
+ * the window was cleared), and what the session was like goes to the log */
+static void uq_end_session(void)
+{
+	if (!UQ.mutex)
+		return;
+	SDL_LockMutex(UQ.mutex);
+	uq_drop_locked();
+	Uint32 until = SDL_GetTicks() + 2000;
+	while (UQ.busy && !SDL_TICKS_PASSED(SDL_GetTicks(), until))
+		SDL_CondWaitTimeout(UQ.cond, UQ.mutex, 50);
+	unsigned arrived = UQ.arrived, decoded = UQ.decoded, dropped = UQ.dropped, deepest = UQ.deepest;
+	unsigned gaps50 = UQ.gaps50, gaps100 = UQ.gaps100;
+	double avg = decoded ? (double)UQ.decode_ns / decoded / 1e6 : 0.0, max = (double)UQ.decode_max_ns / 1e6;
+	uq_reset_locked();
+	SDL_UnlockMutex(UQ.mutex);
+	if (arrived)
+		app_log("USB pictures: %u came, %u decoded (%.1f ms on average, %.1f ms at most), at most %u waiting, "
+			"%u dropped; gaps over 50 ms: %u (over 100 ms: %u)",
+			arrived, decoded, avg, max, deepest, dropped, gaps50, gaps100);
+}
 
 static void usb_video(const uint8_t *annexb, size_t len, bool h265, int width, int height)
 {
@@ -2001,18 +2144,76 @@ static void usb_video(const uint8_t *annexb, size_t len, bool h265, int width, i
 		app_log("USB video: %s", format);
 		push_event(EV_STATE);
 	}
-	SDL_LockMutex(A.media_mutex);
-	if (!UV.dec.pkt) {
-		UV.dec.pkt = av_packet_alloc();
-		UV.dec.frame = av_frame_alloc();
-		UV.dec.sw = av_frame_alloc();
+	if (len == 0 || len > UQ_BYTES / 2)
+		return;
+	if (!UQ.mutex) {
+		/* (no decoding thread: decoded here, as before 1.3.14; qtproto.c leaves the padding after the picture) */
+		struct uq_item here = {(uint8_t *)annexb, len, h265};
+		usb_decode(&here);
+		return;
 	}
-	if (UV.dec.vdec && UV.dec_hw != A.hw_decode)
-		avcodec_free_context(&UV.dec.vdec); /* (decoding was switched between the graphics card and the processor) */
-	UV.dec_hw = A.hw_decode;
-	if (UV.dec.pkt && UV.dec.frame && UV.dec.sw)
-		decode_video(&UV.dec, annexb, len, h265);
-	SDL_UnlockMutex(A.media_mutex);
+	uint8_t *copy = malloc(len + AV_INPUT_BUFFER_PADDING_SIZE);
+	if (!copy)
+		return;
+	memcpy(copy, annexb, len);
+	memset(copy + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+	uint64_t t = now_ns();
+	int fps = -1;
+	unsigned dropped_now = 0;
+	SDL_LockMutex(UQ.mutex);
+	/* how the pictures come: gaps, and pictures a second over five seconds (written when it changes much) */
+	UQ.arrived++;
+	if (UQ.last_t) {
+		uint64_t gap = t - UQ.last_t;
+		UQ.gaps50 += gap > 50000000ull;
+		UQ.gaps100 += gap > 100000000ull;
+	}
+	UQ.last_t = t;
+	if (!UQ.window_t)
+		UQ.window_t = t;
+	UQ.window_n++;
+	if (t - UQ.window_t >= 5000000000ull) {
+		int now_fps = (int)((double)UQ.window_n * 1e9 / (double)(t - UQ.window_t) + 0.5);
+		if ((UQ.shown_fps < 0 || abs(now_fps - UQ.shown_fps) >= 8) && UQ.fps_lines < 60) {
+			UQ.shown_fps = now_fps;
+			UQ.fps_lines++;
+			fps = now_fps;
+		}
+		UQ.window_t = t;
+		UQ.window_n = 0;
+	}
+	/* room in the queue: waited for; a queue that stays full for a second is emptied */
+	Uint32 until = SDL_GetTicks() + 1000;
+	while (!UQ.quit && UQ.count > 0 && (UQ.count >= UQ_ITEMS || UQ.bytes + len > UQ_BYTES)) {
+		if (SDL_TICKS_PASSED(SDL_GetTicks(), until)) {
+			dropped_now = uq_drop_locked();
+			UQ.want_key = true;
+			break;
+		}
+		SDL_CondWaitTimeout(UQ.cond, UQ.mutex, 50);
+	}
+	bool queued = false;
+	if (!UQ.quit && UQ.want_key && annexb_key(copy, len, h265))
+		UQ.want_key = false;
+	if (!UQ.quit && !UQ.want_key) {
+		UQ.items[(UQ.head + UQ.count) % UQ_ITEMS] = (struct uq_item){copy, len, h265};
+		UQ.count++;
+		UQ.bytes += len;
+		if ((unsigned)UQ.count > UQ.deepest)
+			UQ.deepest = (unsigned)UQ.count;
+		queued = true;
+		SDL_CondBroadcast(UQ.cond);
+	} else if (!UQ.quit) {
+		UQ.dropped++;
+	}
+	SDL_UnlockMutex(UQ.mutex);
+	if (!queued)
+		free(copy);
+	if (fps >= 0)
+		app_log("USB: %d pictures a second", fps);
+	if (dropped_now)
+		app_log("USB: decoding fell behind for a second: %u pictures dropped, waiting for a key frame",
+			dropped_now);
 }
 
 static void usb_audio(const uint8_t *pcm, int frames, int channels, int rate)
@@ -2053,6 +2254,7 @@ static void usb_state(enum usbqt_state state)
 	int before = SDL_AtomicSet(&A.usb_state, (int)state);
 	if (before == USBQT_STREAMING && state != USBQT_STREAMING) {
 		/* the cable's mirroring ended: as at the end of a session */
+		uq_end_session();
 		SDL_LockMutex(A.media_mutex);
 		rec_queue_close();
 		clear_picture();
@@ -4045,6 +4247,19 @@ int main(int argc, char *argv[])
 	Q.mutex = SDL_CreateMutex();
 	Q.cond = SDL_CreateCond();
 	Q.thread = SDL_CreateThread(rec_thread, "recording", NULL);
+	UQ.mutex = SDL_CreateMutex();
+	UQ.cond = SDL_CreateCond();
+	if (UQ.mutex && UQ.cond)
+		UQ.thread = SDL_CreateThread(uq_thread, "usb pictures", NULL);
+	if (!UQ.thread) {
+		/* (no thread: the cable's pictures are not queued; usb_video needs UQ.mutex) */
+		if (UQ.cond)
+			SDL_DestroyCond(UQ.cond);
+		if (UQ.mutex)
+			SDL_DestroyMutex(UQ.mutex);
+		UQ.cond = NULL;
+		UQ.mutex = NULL;
+	}
 	log_mutex = SDL_CreateMutex();
 	A.event_type = SDL_RegisterEvents(1);
 	A.pending = av_frame_alloc();
@@ -4311,6 +4526,14 @@ int main(int argc, char *argv[])
 		usbqt_stop(true);
 	}
 	session_stop();
+	if (UQ.thread) {
+		SDL_LockMutex(UQ.mutex);
+		UQ.quit = true;
+		SDL_CondBroadcast(UQ.cond);
+		SDL_UnlockMutex(UQ.mutex);
+		SDL_WaitThread(UQ.thread, NULL);
+		UQ.thread = NULL;
+	}
 	SDL_LockMutex(Q.mutex);
 	Q.quit = true;
 	SDL_CondSignal(Q.cond);

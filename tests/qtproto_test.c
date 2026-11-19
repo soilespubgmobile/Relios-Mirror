@@ -448,9 +448,11 @@ int main(int argc, char **argv)
 			qt_session_stop(s, &o3);
 			CHECK(qt_session_state(s) == QT_STOPPING, "release: state %d", (int)qt_session_state(s));
 			qt_out_clear(&o3);
+			int shown = st_seen.videos;
 			qt_session_feed(s, feed, fl, &o3, t0 + 3000000000ull);
 			k = messages(&o3, at, len, 4);
 			CHECK(k == 0, "release: a picture during the release was answered (%d answers)", k);
+			CHECK(st_seen.videos == shown, "release: a picture during the release was shown");
 			free(feed);
 			free(eat);
 			qt_out_free(&o3);
