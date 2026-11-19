@@ -77,6 +77,7 @@ struct seen {
 	int width, height;
 	bool h265, first_has_sps, nal_ok;
 	int audio_frames, audio_channels, audio_rate;
+	int16_t first[4]; /* the first samples of the first sound packet */
 	int logs;
 };
 
@@ -101,7 +102,9 @@ static void on_video(void *ctx, const uint8_t *d, size_t n, bool h265, int w, in
 static void on_audio(void *ctx, const uint8_t *pcm, int frames, int channels, int rate)
 {
 	struct seen *s = ctx;
-	(void)pcm;
+	if (s->audios == 0)
+		for (int i = 0; i < 4 && i < frames * channels; i++)
+			s->first[i] = (int16_t)(pcm[2 * i] | (pcm[2 * i + 1] << 8));
 	s->audios++;
 	s->audio_frames += frames;
 	s->audio_channels = channels;
@@ -305,14 +308,26 @@ int main(int argc, char **argv)
 		struct {
 			uint32_t flags, frame_bytes, channels, bits;
 			int bytes;
+			int16_t expect[2]; /* the first frame out (left, right) */
 		} formats[] = {
-			{0x4c, 4, 2, 16, 2},  /* as the device sends it normally */
-			{0x29, 4, 2, 32, 4},  /* float, non-interleaved */
-			{0x0c, 6, 2, 24, 3},  /* 24-bit in three bytes */
-			{0x1c, 8, 2, 24, 4},  /* 24-bit at the top of four bytes */
-			{0x4c, 12, 6, 16, 2}, /* six channels */
-			{0x4c, 2, 1, 16, 2},  /* one channel */
+			{0x4c, 4, 2, 16, 2, {0x1234, -292}},   /* as the device sends it normally */
+			{0x29, 4, 2, 32, 4, {16383, -8191}},   /* float, non-interleaved */
+			{0x0c, 6, 2, 24, 3, {0x1234, -1}},     /* 24-bit in three bytes */
+			{0x1c, 8, 2, 24, 4, {0x1234, -32768}}, /* 24-bit at the top of four bytes */
+			{0x4c, 12, 6, 16, 2, {0, 1000}},       /* six channels: the first two */
+			{0x4c, 2, 1, 16, 2, {7, 0}},           /* one channel */
 		};
+		/* the sound data inside the captured sound packet: its 'sdat' chunk */
+		size_t sdat = 0, sdat_len = 0;
+		for (size_t i = 4; i + 4 <= el; i++)
+			if (memcmp(eat + i, "tads", 4) == 0) {
+				sdat = i + 4;
+				sdat_len = (size_t)rd32(eat + i - 4) - 8;
+				break;
+			}
+		CHECK(sdat && sdat + sdat_len <= el && sdat_len >= 64, "no sound data in the captured sound packet");
+		uint8_t *orig = malloc(el);
+		memcpy(orig, eat, el);
 		int frames0 = 0;
 		for (size_t f = 0; f < sizeof(formats) / sizeof(formats[0]); f++) {
 			struct seen seen = {0};
@@ -327,6 +342,27 @@ int main(int argc, char **argv)
 			memcpy(asbd + 24, &formats[f].frame_bytes, 4);
 			memcpy(asbd + 28, &formats[f].channels, 4);
 			memcpy(asbd + 32, &formats[f].bits, 4);
+			/* the first frame of each format, known values */
+			memcpy(eat, orig, el);
+			uint8_t *d = eat + sdat;
+			float half = 0.5f, quarter = -0.25f;
+			switch (f) {
+			case 0: d[0] = 0x34, d[1] = 0x12, d[2] = 0xdc, d[3] = 0xfe; break;
+			case 1:
+				memcpy(d, &half, 4);
+				memcpy(d + sdat_len / 2, &quarter, 4); /* (the right channel's samples follow the left's) */
+				break;
+			case 2: d[0] = 0x56, d[1] = 0x34, d[2] = 0x12, d[3] = 0x00, d[4] = 0xff, d[5] = 0xff; break;
+			case 3:
+				d[0] = 0x00, d[1] = 0x56, d[2] = 0x34, d[3] = 0x12;
+				d[4] = 0x00, d[5] = 0x00, d[6] = 0x00, d[7] = 0x80;
+				break;
+			case 4:
+				for (int c = 0; c < 6; c++)
+					d[2 * c] = (uint8_t)(c * 1000), d[2 * c + 1] = (uint8_t)((c * 1000) >> 8);
+				break;
+			default: d[0] = 7, d[1] = 0; break;
+			}
 			qt_session_feed(a, m, al, &o, 1000);
 			qt_session_feed(a, eat, el, &o, 2000);
 			int out_ch = formats[f].channels > 2 ? 2 : (int)formats[f].channels;
@@ -337,11 +373,15 @@ int main(int argc, char **argv)
 				      seen.audio_rate == 48000,
 			      "sound format %zu: %d packets, %d channels (%d expected), %d frames (%d expected), %d Hz", f,
 			      seen.audios, seen.audio_channels, out_ch, seen.audio_frames, expected, seen.audio_rate);
+			CHECK(seen.first[0] == formats[f].expect[0] && (out_ch == 1 || seen.first[1] == formats[f].expect[1]),
+			      "sound format %zu: first frame %d %d (%d %d expected)", f, seen.first[0], seen.first[1],
+			      formats[f].expect[0], formats[f].expect[1]);
 			free(m);
 			qt_out_free(&o);
 			qt_session_free(a);
 		}
 		CHECK(frames0 > 0, "sound: no frames from the captured sound");
+		free(orig);
 		free(afmt);
 		free(eat);
 	}

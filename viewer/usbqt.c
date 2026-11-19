@@ -385,8 +385,8 @@ static bool find_entry(const char *serial, struct usbqt_device *out)
 	info.cbSize = sizeof(info);
 	bool found = false;
 	for (DWORD i = 0; !found && SetupDiEnumDeviceInfo(set, i, &info); i++) {
-		wchar_t id[400];
-		char a[400], norm[128];
+		wchar_t id[400] = {0};
+		char a[400] = {0}, norm[128] = {0};
 		bool ok;
 		if (!SetupDiGetDeviceInstanceIdW(set, &info, id, 400, NULL))
 			continue;

@@ -96,6 +96,12 @@ Log'a göre karar:
   artık beklemiyor). Denemede bakılacak: "USB: N pictures a second" satırları ve oturum sonundaki "USB pictures:"
   satırı (çözme süresi, kuyruk, atlanan). Hâlâ 30 ve düzensizse sıradaki adım: resimleri cihazın zaman damgasına
   (FEED'deki stia/opts) göre aralıklı göstermek (küçük bir gecikmeyle).
+- log 15 (1.3.14): kayıt kapalı 58 fps; iPad kendi kaydını açınca 40 → 32. Çözme 7,6 ms ort., kuyrukta en çok 2,
+  atlanan yok: düşüş iPad'den (iki akışı birden 2420x1668 kodluyor). Kullanıcıya önerildi: kaydı Relios'ta almak.
+- 1.3.15: kapsamlı sınama (tests/run_checks.sh; GELISTIRME.txt 7). Gerçek hata çıkmadı; sağlamlaştırmalar:
+  usbqueue.c ayrı dosya, usbids.h yalnızca büyük harf, kimlik tamponları sıfırla başlar. Canlı ağ sınaması
+  (tests/receiver_live_fuzz.py) UxPlay'de iki assert buldu (raop.c oturum kimliği, http_response.c boş değer):
+  yalnızca hata ayıklama derlemesini durduruyordu; gerçek denetimle değiştirildi (RELIOS:).
 
 ## Yapılmaması gerekenler
 

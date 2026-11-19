@@ -64,11 +64,17 @@ jobs:
           & $msbuild softcam\src\softcam\softcam.vcxproj /p:Configuration=Release /p:Platform=x64 /p:SolutionDir=$root /m /v:minimal /nologo
           if ($LASTEXITCODE -ne 0) { throw 'softcam: the build failed' }
           Get-ChildItem softcam\dist -Recurse -Filter softcam.dll | ForEach-Object { Write-Host "built: $($_.FullName) ($($_.Length) bytes)" }
-      # The USB protocol of wired mirroring, tested with messages captured from real devices (tests/fixtures/qvh).
+      # The USB protocol of wired mirroring, tested with messages captured from real devices (tests/fixtures/qvh),
+      # then fuzzed briefly (the long runs with sanitizers: tests/run_checks.sh on Linux); and which USB device
+      # instances the driver installer accepts.
       - name: Test the USB protocol
         run: |
           gcc -std=c11 -O1 -Wall -Wextra -Iviewer tests/qtproto_test.c viewer/qtproto.c -o qtproto_test.exe
           ./qtproto_test.exe tests/fixtures/qvh
+          gcc -std=c11 -O1 -Wall -Wextra -Iviewer tests/qtproto_fuzz.c viewer/qtproto.c -o qtproto_fuzz.exe
+          ./qtproto_fuzz.exe tests/fixtures/qvh 30000 1
+          gcc -std=c11 -O1 -Wall -Wextra -Iviewer tests/usbids_test.c -o usbids_test.exe
+          ./usbids_test.exe
       # The USB driver for wired mirroring: libusb-win32 1.2.6.0, its official release on SourceForge. The two files
       # the program installs must have these SHA-256 fingerprints (the program checks the same ones again before it
       # installs them), or the build stops. Nothing downloaded here is run.

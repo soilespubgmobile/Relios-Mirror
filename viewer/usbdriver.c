@@ -800,8 +800,8 @@ static void winusb_remove_all(void)
 	SP_DEVINFO_DATA info;
 	info.cbSize = sizeof(info);
 	for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
-		wchar_t id[300];
-		char a[300];
+		wchar_t id[300] = {0};
+		char a[300] = {0};
 		if (!SetupDiGetDeviceInstanceIdW(set, &info, id, 300, NULL))
 			continue;
 		size_t k = 0;
@@ -940,8 +940,8 @@ static int run(int argc, wchar_t **argv)
 	if (!install && !winusb && wcscmp(argv[1], L"remove"))
 		return USBQT_DRIVER_ARGUMENTS;
 	/* the device instance: plain ASCII, as the program found it */
-	char instance[200];
-	wchar_t winstance[200];
+	char instance[200] = {0};
+	wchar_t winstance[200] = {0};
 	size_t i = 0;
 	for (; argv[2][i]; i++) {
 		if (i + 1 >= sizeof(instance) || argv[2][i] > 0x7f)

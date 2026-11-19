@@ -35,7 +35,11 @@ http_response_add_data(http_response_t *response, const char *data, int datalen)
 {
     assert(response);
     assert(data);
-    assert(datalen > 0);
+    /* RELIOS: nothing to add (an empty header value): nothing is done. (Upstream asserted datalen > 0, which ended a
+     * debug build on a request with an empty value; a release build copied nothing.) */
+    if (datalen <= 0) {
+        return;
+    }
 
     size_t newbufsize = response->buffer_size;
     while (response->data_length + datalen > newbufsize) {

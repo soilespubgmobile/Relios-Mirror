@@ -440,8 +440,14 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         free(header_str);
     }
     
-    if (client_session_id) {
-        assert(!strcmp(client_session_id, conn->client_session_id));
+    /* RELIOS: a request whose session ID is not the one its connection began with, or that brings one to a connection
+     * that began without (a screen mirroring one), is refused. (Upstream asserted it: a debug build ended at once,
+     * on strcmp with NULL; a release build, without the assert, went on as if nothing were wrong.) */
+    if (client_session_id && (!conn->client_session_id || strcmp(client_session_id, conn->client_session_id))) {
+        logger_log(raop->logger, LOGGER_WARNING, "RELIOS: refused %s %s: not this connection's session", method, url);
+        http_response_init(*response, protocol, 400, "Bad Request");
+        http_response_set_disconnect(*response, 1);
+        goto finish;
     }
 
     logger_log(raop->logger, LOGGER_DEBUG, "Handling request %s with URL %s", method, url);

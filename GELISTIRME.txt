@@ -110,7 +110,10 @@ viewer\usbdriver.c    Sürücü kurucusu: ayrı, küçük program relios-usb-kur
                       "camera-remove"): softcam.dll'i yalnızca derlemenin içine yazdığı SHA-256 parmak iziyle kabul
                       eder (paketle.sh hesaplar, CMake'e SOFTCAM_SHA256 olarak verir), denetlediği baytları
                       "Program Files\Relios Mirror"a yazar ve System32'deki regsvr32 ile oradan kaydeder.
-viewer\usbids.h       Dokunulabilecek Apple cihazları (ürün kimlikleri, aygıt örneği biçimi).
+viewer\usbids.h       Dokunulabilecek Apple cihazları (ürün kimlikleri, aygıt örneği biçimi; yalnızca büyük harf).
+viewer\usbqueue.c    Kablonun resim kuyruğu (1.3.14): USB iş parçacığı resmi kopyalayıp hemen yeni resim ister
+                      (NEED), resimler "usb pictures" iş parçacığında çözülür. Yalnızca SDL kullanır; sınaması
+                      tests\usbqueue_test.c (tests\sdl_shim\SDL.h ile Linux'ta, ThreadSanitizer altında).
 viewer\qtproto.c      USB protokolü (QuickTime ekran kaydı: PING / SYNC / ASYN / RPLY, CMSampleBuffer). Platformdan
                       bağımsızdır; quicktime_video_hack'e (MIT) dayanır.
 viewer\proc_win.c     Alıcıyı düşük yetkiyle (low integrity) ve bir iş nesnesi içinde başlatır. "Sıkı Koruma"
@@ -129,10 +132,14 @@ receiver\protocol.h   Alıcı ile program arasındaki mesajlar.
 receiver\uxplay       UxPlay'in AirPlay kitaplığı (hangi sürüm: UPSTREAM.txt). Yapılan değişiklikler "RELIOS:"
                       diye işaretlidir:   grep -rn "RELIOS" receiver/uxplay
 receiver\libplist     libplist (olduğu gibi).
-tests\                receiver_test.py: alıcının cihazsız sınaması. receiver_security_test.py: alıcının saldırılara
+tests\                run_checks.sh: aşağıdakilerin hepsini tek komutla derleyip çalıştırır (bkz. 7).
+                      receiver_test.py: alıcının cihazsız sınaması. receiver_security_test.py: alıcının saldırılara
                       karşı sınaması (eşleşme atlatma, PIN'siz eşleşme, bozuk istekler, bellek tüketme, bağlantı
                       işgali). qtproto_test.c: USB protokolünün sınaması (tests\fixtures\qvh:
-                      quicktime_video_hack'in gerçek cihaz kayıtları, MIT).
+                      quicktime_video_hack'in gerçek cihaz kayıtları, MIT). qtproto_fuzz.c: USB protokolünün
+                      bulanık sınaması. usbqueue_test.c: resim kuyruğu (iş parçacıkları). usbids_test.c: sürücü
+                      kurucusunun kabul ettiği aygıt kimlikleri. receiver_parsers_fuzz.c: alıcının eşleşmeden önce
+                      ulaşılabilen ayrıştırıcıları (mDNS, RTSP/HTTP, ikili plist).
 paketle.sh            Derler, DLL'leri toplar, tek dosyayı yapar.   derle.bat: bunu MSYS2 ile çalıştırır.
 
 
@@ -178,6 +185,26 @@ UxPlay'i yenilemek: receiver\uxplay\lib'i yeni sürümle değiştirin, "RELIOS:"
 
 
 7. SINAMA
+Hepsi tek komutla (cihaz gerekmez; Linux / WSL; gcc, cmake, ninja, OpenSSL 3 geliştirme paketi, python3 ve
+"cryptography" paketi; varsa valgrind):
+   sh tests/run_checks.sh          (hızlı: birkaç dakika)
+   sh tests/run_checks.sh full     (milyonlarca bulanık girdi: 15-30 dakika)
+   Sırayla: USB protokolü (AddressSanitizer + UBSan, valgrind), USB protokolünün bulanık sınaması, sürücü
+   kurucusunun aygıt kimliği denetimi, resim kuyruğu (ThreadSanitizer, AddressSanitizer, iş parçacığısız),
+   alıcının ağdan ulaşılabilen ayrıştırıcıları (mDNS, RTSP/HTTP, plist; dağıtılan derleme gibi NDEBUG ile), alıcının
+   AddressSanitizer'lı derlemesi ve kendi iki sınaması, ardından çalışan alıcıya ağdan bozuk istekler ve mDNS
+   soruları (receiver_live_fuzz.py; hem hata ayıklama derlemesine hem dağıtılan gibi NDEBUG'lı derlemeye). İlk
+   başarısızlıkta durur ve çıktısını gösterir; sonunda
+   "all checks passed" yazar. GitHub'daki derleme de her seferinde USB protokolünün sınamasını, kısa bir bulanık
+   sınamasını ve aygıt kimliği sınamasını çalıştırır.
+   1.3.15'te yapılan kapsamlı sınama: USB protokolü 10 milyon bozuk / uydurma girdi (satırların %98'i), mDNS / RTSP /
+   plist 1'er milyon girdi, resim kuyruğu ThreadSanitizer ile (bilerek bozulmuş bir kopyada yarışı yakaladığı da
+   denendi), clang ve gcc statik çözümleyicileri bütün kaynaklarda, çalışan alıcıya ağdan binlerce bozuk istek.
+   Canlı sınama UxPlay'den gelen iki assert'i buldu (raop.c: oturum kimliğiyle gelen bir istek; http_response.c:
+   boş bir başlık değeri): ikisi de yalnızca hata ayıklama derlemesini durduruyordu (dağıtılan alıcı NDEBUG'lıdır,
+   orada assert yoktur); gerçek denetimle değiştirildi (RELIOS: diye işaretli). Not: libplist'in bir assert'i, içinde
+   sıfır baytı olan bir plist metninde hata ayıklama derlemesini durdurur; dağıtılan alıcı etkilenmez (metin
+   yalnızca kısalır); libplist olduğu gibi bırakıldı.
 Alıcı (cihaz gerekmez; Linux / WSL):
    python3 tests/receiver_test.py build-alici/relios-airplay-receiver /tmp/alici-sinama
    python3 tests/receiver_security_test.py build-alici/relios-airplay-receiver /tmp/alici-guvenlik
@@ -332,6 +359,14 @@ Program (elle; her yeni sürümde):
   Log: "USB: N pictures a second" (5 s'lik pencerede, 8'den çok değişince) ve oturum sonunda "USB pictures: ...
   decoded (ortalama/en çok ms), at most N waiting, dropped, gaps over 50/100 ms". İş parçacığı açılamazsa eskisi
   gibi doğrudan çözülür.
+- 1.3.14 denemesi (log 15): kayıt kapalıyken 58 resim/s (önceden 54-56); iPad kendi kaydını açınca 40 → 32: çözme
+  ortalama 7,6 ms, kuyrukta en çok 2 resim, atlanan yok; düşüş iPad'in (iki akışı birden kodluyor).
+- 1.3.15: Kapsamlı sınama (bkz. 7) ve bulduklarıyla: resim kuyruğu ayrı dosyada (viewer/usbqueue.c; davranış aynı),
+  aygıt kimliği denetimi yalnızca büyük harf kabul eder (çağıranlar zaten büyük harfe çeviriyor), sürücü
+  kurucusunun ve usbqt.c'nin aygıt kimliği tamponları sıfırla başlar, kaydın günlük satırı kodlayıcı adı olmadan da
+  güvenli. Alıcı: raop.c'de bağlantının oturumuna ait olmayan oturum kimliğiyle gelen istek reddedilir (400; önce
+  assert'ti), http_response.c boş değeri atlar (önce assert'ti). tests/run_checks.sh ve yeni sınamalar eklendi
+  (receiver_live_fuzz.py dahil); GitHub derlemesi kısa bulanık sınamayı da çalıştırır.
 - USB sürücüsü kaldırılınca: sürücüyü Relios Mirror kurduysa (hizmetin anahtarındaki "ReliosMirror" değeri:
   1 hizmet, 2 libusb0.sys, 4 libusb0.dll) ve hiçbir cihaz ya da cihaz sınıfı libusb0'ı anmıyorsa hizmet ve
   yalnızca programın koyduğu dosyalar silinir (kullanımdaysa bir sonraki açılışta). Başka bir programın kurduğu

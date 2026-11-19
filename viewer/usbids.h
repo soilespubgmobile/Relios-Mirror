@@ -23,6 +23,17 @@ static inline bool apple_mobile_product(unsigned pid)
 	return false;
 }
 
+/* (upper case only: the callers make the instances upper case first; anything else is refused) */
+static inline bool upper_hex(char c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F');
+}
+
+static inline bool upper_alnum(char c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
+}
+
 /* an iPad's / iPhone's own device instance (upper case ASCII): USB\VID_05AC&PID_xxxx\<serial>, the serial made of
  * letters, digits and dashes (not one of its interfaces: those have &MI_xx) */
 static inline bool valid_instance(const char *a)
@@ -31,14 +42,14 @@ static inline bool valid_instance(const char *a)
 	if (strncmp(a, "USB\\VID_05AC&PID_", 17) || n < 22 + 7 || n > 22 + 40 || a[21] != '\\')
 		return false;
 	for (int i = 17; i < 21; i++) {
-		if (!isxdigit((unsigned char)a[i]))
+		if (!upper_hex(a[i]))
 			return false;
 	}
 	char hex[5] = {a[17], a[18], a[19], a[20], 0};
-	if (!apple_mobile_product((unsigned)strtoul(hex, NULL, 16)) || !isalnum((unsigned char)a[22]))
+	if (!apple_mobile_product((unsigned)strtoul(hex, NULL, 16)) || !upper_alnum(a[22]))
 		return false;
 	for (const char *p = a + 22; *p; p++) {
-		if (!isalnum((unsigned char)*p) && *p != '-')
+		if (!upper_alnum(*p) && *p != '-')
 			return false;
 	}
 	return true;
@@ -56,14 +67,14 @@ static inline bool valid_interface_instance(const char *a)
 	for (int i = 17; i < 27; i++) {
 		if (i >= 21 && i < 25)
 			continue;
-		if (!isxdigit((unsigned char)a[i]))
+		if (!upper_hex(a[i]))
 			return false;
 	}
 	char hex[5] = {a[17], a[18], a[19], a[20], 0};
 	if (!apple_mobile_product((unsigned)strtoul(hex, NULL, 16)))
 		return false;
 	for (const char *p = a + 28; *p; p++) {
-		if (!isxdigit((unsigned char)*p) && *p != '&')
+		if (!upper_hex(*p) && *p != '&')
 			return false;
 	}
 	return true;

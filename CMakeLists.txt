@@ -30,7 +30,7 @@ pkg_check_modules(SDL2TTF REQUIRED IMPORTED_TARGET SDL2_ttf)
 if(WIN32)
   enable_language(RC)
   add_executable(ReliosMirror WIN32 viewer/main.c viewer/proc_win.c viewer/proc.h viewer/version.h viewer/app.rc
-                 viewer/qtproto.c viewer/qtproto.h viewer/usbqt.c viewer/usbqt.h)
+                 viewer/qtproto.c viewer/qtproto.h viewer/usbqt.c viewer/usbqt.h viewer/usbqueue.c viewer/usbqueue.h)
   set_source_files_properties(viewer/app.rc PROPERTIES COMPILE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/viewer")
   # (cfgmgr32, setupapi: the device list and the USB driver for wired mirroring; cfgmgr32 first, so that the CM_
   # functions come from the DLL that documents them)
@@ -55,7 +55,7 @@ if(WIN32)
   endif()
 else()
   add_executable(ReliosMirror viewer/main.c viewer/proc_posix.c viewer/proc.h viewer/qtproto.c viewer/qtproto.h
-                 viewer/usbqt.c viewer/usbqt.h)
+                 viewer/usbqt.c viewer/usbqt.h viewer/usbqueue.c viewer/usbqueue.h)
   target_link_libraries(ReliosMirror PRIVATE m)
 endif()
 target_include_directories(ReliosMirror PRIVATE receiver)
